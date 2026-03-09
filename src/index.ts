@@ -536,16 +536,19 @@ async function processInboundMessage(api: any, client: OpenIMClientState, msg: M
     return;
   }
 
-  const sessionId = group ? `openim:group:${msg.groupID}`.toLowerCase() : `openim:${msg.sendID}`.toLowerCase();
+  const baseSessionKey = group ? `openim:group:${msg.groupID}`.toLowerCase() : `openim:${msg.sendID}`.toLowerCase();
   const cfg = api.config;
 
   const route =
     runtime.channel.routing?.resolveAgentRoute?.({
       cfg,
-      sessionKey: sessionId,
+      sessionKey: baseSessionKey,
       channel: "openim",
       accountId: client.config.accountId,
-    }) ?? { agentId: "main" };
+    }) ?? { agentId: "main", sessionKey: baseSessionKey };
+
+  // Use router-resolved session key so history aligns with Control UI session namespaces.
+  const sessionKey = String(route?.sessionKey ?? baseSessionKey).trim() || baseSessionKey;
 
   const storePath =
     runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
@@ -572,7 +575,7 @@ async function processInboundMessage(api: any, client: OpenIMClientState, msg: M
     RawBody: inbound.body,
     From: group ? `openim:group:${msg.groupID}` : `openim:${msg.sendID}`,
     To: `openim:${client.config.userID}`,
-    SessionKey: sessionId,
+    SessionKey: sessionKey,
     AccountId: client.config.accountId,
     ChatType: chatType,
     ConversationLabel: fromLabel,
@@ -597,11 +600,11 @@ async function processInboundMessage(api: any, client: OpenIMClientState, msg: M
   if (runtime.channel.session?.recordInboundSession) {
     await runtime.channel.session.recordInboundSession({
       storePath,
-      sessionKey: sessionId,
+      sessionKey,
       ctx: ctxPayload,
       updateLastRoute: !group
         ? {
-            sessionKey: sessionId,
+            sessionKey,
             channel: "openim",
             to: String(msg.sendID),
             accountId: client.config.accountId,
