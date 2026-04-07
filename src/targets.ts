@@ -4,7 +4,7 @@ export function parseTarget(to?: string): ParsedTarget | null {
   const raw = String(to ?? "").trim();
   if (!raw) return null;
 
-  const t = raw.replace(/^openim:/i, "");
+  const t = raw.replace(/^(openim|infiai):/i, "");
   if (t.startsWith("user:")) {
     const id = t.slice("user:".length).trim();
     return id ? { kind: "user", id } : null;

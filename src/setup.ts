@@ -1,6 +1,6 @@
 /**
- * OpenIM TUI setup wizard
- * openclaw openim setup
+ * Infiai TUI setup wizard
+ * openclaw infiai setup
  */
 
 import {
@@ -27,26 +27,26 @@ function guardCancel<T>(value: T | symbol): T {
 }
 
 export async function runOpenIMSetup(): Promise<void> {
-  clackIntro("OpenIM Channel Setup Wizard");
+  clackIntro("Infiai Channel Setup Wizard");
 
   const token = guardCancel(
     await clackText({
-      message: "Enter OpenIM Access Token",
-      initialValue: process.env.OPENIM_TOKEN || "",
+      message: "Enter Infiai Access Token",
+      initialValue: process.env.INFIAI_TOKEN || process.env.OPENIM_TOKEN || "",
     })
   );
 
   const wsAddr = guardCancel(
     await clackText({
-      message: "Enter OpenIM WebSocket endpoint",
-      initialValue: process.env.OPENIM_WS_ADDR || "ws://127.0.0.1:10001",
+      message: "Enter Infiai WebSocket endpoint",
+      initialValue: process.env.INFIAI_WS_ADDR || process.env.OPENIM_WS_ADDR || "ws://127.0.0.1:10001",
     })
   );
 
   const apiAddr = guardCancel(
     await clackText({
-      message: "Enter OpenIM REST API endpoint",
-      initialValue: process.env.OPENIM_API_ADDR || "http://127.0.0.1:10002",
+      message: "Enter Infiai REST API endpoint",
+      initialValue: process.env.INFIAI_API_ADDR || process.env.OPENIM_API_ADDR || "http://127.0.0.1:10002",
     })
   );
 
@@ -69,8 +69,8 @@ export async function runOpenIMSetup(): Promise<void> {
   }
 
   const channels = existing.channels || {};
-  const openim = channels.openim || {};
-  const accounts = openim.accounts || {};
+  const infiai = channels.infiai || channels.openim || {};
+  const accounts = infiai.accounts || {};
 
   accounts.default = {
     enabled: true,
@@ -79,8 +79,8 @@ export async function runOpenIMSetup(): Promise<void> {
     apiAddr: trimmedApiAddr,
   };
 
-  channels.openim = {
-    ...openim,
+  channels.infiai = {
+    ...infiai,
     enabled: true,
     accounts,
   };

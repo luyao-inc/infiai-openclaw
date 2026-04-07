@@ -9,7 +9,7 @@ function getConfigRoot(apiOrCfg: any): any {
 
 export function getOpenIMChannelConfig(apiOrCfg: any): any {
   const root = getConfigRoot(apiOrCfg);
-  return root?.channels?.openim ?? {};
+  return root?.channels?.infiai ?? root?.channels?.openim ?? {};
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
@@ -46,14 +46,14 @@ function extractAccountHintsFromToken(token: string): { userID?: string; platfor
 }
 
 function envDefaultAccount(): Record<string, unknown> | null {
-  const token = String(process.env.OPENIM_TOKEN ?? "").trim();
-  const wsAddr = String(process.env.OPENIM_WS_ADDR ?? "").trim();
-  const apiAddr = String(process.env.OPENIM_API_ADDR ?? "").trim();
+  const token = String(process.env.INFIAI_TOKEN ?? process.env.OPENIM_TOKEN ?? "").trim();
+  const wsAddr = String(process.env.INFIAI_WS_ADDR ?? process.env.OPENIM_WS_ADDR ?? "").trim();
+  const apiAddr = String(process.env.INFIAI_API_ADDR ?? process.env.OPENIM_API_ADDR ?? "").trim();
   if (!token || !wsAddr || !apiAddr) return null;
 
   const hints = extractAccountHintsFromToken(token);
-  const userID = String(process.env.OPENIM_USER_ID ?? hints.userID ?? "").trim();
-  const platformID = toFiniteNumber(process.env.OPENIM_PLATFORM_ID ?? hints.platformID, 5);
+  const userID = String(process.env.INFIAI_USER_ID ?? process.env.OPENIM_USER_ID ?? hints.userID ?? "").trim();
+  const platformID = toFiniteNumber(process.env.INFIAI_PLATFORM_ID ?? process.env.OPENIM_PLATFORM_ID ?? hints.platformID, 5);
   if (!userID) return null;
 
   return {

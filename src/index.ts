@@ -1,7 +1,7 @@
 /**
- * OpenClaw OpenIM Channel Plugin
+ * OpenClaw Infiai Channel Plugin
  *
- * Integrates OpenIM into OpenClaw Gateway using @openim/client-sdk.
+ * Integrates Infiai into OpenClaw Gateway using the official SDK.
  * Supports multi-account concurrency, direct/group text messaging, and mention-gated group triggering.
  */
 
@@ -9,6 +9,7 @@ import "./polyfills";
 import { OpenIMChannelPlugin } from "./channel";
 import { connectedClientCount, startAccountClient, stopAllClients } from "./clients";
 import { listEnabledAccountConfigs } from "./config";
+import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
 
 export default function register(api: any): void {
@@ -22,30 +23,29 @@ export default function register(api: any): void {
       (ctx: any) => {
         const prog = ctx.program;
         if (prog && typeof prog.command === "function") {
-          const openim = prog.command("openim").description("OpenIM channel configuration");
-          openim.command("setup").description("Interactive setup for the OpenIM default account").action(async () => {
-            const { runOpenIMSetup } = await import("./setup");
+          const infiai = prog.command("infiai").description("Infiai channel configuration");
+          infiai.command("setup").description("Interactive setup for the Infiai default account").action(async () => {
             await runOpenIMSetup();
           });
         }
       },
-      { commands: ["openim"] }
+      { commands: ["infiai"] }
     );
   }
 
   registerOpenIMTools(api);
 
   api.registerService({
-    id: "openim-sdk",
+    id: "infiai-sdk",
     start: async () => {
       if (connectedClientCount() > 0) {
-        api.logger?.info?.("[openim] service already started");
+        api.logger?.info?.("[infiai] service already started");
         return;
       }
 
       const accounts = listEnabledAccountConfigs(api);
       if (accounts.length === 0) {
-        api.logger?.warn?.("[openim] no enabled account config found");
+        api.logger?.warn?.("[infiai] no enabled account config found");
         return;
       }
 
@@ -53,13 +53,13 @@ export default function register(api: any): void {
         await startAccountClient(api, account);
       }
 
-      api.logger?.info?.(`[openim] service started with ${connectedClientCount()}/${accounts.length} connected accounts`);
+      api.logger?.info?.(`[infiai] service started with ${connectedClientCount()}/${accounts.length} connected accounts`);
     },
     stop: async () => {
       await stopAllClients(api);
-      api.logger?.info?.("[openim] service stopped");
+      api.logger?.info?.("[infiai] service stopped");
     },
   });
 
-  api.logger?.info?.("[openim] plugin loaded");
+  api.logger?.info?.("[infiai] plugin loaded");
 }

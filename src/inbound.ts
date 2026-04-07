@@ -122,7 +122,7 @@ function buildTextEnvelope(
 ): string {
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const formatted = runtime.channel.reply?.formatInboundEnvelope?.({
-    channel: "OpenIM",
+    channel: "Infiai",
     from: fromLabel,
     timestamp,
     body: bodyText,
@@ -293,7 +293,7 @@ async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem,
 export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
-    api.logger?.warn?.("[openim] runtime.channel.reply not available");
+    api.logger?.warn?.("[infiai] runtime.channel.reply not available");
     return;
   }
 
@@ -307,7 +307,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const inbound = extractInboundBody(msg);
   if (!inbound.body) {
     api.logger?.info?.(
-      `[openim] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`
+      `[infiai] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`
     );
     return;
   }
@@ -322,14 +322,14 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     return;
   }
 
-  const baseSessionKey = group ? `openim:group:${msg.groupID}`.toLowerCase() : `openim:${msg.sendID}`.toLowerCase();
+  const baseSessionKey = group ? `infiai:group:${msg.groupID}`.toLowerCase() : `infiai:${msg.sendID}`.toLowerCase();
   const cfg = api.config;
 
   const route =
     runtime.channel.routing?.resolveAgentRoute?.({
       cfg,
       sessionKey: baseSessionKey,
-      channel: "openim",
+      channel: "infiai",
       accountId: client.config.accountId,
     }) ?? { agentId: "main", sessionKey: baseSessionKey };
 
@@ -351,29 +351,29 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
 
   if (mediaResult.warnings.length > 0) {
     for (const warning of mediaResult.warnings) {
-      api.logger?.warn?.(`[openim] inbound media fetch failed: ${warning}`);
+      api.logger?.warn?.(`[infiai] inbound media fetch failed: ${warning}`);
     }
   }
 
   const ctxPayload = {
     Body: body,
     RawBody: rawBody,
-    From: group ? `openim:group:${msg.groupID}` : `openim:${msg.sendID}`,
-    To: `openim:${client.config.userID}`,
+    From: group ? `infiai:group:${msg.groupID}` : `infiai:${msg.sendID}`,
+    To: `infiai:${client.config.userID}`,
     SessionKey: sessionKey,
     AccountId: client.config.accountId,
     ChatType: chatType,
     ConversationLabel: fromLabel,
     SenderName: fromLabel,
     SenderId: senderId,
-    Provider: "openim",
-    Surface: "openim",
-    MessageSid: msg.clientMsgID || `openim-${Date.now()}`,
+    Provider: "infiai",
+    Surface: "infiai",
+    MessageSid: msg.clientMsgID || `infiai-${Date.now()}`,
     Timestamp: timestamp,
-    OriginatingChannel: "openim",
-    OriginatingTo: `openim:${client.config.userID}`,
+    OriginatingChannel: "infiai",
+    OriginatingTo: `infiai:${client.config.userID}`,
     CommandAuthorized: true,
-    _openim: {
+    _infiai: {
       accountId: client.config.accountId,
       isGroup: group,
       senderId,
@@ -391,18 +391,18 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       updateLastRoute: !group
         ? {
             sessionKey,
-            channel: "openim",
+            channel: "infiai",
             to: String(msg.sendID),
             accountId: client.config.accountId,
           }
         : undefined,
-      onRecordError: (err: unknown) => api.logger?.warn?.(`[openim] recordInboundSession: ${String(err)}`),
+      onRecordError: (err: unknown) => api.logger?.warn?.(`[infiai] recordInboundSession: ${String(err)}`),
     });
   }
 
   if (runtime.channel.activity?.record) {
     runtime.channel.activity.record({
-      channel: "openim",
+      channel: "infiai",
       accountId: client.config.accountId,
       direction: "inbound",
     });
@@ -418,11 +418,11 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
           try {
             await sendReplyFromInbound(client, msg, payload.text);
           } catch (e: any) {
-            api.logger?.error?.(`[openim] deliver failed: ${formatSdkError(e)}`);
+            api.logger?.error?.(`[infiai] deliver failed: ${formatSdkError(e)}`);
           }
         },
         onError: (err: unknown, info: { kind?: string }) => {
-          api.logger?.error?.(`[openim] ${info?.kind || "reply"} failed: ${String(err)}`);
+          api.logger?.error?.(`[infiai] ${info?.kind || "reply"} failed: ${String(err)}`);
         },
       },
       replyOptions: {
@@ -431,7 +431,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       },
     });
   } catch (err: any) {
-    api.logger?.error?.(`[openim] dispatch failed: ${formatSdkError(err)}`);
+    api.logger?.error?.(`[infiai] dispatch failed: ${formatSdkError(err)}`);
     try {
       const errMsg = formatSdkError(err);
       await sendReplyFromInbound(client, msg, `Processing failed: ${errMsg.slice(0, 80)}`);

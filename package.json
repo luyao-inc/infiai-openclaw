@@ -1,16 +1,16 @@
 {
-  "name": "@openim/openclaw-channel",
+  "name": "@luyao-inc/infiai-openclaw",
   "version": "0.3.2",
-  "description": "OpenIM channel plugin for OpenClaw gateway",
+  "description": "Infiai channel plugin for OpenClaw gateway",
   "license": "AGPL-3.0-only",
   "author": "blooming",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openimsdk/openclaw-channel.git"
+    "url": "git+ssh://git@github.com/luyao-inc/infiai-openclaw.git"
   },
-  "homepage": "https://github.com/openimsdk/openclaw-channel#readme",
+  "homepage": "https://github.com/luyao-inc/infiai-openclaw#readme",
   "bugs": {
-    "url": "https://github.com/openimsdk/openclaw-channel/issues"
+    "url": "https://github.com/luyao-inc/infiai-openclaw/issues"
   },
   "type": "module",
   "main": "./dist/index.js",
@@ -26,14 +26,14 @@
       "./dist/index.js"
     ],
     "channel": {
-      "id": "openim",
-      "label": "OpenIM",
-      "selectionLabel": "OpenIM",
-      "docsPath": "/channels/openim",
-      "blurb": "OpenIM protocol channel via @openim/client-sdk",
+      "id": "infiai",
+      "label": "Infiai",
+      "selectionLabel": "Infiai",
+      "docsPath": "/channels/infiai",
+      "blurb": "Infiai protocol channel via official SDK",
       "order": 86,
       "aliases": [
-        "openim",
+        "infiai",
         "im"
       ]
     }

@@ -21,7 +21,7 @@ export function registerOpenIMTools(api: any): void {
       return {
         ok: false as const,
         result: {
-          content: [{ type: "text", text: "OpenIM is not connected." }],
+          content: [{ type: "text", text: "Infiai is not connected." }],
         },
       };
     }
@@ -29,8 +29,8 @@ export function registerOpenIMTools(api: any): void {
   };
 
   api.registerTool({
-    name: "openim_send_text",
-    description: "Send a text message via OpenIM. target format: user:ID or group:ID.",
+    name: "infiai_send_text",
+    description: "Send a text message via Infiai. target format: user:ID or group:ID.",
     parameters: {
       type: "object",
       properties: {
@@ -53,8 +53,8 @@ export function registerOpenIMTools(api: any): void {
   });
 
   api.registerTool({
-    name: "openim_send_image",
-    description: "Send an image via OpenIM. `image` supports a local path or an http(s) URL.",
+    name: "infiai_send_image",
+    description: "Send an image via Infiai. `image` supports a local path or an http(s) URL.",
     parameters: {
       type: "object",
       properties: {
@@ -77,8 +77,8 @@ export function registerOpenIMTools(api: any): void {
   });
 
   api.registerTool({
-    name: "openim_send_video",
-    description: "Send a video via OpenIM (delivered as a file message). `video` supports a local path or URL.",
+    name: "infiai_send_video",
+    description: "Send a video via Infiai (delivered as a file message). `video` supports a local path or URL.",
     parameters: {
       type: "object",
       properties: {
@@ -102,8 +102,8 @@ export function registerOpenIMTools(api: any): void {
   });
 
   api.registerTool({
-    name: "openim_send_file",
-    description: "Send a file via OpenIM. `file` supports a local path or URL; `name` is optional.",
+    name: "infiai_send_file",
+    description: "Send a file via Infiai. `file` supports a local path or URL; `name` is optional.",
     parameters: {
       type: "object",
       properties: {

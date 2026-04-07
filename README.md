@@ -1,25 +1,27 @@
-# @openim/openclaw-channel
+# Infiai Channel for OpenClaw
 
-OpenIM channel plugin for OpenClaw Gateway.
+![Infiai Logo](./logo.png)
 
-Chinese documentation: [README.zh-CN.md](https://github.com/openimsdk/openclaw-channel/blob/main/README.zh-CN.md)
+Infiai channel plugin for OpenClaw Gateway.
+
+Chinese documentation: [README.zh-CN.md](https://github.com/luyao-inc/infiai-openclaw/blob/main/README.zh-CN.md)
 
 ## Features
 
 - Direct chat and group chat support
 - Inbound and outbound text/image/file messages
-- `openim_send_video` is intentionally sent as a file message
+- `infiai_send_video` is intentionally sent as a file message
 - Quote/reply message parsing for inbound context
-- Multi-account login via `channels.openim.accounts.<id>`
+- Multi-account login via `channels.infiai.accounts.<id>`
 - Group trigger policy with optional mention-only mode
-- Interactive setup command: `openclaw openim setup`
+- Interactive setup command: `openclaw infiai setup`
 
 ## Installation
 
 Install from npm:
 
 ```bash
-openclaw plugins install @openim/openclaw-channel
+openclaw plugins install @luyao-inc/infiai-openclaw
 ```
 
 Or install from local path:
@@ -28,21 +30,21 @@ Or install from local path:
 openclaw plugins install /path/to/openclaw-channel
 ```
 
-Repository: https://github.com/openimsdk/openclaw-channel
+Repository: https://github.com/luyao-inc/infiai-openclaw
 
 ## Identity Mapping
 
-- npm package name: `@openim/openclaw-channel`
+- npm package name: `@luyao-inc/infiai-openclaw`
 - plugin id: `openclaw-channel` (used in `plugins.entries` and `plugins.allow`)
-- channel id: `openim` (used in `channels.openim`)
-- setup command: `openclaw openim setup`
+- channel id: `infiai` (used in `channels.infiai`)
+- setup command: `openclaw infiai setup`
 
 ## Configuration
 
 ### Option 1: Interactive setup (recommended)
 
 ```bash
-openclaw openim setup
+openclaw infiai setup
 ```
 
 ### Option 2: Edit `~/.openclaw/openclaw.json`
@@ -50,7 +52,7 @@ openclaw openim setup
 ```json
 {
   "channels": {
-    "openim": {
+    "infiai": {
       "accounts": {
         "default": {
           "enabled": true,
@@ -77,35 +79,35 @@ Single-account fallback (without `accounts`) is supported.
 
 Environment fallback is supported for the `default` account:
 
-- `OPENIM_TOKEN`
-- `OPENIM_WS_ADDR`
-- `OPENIM_API_ADDR`
+- `INFIAI_TOKEN`
+- `INFIAI_WS_ADDR`
+- `INFIAI_API_ADDR`
 
 Optional env overrides:
 
-- `OPENIM_USER_ID`
-- `OPENIM_PLATFORM_ID`
+- `INFIAI_USER_ID`
+- `INFIAI_PLATFORM_ID`
 
 ## Agent Tools
 
-- `openim_send_text`
+- `infiai_send_text`
   - `target`: `user:<id>` or `group:<id>`
   - `text`: message text
   - `accountId` (optional): select sending account
 
-- `openim_send_image`
+- `infiai_send_image`
   - `target`: `user:<id>` or `group:<id>`
   - `image`: local path (`file://` supported) or `http(s)` URL
   - `accountId` (optional): select sending account
 
-- `openim_send_video`
+- `infiai_send_video`
   - `target`: `user:<id>` or `group:<id>`
   - `video`: local path (`file://` supported) or `http(s)` URL
-  - behavior: sent as a file message (not OpenIM video message)
+  - behavior: sent as a file message (not Infiai video message)
   - `name` (optional): override filename for URL input
   - `accountId` (optional): select sending account
 
-- `openim_send_file`
+- `infiai_send_file`
   - `target`: `user:<id>` or `group:<id>`
   - `file`: local path (`file://` supported) or `http(s)` URL
   - `name` (optional): override filename for URL input
@@ -122,4 +124,5 @@ For `test:connect`, configure `.env` first (see `.env.example`).
 
 ## License
 
-AGPL-3.0-only. See [LICENSE](https://github.com/openimsdk/openclaw-channel/blob/main/LICENSE).
+AGPL-3.0-only. See [LICENSE](https://github.com/luyao-inc/infiai-openclaw/blob/main/LICENSE).
+

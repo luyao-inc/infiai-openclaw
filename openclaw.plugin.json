@@ -1,11 +1,11 @@
 {
   "id": "openclaw-channel",
-  "name": "OpenIM Channel",
+  "name": "Infiai Channel",
   "version": "0.3.2",
-  "description": "OpenIM protocol channel for OpenClaw",
-  "author": "openclaw-openim",
+  "description": "Infiai protocol channel for OpenClaw",
+  "author": "openclaw-infiai",
   "channels": [
-    "openim"
+    "infiai"
   ],
   "configSchema": {
     "type": "object",
@@ -17,15 +17,15 @@
       },
       "token": {
         "type": "string",
-        "description": "OpenIM JWT token (used to derive userID/platformID when omitted)"
+        "description": "Infiai JWT token (used to derive userID/platformID when omitted)"
       },
       "wsAddr": {
         "type": "string",
-        "description": "OpenIM WebSocket endpoint, e.g. ws://127.0.0.1:10001"
+        "description": "Infiai WebSocket endpoint, e.g. ws://127.0.0.1:10001"
       },
       "apiAddr": {
         "type": "string",
-        "description": "OpenIM API endpoint, e.g. http://127.0.0.1:10002"
+        "description": "Infiai API endpoint, e.g. http://127.0.0.1:10002"
       },
       "requireMention": {
         "type": "boolean",
@@ -53,7 +53,7 @@
             },
             "token": {
               "type": "string",
-              "description": "OpenIM JWT token"
+              "description": "Infiai JWT token"
             },
             "wsAddr": {
               "type": "string"

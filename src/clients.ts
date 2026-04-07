@@ -40,7 +40,7 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
 
   const consumeMessage = (msg: MessageItem) => {
     processInboundMessage(api, state, msg).catch((e: any) => {
-      api.logger?.error?.(`[openim] processInboundMessage failed: ${formatSdkError(e)}`);
+      api.logger?.error?.(`[infiai] processInboundMessage failed: ${formatSdkError(e)}`);
     });
   };
 
@@ -69,10 +69,10 @@ export async function startAccountClient(api: any, config: OpenIMAccountConfig):
       platformID: config.platformID,
     });
     clients.set(config.accountId, state);
-    api.logger?.info?.(`[openim] account ${config.accountId} connected`);
+    api.logger?.info?.(`[infiai] account ${config.accountId} connected`);
   } catch (e: any) {
     detachHandlers(state);
-    api.logger?.error?.(`[openim] account ${config.accountId} login failed: ${formatSdkError(e)}`);
+    api.logger?.error?.(`[infiai] account ${config.accountId} login failed: ${formatSdkError(e)}`);
   }
 }
 
@@ -85,7 +85,7 @@ export async function stopAllClients(api: any): Promise<void> {
     try {
       await state.sdk.logout();
     } catch (e: any) {
-      api.logger?.warn?.(`[openim] account ${state.config.accountId} logout failed: ${formatSdkError(e)}`);
+      api.logger?.warn?.(`[infiai] account ${state.config.accountId} logout failed: ${formatSdkError(e)}`);
     }
   }
 }

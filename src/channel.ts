@@ -5,14 +5,14 @@ import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
 
 export const OpenIMChannelPlugin = {
-  id: "openim",
+  id: "infiai",
   meta: {
-    id: "openim",
-    label: "OpenIM",
-    selectionLabel: "OpenIM",
-    docsPath: "/channels/openim",
-    blurb: "OpenIM protocol channel via @openim/client-sdk",
-    aliases: ["openim", "im"],
+    id: "infiai",
+    label: "Infiai",
+    selectionLabel: "Infiai",
+    docsPath: "/channels/infiai",
+    blurb: "Infiai protocol channel via official SDK",
+    aliases: ["infiai", "im"],
   },
   capabilities: {
     chatTypes: ["direct", "group"],
@@ -26,7 +26,7 @@ export const OpenIMChannelPlugin = {
     resolveTarget: ({ to }: { to?: string }) => {
       const target = parseTarget(to);
       if (!target) {
-        return { ok: false, error: new Error("OpenIM requires --to <user:ID|group:ID>") };
+        return { ok: false, error: new Error("Infiai requires --to <user:ID|group:ID>") };
       }
       return { ok: true, to: `${target.kind}:${target.id}` };
     },
@@ -37,11 +37,11 @@ export const OpenIMChannelPlugin = {
       }
       const client = getConnectedClient(accountId);
       if (!client) {
-        return { ok: false, error: new Error("OpenIM not connected") };
+        return { ok: false, error: new Error("Infiai not connected") };
       }
       try {
         await sendTextToTarget(client, target, text);
-        return { ok: true, provider: "openim" };
+        return { ok: true, provider: "infiai" };
       } catch (e: any) {
         return { ok: false, error: new Error(formatSdkError(e)) };
       }
