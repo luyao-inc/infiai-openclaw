@@ -316,8 +316,12 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const mentioned = group && isMentionedInGroup(msg, client.config.userID);
   const hasWhitelist = client.config.inboundWhitelist.length > 0;
   if (hasWhitelist) {
-    if (!isWhitelistedSender(client, msg)) return;
-    if (group && !mentioned) return;
+    if (!isWhitelistedSender(client, msg)) {
+      return;
+    }
+    if (group && !mentioned) {
+      return;
+    }
   } else if (group && client.config.requireMention && !mentioned) {
     return;
   }
