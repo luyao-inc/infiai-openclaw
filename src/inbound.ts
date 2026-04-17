@@ -52,6 +52,27 @@ function summarizeMedia(item: InboundMediaItem): string {
   return parts.join(" ");
 }
 
+/** Drop model "Reasoning:/Thinking:" preambles that some providers still emit as plain text. */
+function stripVisibleReasoningPreamble(text: string): string {
+  let s = String(text ?? "").replace(/\r\n/g, "\n");
+  let prev = "";
+  while (s !== prev) {
+    prev = s;
+    const parts = s.split(/\n\n+/);
+    if (parts.length < 2) break;
+    const head = parts[0].trim();
+    if (
+      /^reasoning\s*:/i.test(head) ||
+      /^thinking\s*:/i.test(head) ||
+      /^thought\s*:/i.test(head) ||
+      /^分析\s*[:：]/i.test(head)
+    ) {
+      s = parts.slice(1).join("\n\n").trim();
+    }
+  }
+  return s;
+}
+
 function mergeInboundResults(parts: Array<InboundBodyResult | null | undefined>): InboundBodyResult {
   const valid = parts.filter(Boolean) as InboundBodyResult[];
   if (valid.length === 0) return { body: "", kind: "unknown" };
@@ -419,8 +440,10 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       dispatcherOptions: {
         deliver: async (payload: { text?: string }) => {
           if (!payload.text) return;
+          const cleaned = stripVisibleReasoningPreamble(payload.text);
+          if (!cleaned.trim()) return;
           try {
-            await sendReplyFromInbound(client, msg, payload.text);
+            await sendReplyFromInbound(client, msg, cleaned);
           } catch (e: any) {
             api.logger?.error?.(`[infiai] deliver failed: ${formatSdkError(e)}`);
           }
