@@ -70,7 +70,29 @@ function stripVisibleReasoningPreamble(text: string): string {
       s = parts.slice(1).join("\n\n").trim();
     }
   }
-  return s;
+   return s;
+}
+
+/** Remove provider/model placeholders that leak into user-visible replies. */
+function stripInfiaiReplyArtifacts(text: string): string {
+  let s = String(text ?? "").replace(/\r\n/g, "\n").trimEnd();
+  let prev = "";
+  while (s !== prev) {
+    prev = s;
+    // Do not require whitespace before NO_REPLY — CJK punctuation is often glued (e.g. "烦不烦？NO_REPLY").
+    s = s.replace(/NO_REPLY\.?\s*$/i, "").trimEnd();
+    s = s.replace(/NO_ANSWER\.?\s*$/i, "").trimEnd();
+  }
+  const lines = s.split("\n");
+  while (lines.length > 0) {
+    const last = (lines[lines.length - 1] ?? "").trim();
+    if (last === "" || /^NO_REPLY\.?$/i.test(last) || /^NO_ANSWER\.?$/i.test(last)) {
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+  return lines.join("\n").trimEnd();
 }
 
 function mergeInboundResults(parts: Array<InboundBodyResult | null | undefined>): InboundBodyResult {
@@ -440,7 +462,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       dispatcherOptions: {
         deliver: async (payload: { text?: string }) => {
           if (!payload.text) return;
-          const cleaned = stripVisibleReasoningPreamble(payload.text);
+          const cleaned = stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(payload.text));
           if (!cleaned.trim()) return;
           try {
             await sendReplyFromInbound(client, msg, cleaned);
