@@ -38,9 +38,14 @@ export default function register(api: any): void {
   api.registerService({
     id: "infiai-sdk",
     start: async () => {
+      // OpenClaw 在 channels.infiai 等配置热重载时会「restarting infiai channel」并再次调用本 start()。
+      // 若此处因 connectedClientCount>0 直接 return，不会重新挂载 SDK 与 runtime.channel.reply，
+      // 表现为仍能收到 OnRecvNewMessages，但不再触发 embedded agent / 无自动回复，直到整容器重启。
       if (connectedClientCount() > 0) {
-        api.logger?.info?.("[infiai] service already started");
-        return;
+        api.logger?.info?.(
+          "[infiai] service restart requested with existing clients; reconnecting SDK after channel reload",
+        );
+        await stopAllClients(api);
       }
 
       const accounts = listEnabledAccountConfigs(api);
