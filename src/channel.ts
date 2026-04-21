@@ -14,6 +14,14 @@ export const OpenIMChannelPlugin = {
     blurb: "Infiai protocol channel via official SDK",
     aliases: ["infiai", "im"],
   },
+  /**
+   * OpenClaw 配置热重载按「路径前缀规则」分类（见网关内 listReloadRules / buildGatewayReloadPlan）。
+   * 未命中任何规则的变更会 Fallback 为整进程重启，并在日志里把该路径列为 restart 原因。
+   * 内置渠道在 OpenClaw 中带 `reload.configPrefixes`；扩展渠道必须在插件里声明，否则与文档「channels.* 可热应用」不一致。
+   */
+  reload: {
+    configPrefixes: ["channels.infiai", "channels.openim"],
+  },
   capabilities: {
     chatTypes: ["direct", "group"],
   },
