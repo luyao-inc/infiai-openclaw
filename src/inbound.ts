@@ -1,5 +1,6 @@
 import { SessionType, type MessageItem } from "@openim/client-sdk";
 import { sendTextToTarget } from "./media";
+import { ensureInfiaiReplyReady } from "./replyHeal";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
 import { formatSdkError } from "./utils";
 
@@ -334,9 +335,11 @@ async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem,
 }
 
 export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
+  await ensureInfiaiReplyReady(api);
+
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
-    api.logger?.warn?.("[infiai] runtime.channel.reply not available");
+    api.logger?.warn?.("[infiai] runtime.channel.reply not available after self-heal");
     return;
   }
 
