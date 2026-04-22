@@ -7,7 +7,7 @@
 
 import "./polyfills";
 import { OpenIMChannelPlugin } from "./channel";
-import { connectedClientCount, startAccountClient, stopAllClients } from "./clients";
+import { startAccountClient, stopAllClients } from "./clients";
 import { listEnabledAccountConfigs } from "./config";
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
@@ -38,27 +38,23 @@ export default function register(api: any): void {
   api.registerService({
     id: "infiai-sdk",
     start: async () => {
-      // OpenClaw 在 channels.infiai 等配置热重载时会「restarting infiai channel」并再次调用本 start()。
-      // 若此处因 connectedClientCount>0 直接 return，不会重新挂载 SDK 与 runtime.channel.reply，
-      // 表现为仍能收到 OnRecvNewMessages，但不再触发 embedded agent / 无自动回复，直到整容器重启。
-      if (connectedClientCount() > 0) {
-        api.logger?.info?.(
-          "[infiai] service restart requested with existing clients; reconnecting SDK after channel reload",
-        );
-        await stopAllClients(api);
+      // 正常运行时 IM 连接由 channels.infiai.gateway.startAccount 建立（在 startChannels 阶段，早于本 sidecar）。
+      // 仅当显式跳过渠道启动（测试 / OPENCLAW_SKIP_CHANNELS 等）时才在此处补连。
+      const skip =
+        process.env.OPENCLAW_SKIP_CHANNELS === "1" || process.env.OPENCLAW_SKIP_PROVIDERS === "1";
+      if (!skip) {
+        return;
       }
 
       const accounts = listEnabledAccountConfigs(api);
       if (accounts.length === 0) {
-        api.logger?.warn?.("[infiai] no enabled account config found");
+        api.logger?.warn?.("[infiai] no enabled account (skip-channels fallback)");
         return;
       }
-
       for (const account of accounts) {
         await startAccountClient(api, account);
       }
-
-      api.logger?.info?.(`[infiai] service started with ${connectedClientCount()}/${accounts.length} connected accounts`);
+      api.logger?.info?.(`[infiai] skip-channels fallback: started ${accounts.length} account(s)`);
     },
     stop: async () => {
       await stopAllClients(api);

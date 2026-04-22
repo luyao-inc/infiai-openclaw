@@ -372,7 +372,12 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     return;
   }
 
-  const baseSessionKey = group ? `infiai:group:${msg.groupID}`.toLowerCase() : `infiai:${msg.sendID}`.toLowerCase();
+  // 单聊不能只按 sendID（对端用户）建 session：同一真人发给两个托管号时 sendID 相同，
+  // 会合并成一条 OpenClaw 会话、同一条 agent 记忆与 dashboard 线程。必须纳入本侧托管号 userID。
+  const selfUid = String(client.config.userID).trim();
+  const baseSessionKey = group
+    ? `infiai:group:${msg.groupID}`.toLowerCase()
+    : `infiai:direct:${selfUid}:${String(msg.sendID).trim()}`.toLowerCase();
   const cfg = api.config;
 
   const route =
@@ -408,7 +413,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const ctxPayload = {
     Body: body,
     RawBody: rawBody,
-    From: group ? `infiai:group:${msg.groupID}` : `infiai:${msg.sendID}`,
+    From: group ? `infiai:group:${msg.groupID}` : `infiai:direct:${selfUid}:${msg.sendID}`,
     To: `infiai:${client.config.userID}`,
     SessionKey: sessionKey,
     AccountId: client.config.accountId,

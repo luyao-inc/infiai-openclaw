@@ -1,5 +1,6 @@
 import { getConnectedClient } from "./clients";
 import { listAccountIds, resolveAccountConfig } from "./config";
+import { infiaiGatewayStartAccount, infiaiGatewayStopAccount } from "./gatewayLifecycle";
 import { sendTextToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
@@ -28,6 +29,14 @@ export const OpenIMChannelPlugin = {
   config: {
     listAccountIds: (cfg: any) => listAccountIds(cfg),
     resolveAccount: (cfg: any, accountId?: string) => resolveAccountConfig(cfg, accountId),
+  },
+  /**
+   * 必须实现：否则 hybrid 重载时 `startChannelInternal` 会因缺少 startAccount 直接 return，
+   * `restarting infiai channel` 不会重建 SDK 连接（真实连接此前只活在 registerService.start，热重载不会再调）。
+   */
+  gateway: {
+    startAccount: infiaiGatewayStartAccount,
+    stopAccount: infiaiGatewayStopAccount,
   },
   outbound: {
     deliveryMode: "direct" as const,
