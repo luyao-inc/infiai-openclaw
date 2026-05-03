@@ -16,6 +16,9 @@ Chinese documentation: [README.zh-CN.md](https://github.com/luyao-inc/infiai-ope
 - Group trigger policy with optional mention-only mode
 - Interactive setup command: `openclaw infiai setup`
 
+Note: the current OpenIM SDK entrypoint exposed to this plugin is still singleton-style (`getSDK()`).
+The plugin now avoids tearing down other account handlers during hot reload, but very high-concurrency multi-account deployments should still be validated carefully.
+
 ## Installation
 
 Install from npm:
@@ -125,4 +128,3 @@ For `test:connect`, configure `.env` first (see `.env.example`).
 ## License
 
 AGPL-3.0-only. See [LICENSE](https://github.com/luyao-inc/infiai-openclaw/blob/main/LICENSE).
-

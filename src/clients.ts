@@ -42,6 +42,10 @@ export async function stopAccountClient(api: any, accountId: string): Promise<vo
   if (!state) return;
   clients.delete(accountId);
   detachHandlers(state);
+  if (clients.size > 0) {
+    api.logger?.info?.(`[infiai] account ${accountId} detached (shared SDK kept alive for remaining accounts)`);
+    return;
+  }
   try {
     await state.sdk.logout();
   } catch (e: any) {
@@ -59,10 +63,6 @@ export async function startAccountClient(
   opts?: { abortSignal?: AbortSignal },
 ): Promise<void> {
   const sdk = getSDK();
-
-  for (const s of clients.values()) {
-    detachHandlers(s);
-  }
 
   const state = {
     sdk,

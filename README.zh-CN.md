@@ -16,6 +16,9 @@ English documentation: [README.md](https://github.com/luyao-inc/infiai-openclaw/
 - 支持群聊仅 @ 触发
 - 提供交互式配置命令：`openclaw infiai setup`
 
+注意：当前接入的 OpenIM SDK 入口仍是单例风格（`getSDK()`）。
+本插件已经避免在热重载时把其他账号的 handler 一起拆掉，但如果要做高并发、多账号长期稳定托管，仍建议继续重点验证这一层。
+
 ## 安装
 
 从 npm 安装：
@@ -124,4 +127,3 @@ pnpm run test:connect
 ## 许可证
 
 本项目采用 `AGPL-3.0-only` 许可证。详见 [LICENSE](https://github.com/luyao-inc/infiai-openclaw/blob/main/LICENSE)。
-

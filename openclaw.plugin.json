@@ -26,6 +26,10 @@
         "type": "string",
         "description": "Infiai JWT token (used to derive userID/platformID when omitted)"
       },
+      "userID": {
+        "type": "string",
+        "description": "Infiai/OpenIM userID for the current account"
+      },
       "wsAddr": {
         "type": "string",
         "description": "Infiai WebSocket endpoint, e.g. ws://127.0.0.1:10001"
@@ -33,6 +37,10 @@
       "apiAddr": {
         "type": "string",
         "description": "Infiai API endpoint, e.g. http://127.0.0.1:10002"
+      },
+      "platformID": {
+        "type": "number",
+        "description": "Infiai/OpenIM platformID for the current account"
       },
       "requireMention": {
         "type": "boolean",
@@ -62,11 +70,17 @@
               "type": "string",
               "description": "Infiai JWT token"
             },
+            "userID": {
+              "type": "string"
+            },
             "wsAddr": {
               "type": "string"
             },
             "apiAddr": {
               "type": "string"
+            },
+            "platformID": {
+              "type": "number"
             },
             "requireMention": {
               "type": "boolean",

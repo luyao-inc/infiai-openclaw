@@ -1,4 +1,7 @@
 import { SessionType, type MessageItem } from "@openim/client-sdk";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { sendTextToTarget } from "./media";
 import { ensureInfiaiReplyReady } from "./replyHeal";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
@@ -8,8 +11,61 @@ const inboundDedup = new Map<string, number>();
 const INBOUND_DEDUP_TTL_MS = 5 * 60 * 1000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
-
+/** Short TTL so workspace-state updates after toggling memory apply within a turn. */
+const MEMORY_POLICY_CACHE_TTL_MS = 500;
+const memoryPolicyCache = new Map<string, { expireAt: number; enabled: boolean }>();
 type ImagePart = { type: "image"; data: string; mimeType: string };
+
+function resolveWorkspaceStatePath(agentEntry: any): string {
+  const rawWorkspace = String(agentEntry?.workspace ?? "").trim();
+  if (!rawWorkspace) return "";
+  const expanded = rawWorkspace.startsWith("~/") ? path.join(os.homedir(), rawWorkspace.slice(2)) : rawWorkspace;
+  return path.join(expanded, ".openclaw", "workspace-state.json");
+}
+
+/**
+ * Workspace-state carries both legacy conversationMemoryEnabled and profile memoryEnabled.
+ * Host UI toggles memoryEnabled only; continuity must be off if either flag is explicitly false.
+ */
+async function readSessionContinuityFromWorkspaceState(agentEntry: any): Promise<boolean | null> {
+  const statePath = resolveWorkspaceStatePath(agentEntry);
+  if (!statePath) return null;
+  try {
+    const raw = await fs.readFile(statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const mem = parsed?.memoryEnabled;
+    const conv = parsed?.conversationMemoryEnabled;
+    if (mem === false || conv === false) return false;
+    const hasMem = typeof mem === "boolean";
+    const hasConv = typeof conv === "boolean";
+    if (!hasMem && !hasConv) return null;
+    return true;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether Infiai inbound messages join the stable OpenClaw thread for this peer.
+ * Source of truth: workspace-state.json (synced from Mongo by orchestrator).
+ *
+ * Do not gate this on cfg.agents.list[].memorySearch.enabled — that flag tracks semantic
+ * memory search tooling and may be toggled independently in Control UI; tying it here
+ * caused stable-session chats to fall through to :ephemeral: keys while profile memory stayed on.
+ */
+async function resolveInfiaiSessionContinuityEnabled(cfg: any, agentId: string): Promise<boolean> {
+  const cacheKey = String(agentId || "main");
+  const now = Date.now();
+  const cached = memoryPolicyCache.get(cacheKey);
+  if (cached && cached.expireAt > now) return cached.enabled;
+
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  const agentEntry = list.find((item: any) => item && String(item.id ?? "") === cacheKey) ?? null;
+  const sessionContinuity = await readSessionContinuityFromWorkspaceState(agentEntry);
+  const effectiveEnabled = sessionContinuity ?? true;
+  memoryPolicyCache.set(cacheKey, { enabled: effectiveEnabled, expireAt: now + MEMORY_POLICY_CACHE_TTL_MS });
+  return effectiveEnabled;
+}
 
 function normalizeImageMimeType(value: unknown): string | undefined {
   const mime = String(value ?? "").trim().toLowerCase();
@@ -375,8 +431,9 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   // 单聊不能只按 sendID（对端用户）建 session：同一真人发给两个托管号时 sendID 相同，
   // 会合并成一条 OpenClaw 会话、同一条 agent 记忆与 dashboard 线程。必须纳入本侧托管号 userID。
   const selfUid = String(client.config.userID).trim();
+  const accountScope = String(client.config.accountId || selfUid || "default").trim().toLowerCase();
   const baseSessionKey = group
-    ? `infiai:group:${msg.groupID}`.toLowerCase()
+    ? `infiai:group:${accountScope}:${String(msg.groupID).trim()}`.toLowerCase()
     : `infiai:direct:${selfUid}:${String(msg.sendID).trim()}`.toLowerCase();
   const cfg = api.config;
 
@@ -389,6 +446,11 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     }) ?? { agentId: "main", sessionKey: baseSessionKey };
 
   const sessionKey = String(route?.sessionKey ?? baseSessionKey).trim() || baseSessionKey;
+  const timestamp = msg.sendTime || Date.now();
+  const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(cfg, String(route?.agentId ?? "main"));
+  const effectiveSessionKey = sessionContinuityEnabled
+    ? sessionKey
+    : `${sessionKey}:ephemeral:${msg.clientMsgID || msg.serverMsgID || timestamp}`;
 
   const storePath =
     runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
@@ -398,7 +460,6 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const chatType: ChatType = group ? "group" : "direct";
   const fromLabel = String(msg.senderNickname || msg.sendID);
   const senderId = String(msg.sendID);
-  const timestamp = msg.sendTime || Date.now();
   const mediaResult = await materializeInboundMedia(inbound.media);
   const warningText = mediaResult.warnings.map((warning) => `[Media fetch failed] ${warning}`).join("\n");
   const rawBody = warningText ? `${inbound.body}\n${warningText}` : inbound.body;
@@ -413,9 +474,9 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const ctxPayload = {
     Body: body,
     RawBody: rawBody,
-    From: group ? `infiai:group:${msg.groupID}` : `infiai:direct:${selfUid}:${msg.sendID}`,
+    From: group ? `infiai:group:${accountScope}:${msg.groupID}` : `infiai:direct:${selfUid}:${msg.sendID}`,
     To: `infiai:${client.config.userID}`,
-    SessionKey: sessionKey,
+    SessionKey: effectiveSessionKey,
     AccountId: client.config.accountId,
     ChatType: chatType,
     ConversationLabel: fromLabel,
@@ -435,17 +496,18 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       groupId: String(msg.groupID || ""),
       messageKind: inbound.kind,
       mediaCount: inbound.media?.length ?? 0,
+      sessionContinuityEnabled,
     },
   };
 
-  if (runtime.channel.session?.recordInboundSession) {
+  if (sessionContinuityEnabled && runtime.channel.session?.recordInboundSession) {
     await runtime.channel.session.recordInboundSession({
       storePath,
-      sessionKey,
+      sessionKey: effectiveSessionKey,
       ctx: ctxPayload,
       updateLastRoute: !group
         ? {
-            sessionKey,
+            sessionKey: effectiveSessionKey,
             channel: "infiai",
             to: String(msg.sendID),
             accountId: client.config.accountId,
