@@ -15,8 +15,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
-const OPENCLAW_HOME = join(homedir(), ".openclaw");
-const CONFIG_PATH = join(OPENCLAW_HOME, "openclaw.json");
+/** Local user OpenClaw config dir (~/.openclaw). Not `process.env.OPENCLAW_HOME`: upstream uses that as *effective HOME* (state = $OPENCLAW_HOME/.openclaw). */
+const OPENCLAW_USER_CONFIG_DIR = join(homedir(), ".openclaw");
+const CONFIG_PATH = join(OPENCLAW_USER_CONFIG_DIR, "openclaw.json");
 
 function guardCancel<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -87,7 +88,7 @@ export async function runOpenIMSetup(): Promise<void> {
 
   const next = { ...existing, channels };
 
-  mkdirSync(OPENCLAW_HOME, { recursive: true });
+  mkdirSync(OPENCLAW_USER_CONFIG_DIR, { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf-8");
 
   clackNote(

@@ -13,6 +13,22 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 /** Short TTL so workspace-state updates after toggling memory apply within a turn. */
 const MEMORY_POLICY_CACHE_TTL_MS = 500;
+
+function transcriptObsEnabled(): boolean {
+  const v = String(process.env.OPENCLAW_TRANSCRIPT_OBSERVABILITY ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+function obsInboundLog(api: any, event: string, fields: Record<string, unknown>): void {
+  if (!transcriptObsEnabled()) return;
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    source: "infiai-gateway-obs",
+    event,
+    ...fields,
+  });
+  api.logger?.info?.(`[openclaw-obs] ${line}`);
+}
 const memoryPolicyCache = new Map<string, { expireAt: number; enabled: boolean }>();
 type ImagePart = { type: "image"; data: string; mimeType: string };
 
@@ -500,6 +516,22 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     },
   };
 
+  obsInboundLog(api, "inbound.accept", {
+    accountId: client.config.accountId,
+    managedUserId: selfUid,
+    agentId: String(route?.agentId ?? "main"),
+    sessionKey,
+    effectiveSessionKey,
+    sessionContinuityEnabled,
+    storePath: storePath || undefined,
+    clientMsgID: msg.clientMsgID || undefined,
+    serverMsgID: msg.serverMsgID || undefined,
+    imSeq: typeof msg.seq === "number" ? msg.seq : undefined,
+    contentType: msg.contentType,
+    senderId,
+    bodyChars: rawBody.length,
+  });
+
   if (sessionContinuityEnabled && runtime.channel.session?.recordInboundSession) {
     await runtime.channel.session.recordInboundSession({
       storePath,
@@ -525,6 +557,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     });
   }
 
+  const dispatchObsStart = transcriptObsEnabled() ? Date.now() : 0;
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -549,7 +582,26 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
         images: mediaResult.images,
       },
     });
+    if (dispatchObsStart) {
+      obsInboundLog(api, "inbound.dispatch.done", {
+        accountId: client.config.accountId,
+        agentId: String(route?.agentId ?? "main"),
+        effectiveSessionKey,
+        clientMsgID: msg.clientMsgID || undefined,
+        durationMs: Date.now() - dispatchObsStart,
+      });
+    }
   } catch (err: any) {
+    if (dispatchObsStart) {
+      obsInboundLog(api, "inbound.dispatch.fail", {
+        accountId: client.config.accountId,
+        agentId: String(route?.agentId ?? "main"),
+        effectiveSessionKey,
+        clientMsgID: msg.clientMsgID || undefined,
+        durationMs: Date.now() - dispatchObsStart,
+        error: formatSdkError(err).slice(0, 500),
+      });
+    }
     api.logger?.error?.(`[infiai] dispatch failed: ${formatSdkError(err)}`);
     try {
       const errMsg = formatSdkError(err);
