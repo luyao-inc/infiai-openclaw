@@ -511,6 +511,23 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       accountId: client.config.accountId,
     }) ?? { agentId: "main", sessionKey: baseSessionKey };
 
+  const matchedBy =
+    route && typeof route === "object" && "matchedBy" in route
+      ? String((route as { matchedBy?: string }).matchedBy ?? "").trim()
+      : "";
+  if (matchedBy === "default") {
+    api.logger?.warn?.(
+      `[infiai] routing: matchedBy=default accountId=${client.config.accountId} userID=${client.config.userID} resolvedAgentId=${String(route?.agentId ?? "main")} — no cfg.bindings route matched this Infiai account; OpenClaw fell back to resolveDefaultAgentId (often agents.list[0]). Fix: ensure orchestrator upsertManagedPoolAgent wrote both channels.infiai.accounts[accountKey] and a bindings row { channel: infiai, accountId }. Orphan agents.list entries alone do not route traffic.`
+    );
+  }
+  const bindingAgentId = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId);
+  const accEntry = cfg?.channels?.infiai?.accounts?.[client.config.accountId];
+  if (accEntry && !bindingAgentId) {
+    api.logger?.warn?.(
+      `[infiai] routing: channels.infiai.accounts['${client.config.accountId}'] exists but no bindings row for channel infiai + this accountId — resolveAgentRoute cannot bind this login to the correct agent.`
+    );
+  }
+
   const sessionKey = String(route?.sessionKey ?? baseSessionKey).trim() || baseSessionKey;
   const timestamp = msg.sendTime || Date.now();
   const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(cfg, String(route?.agentId ?? "main"));
