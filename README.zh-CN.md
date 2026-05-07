@@ -90,6 +90,12 @@ openclaw infiai setup
 - `INFIAI_USER_ID`
 - `INFIAI_PLATFORM_ID`
 
+托管池 / 托管机器人互发轮次上限（可选；仅进程内计数，网关重启后清零）。熔断按 **`cfg.bindings` 里当前 `accountId` 对应的 agent** 与对应 `workspace-state.json` 的 `maxDialogueRounds` 计算，**不依赖** `resolveAgentRoute`（避免路由飘到别的租户 agent 时限额失效）。
+
+- `MANAGED_AGENT_MAX_DIALOGUE_ROUNDS_CAP` — 与 workspace-state 中 `maxDialogueRounds` 上限钳制（默认 `10`）。
+- `MANAGED_AGENT_MAX_DIALOGUE_ROUNDS_DEFAULT` — workspace-state 未写 `maxDialogueRounds` 时的默认轮次（默认 `5`）。
+- `MANAGED_AGENT_MANAGED_MANAGED_IDLE_RESET_SEC` — 托管↔托管计数器若连续 **秒数** 无变化，则在下次入站时惰性清零（默认 `180` 秒）。
+
 ## Agent 工具
 
 - `infiai_send_text`

@@ -2,6 +2,9 @@ import { SessionType, type MessageItem } from "@openim/client-sdk";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { consumeManagedManagedReplySlot, resolveManagedPairKey } from "./managedManagedCap";
+import { resolveManagedMaxDialogueRoundsCap, resolveManagedMaxDialogueRoundsDefault } from "./managedManagedEnv";
+import { isUserInfiaiManagedInCfg, resolveInfiaiAgentIdForAccount } from "./managedManagedPredicate";
 import { sendTextToTarget } from "./media";
 import { ensureInfiaiReplyReady } from "./replyHeal";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
@@ -81,6 +84,50 @@ async function resolveInfiaiSessionContinuityEnabled(cfg: any, agentId: string):
   const effectiveEnabled = sessionContinuity ?? true;
   memoryPolicyCache.set(cacheKey, { enabled: effectiveEnabled, expireAt: now + MEMORY_POLICY_CACHE_TTL_MS });
   return effectiveEnabled;
+}
+
+async function readMaxDialogueRoundsFromWorkspaceState(agentEntry: any): Promise<number | null> {
+  const statePath = resolveWorkspaceStatePath(agentEntry);
+  if (!statePath) return null;
+  try {
+    const raw = await fs.readFile(statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const n = Number(parsed?.maxDialogueRounds);
+    if (!Number.isFinite(n)) return null;
+    const cap = resolveManagedMaxDialogueRoundsCap();
+    return Math.max(1, Math.min(cap, Math.trunc(n)));
+  } catch {
+    return null;
+  }
+}
+
+async function resolveInfiaiMaxDialogueRounds(cfg: any, agentId: string): Promise<number> {
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  const item = list.find((entry: any) => entry && String(entry.id ?? "") === String(agentId || "main"));
+  const fromWorkspace = await readMaxDialogueRoundsFromWorkspaceState(item);
+  if (fromWorkspace && fromWorkspace > 0) return fromWorkspace;
+  return resolveManagedMaxDialogueRoundsDefault();
+}
+
+/**
+ * Platform ID used when the managed pool logs into OpenIM as the bot tenant (must match
+ * chat/orchestrator `OPENCLAW_MANAGED_IM_PLATFORM`, typically 12). Real users send from
+ * Web/iOS/Android with other IDs — see OpenIM `senderPlatformID` on messages.
+ */
+function resolveManagedImBotPlatformId(): number {
+  const raw = String(process.env.OPENCLAW_MANAGED_IM_PLATFORM ?? process.env.INFIAI_MANAGED_IM_PLATFORM ?? "").trim();
+  if (!raw) return 12;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 12;
+  return Math.trunc(n);
+}
+
+/** True only if this inbound looks like another managed-runtime send (bot↔bot), not a human client. */
+function isInboundFromManagedBotSession(msg: MessageItem): boolean {
+  const m = msg as MessageItem & { senderPlatformID?: number };
+  const pid = Number(m.senderPlatformID);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  return pid === resolveManagedImBotPlatformId();
 }
 
 function normalizeImageMimeType(value: unknown): string | undefined {
@@ -419,6 +466,9 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     return;
   }
   if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
+    api.logger?.info?.(
+      `[infiai] inbound dedup skip: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} serverMsgID=${msg.serverMsgID || ""} sendID=${msg.sendID}`
+    );
     return;
   }
 
@@ -476,6 +526,31 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const chatType: ChatType = group ? "group" : "direct";
   const fromLabel = String(msg.senderNickname || msg.sendID);
   const senderId = String(msg.sendID);
+  const selfManaged = isUserInfiaiManagedInCfg(cfg, selfUid);
+  const senderManaged = isUserInfiaiManagedInCfg(cfg, senderId);
+  // Round-cap only for managed↔managed **bot traffic**. Same OpenIM userId may also log in as a
+  // human (e.g. Web); those sends carry a non-bot senderPlatformID and must not trip the cap.
+  if (!group && selfManaged && senderManaged && isInboundFromManagedBotSession(msg)) {
+    const pairKey = resolveManagedPairKey(selfUid, senderId);
+    const routeAgentId = String(route?.agentId ?? "main");
+    // Round-cap must follow cfg.bindings for this account — resolveAgentRoute can point at another
+    // tenant's agent (wrong session) while the Infiai account is still correctly provisioned.
+    const replyAgentForCap = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ?? routeAgentId;
+    if (replyAgentForCap !== routeAgentId) {
+      api.logger?.info?.(
+        `[infiai] managed round-cap: using binding agent ${replyAgentForCap} (resolveAgentRoute=${routeAgentId}) accountId=${client.config.accountId}`
+      );
+    }
+    const replyCapKey = `${pairKey}|reply|${replyAgentForCap}`;
+    const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(cfg, replyAgentForCap);
+    const slot = consumeManagedManagedReplySlot(replyCapKey, maxDialogueRounds);
+    if (!slot.allowed) {
+      api.logger?.warn?.(
+        `[infiai] managed dialogue capped: pair=${pairKey}, replyAgent=${replyAgentForCap}, reason=round_cap count=${slot.countAtDecision}, maxRounds=${slot.maxRounds}, counterReset=1, session=${effectiveSessionKey}, clientMsgID=${msg.clientMsgID || ""}`
+      );
+      return;
+    }
+  }
   const mediaResult = await materializeInboundMedia(inbound.media);
   const warningText = mediaResult.warnings.map((warning) => `[Media fetch failed] ${warning}`).join("\n");
   const rawBody = warningText ? `${inbound.body}\n${warningText}` : inbound.body;

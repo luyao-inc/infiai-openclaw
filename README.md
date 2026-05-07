@@ -91,6 +91,12 @@ Optional env overrides:
 - `INFIAI_USER_ID`
 - `INFIAI_PLATFORM_ID`
 
+Managed-pool / bot-to-bot round cap (optional; in-process only, resets on gateway restart). The cap uses the **Infiai `bindings` agent for the current `accountId`**, not `resolveAgentRoute`, so limits follow each tenant’s `workspace-state.json` even when session routing points at another agent.
+
+- `MANAGED_AGENT_MAX_DIALOGUE_ROUNDS_CAP` — upper bound for `maxDialogueRounds` from workspace-state (default `10`).
+- `MANAGED_AGENT_MAX_DIALOGUE_ROUNDS_DEFAULT` — default rounds when workspace-state omits `maxDialogueRounds` (default `5`).
+- `MANAGED_AGENT_MANAGED_MANAGED_IDLE_RESET_SEC` — if a managed↔managed reply counter is unchanged for this many **seconds**, it is reset on the next inbound (default `180`).
+
 ## Agent Tools
 
 - `infiai_send_text`

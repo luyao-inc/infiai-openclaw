@@ -4,6 +4,9 @@
   "version": "0.3.2",
   "description": "Infiai protocol channel for OpenClaw",
   "author": "openclaw-infiai",
+  "contracts": {
+    "tools": true
+  },
   "channels": [
     "infiai"
   ],

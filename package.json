@@ -25,6 +25,9 @@
     "extensions": [
       "./dist/index.js"
     ],
+    "contracts": {
+      "tools": true
+    },
     "channel": {
       "id": "infiai",
       "label": "Infiai",
