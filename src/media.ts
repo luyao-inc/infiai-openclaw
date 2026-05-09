@@ -82,6 +82,46 @@ export async function sendTextToTarget(client: OpenIMClientState, target: Parsed
   });
 }
 
+export async function sendAtTextToGroup(
+  client: OpenIMClientState,
+  groupID: string,
+  atUserID: string,
+  text: string,
+  atNickname?: string
+): Promise<void> {
+  const displayName = String(atNickname || atUserID).trim();
+  const content = `@${displayName} ${String(text ?? "").trim()}`.trim();
+  const hasCreateAtMsg = typeof (client.sdk as any).createTextAtMessage === "function";
+  console.warn(`[infiai] sendAtTextToGroup: groupID=${groupID}, atUserID=${atUserID}, textLen=${text.length}, hasCreateAtMsg=${hasCreateAtMsg}, sdkExists=${!!client.sdk}`);
+  if (!hasCreateAtMsg) {
+    console.warn(
+      `[infiai] createTextAtMessage not available on SDK, falling back to createTextMessage — reply will lack formal @-mention, groupID=${groupID}, atUserID=${atUserID}`
+    );
+  }
+  const created = hasCreateAtMsg
+    ? await (client.sdk as any).createTextAtMessage({
+        text: content,
+        atUserIDList: [atUserID],
+        atUsersInfo: [
+          {
+            atUserID,
+            groupNickname: atNickname || atUserID,
+          },
+        ],
+      })
+    : await client.sdk.createTextMessage(content);
+  const message = created?.data;
+  console.warn(`[infiai] sendAtTextToGroup: message created, hasData=${!!message}, dataKeys=${message ? Object.keys(message).join(",") : "null"}`);
+  if (!message) throw new Error("createTextAtMessage failed");
+  console.warn(`[infiai] sendAtTextToGroup: calling sendMessage recvID="" groupID=${groupID}`);
+  await client.sdk.sendMessage({
+    recvID: "",
+    groupID,
+    message,
+  });
+  console.warn(`[infiai] sendAtTextToGroup: sendMessage COMPLETED`);
+}
+
 export async function sendImageToTarget(client: OpenIMClientState, target: ParsedTarget, image: string): Promise<void> {
   const input = image.trim();
   if (!input) throw new Error("image is empty");

@@ -1,11 +1,11 @@
-import { SessionType, type MessageItem } from "@openim/client-sdk";
+import { NotificationType, SessionType, type MessageItem } from "@openim/client-sdk";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { consumeManagedManagedReplySlot, resolveManagedPairKey } from "./managedManagedCap";
 import { resolveManagedMaxDialogueRoundsCap, resolveManagedMaxDialogueRoundsDefault } from "./managedManagedEnv";
 import { isUserInfiaiManagedInCfg, resolveInfiaiAgentIdForAccount } from "./managedManagedPredicate";
-import { sendTextToTarget } from "./media";
+import { sendAtTextToGroup, sendTextToTarget } from "./media";
 import { ensureInfiaiReplyReady } from "./replyHeal";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
 import { formatSdkError } from "./utils";
@@ -432,11 +432,57 @@ function isGroupMessage(msg: MessageItem): boolean {
   return msg.sessionType === SessionType.Group && !!msg.groupID;
 }
 
+function isOpenIMNotificationMessage(msg: MessageItem): boolean {
+  const contentType = Number(msg.contentType);
+  if (!Number.isFinite(contentType)) return false;
+  return contentType >= NotificationType.NotificationBegin && contentType <= NotificationType.NotificationEnd;
+}
+
+function collectIdsFromUnknown(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  return [];
+}
+
+function extractMentionedUserIDsFromAttachedInfo(attachedInfo?: string): string[] {
+  const raw = String(attachedInfo ?? "").trim();
+  if (!raw) return [];
+  try {
+    const o = JSON.parse(raw) as Record<string, unknown>;
+    const nested = o.groupHasReadInfo as Record<string, unknown> | undefined;
+    return [
+      ...collectIdsFromUnknown(o.atUserIDList),
+      ...collectIdsFromUnknown(o.atUserList),
+      ...collectIdsFromUnknown(nested?.atUserIDList),
+      ...collectIdsFromUnknown(nested?.atUserList),
+    ];
+  } catch {
+    return [];
+  }
+}
+
 function isMentionedInGroup(msg: MessageItem, selfUserID: string): boolean {
-  const list = msg.atTextElem?.atUserList;
-  if (!Array.isArray(list) || list.length === 0) return false;
   const id = String(selfUserID);
-  return list.some((item) => String(item) === id);
+  return extractMentionedUserIDs(msg).some((item) => item === id);
+}
+
+function extractMentionedUserIDs(msg: MessageItem): string[] {
+  const elem = msg.atTextElem as MessageItem["atTextElem"] & {
+    atUserIDList?: string[];
+    atUsersInfo?: Array<{ atUserID?: string }>;
+  };
+  const topLevelList = Array.isArray((msg as any).atUserIDList)
+    ? (msg as any).atUserIDList.map((item: unknown) => String(item || "").trim())
+    : [];
+  const fromList = Array.isArray(elem?.atUserList) ? elem.atUserList.map((item) => String(item || "").trim()) : [];
+  const fromIDList = Array.isArray(elem?.atUserIDList)
+    ? elem.atUserIDList.map((item) => String(item || "").trim())
+    : [];
+  const fromInfo = Array.isArray(elem?.atUsersInfo)
+    ? elem.atUsersInfo.map((item) => String(item?.atUserID || "").trim())
+    : [];
+  const fromAttached = extractMentionedUserIDsFromAttachedInfo(msg.attachedInfo);
+  return [...new Set([...topLevelList, ...fromList, ...fromIDList, ...fromInfo, ...fromAttached].filter(Boolean))];
 }
 
 function isWhitelistedSender(client: OpenIMClientState, msg: MessageItem): boolean {
@@ -449,8 +495,27 @@ function isWhitelistedSender(client: OpenIMClientState, msg: MessageItem): boole
 
 async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem, text: string): Promise<void> {
   const isGroup = isGroupMessage(msg);
+  console.warn(`[infiai] sendReplyFromInbound: isGroup=${isGroup}, groupID=${String(msg.groupID || "-")}, sendID=${String(msg.sendID || "-")}, textLen=${text.length}, clientMsgID=${msg.clientMsgID || "-"}`);
+  if (isGroup) {
+    const senderID = String(msg.sendID || "").trim();
+    if (senderID) {
+      console.warn(`[infiai] sendReplyFromInbound: GROUP path, groupID=${String(msg.groupID)}, senderID=${senderID}, textLen=${text.length}`);
+      await sendAtTextToGroup(
+        client,
+        String(msg.groupID),
+        senderID,
+        text,
+        String(msg.senderNickname || senderID)
+      );
+      console.warn(`[infiai] sendReplyFromInbound: GROUP sendAtTextToGroup COMPLETED`);
+      return;
+    }
+    console.warn(`[infiai] sendReplyFromInbound: GROUP but senderID empty, falling through to sendTextToTarget`);
+  }
   const target: ParsedTarget = isGroup ? { kind: "group", id: String(msg.groupID) } : { kind: "user", id: String(msg.sendID) };
+  console.warn(`[infiai] sendReplyFromInbound: target kind=${target.kind}, id=${target.id}`);
   await sendTextToTarget(client, target, text);
+  console.warn(`[infiai] sendReplyFromInbound: sendTextToTarget COMPLETED`);
 }
 
 export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
@@ -465,6 +530,26 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   if (String(msg.sendID) === String(client.config.userID)) {
     return;
   }
+  if (isOpenIMNotificationMessage(msg)) {
+    return;
+  }
+
+  // 群聊 @ 检查提至最前：非当前 agent 的消息直接丢弃，不执行任何处理与日志
+  const group = isGroupMessage(msg);
+  const mentioned = group && isMentionedInGroup(msg, client.config.userID);
+  const mentionedIDs = group ? extractMentionedUserIDs(msg) : [];
+  const hasWhitelist = client.config.inboundWhitelist.length > 0;
+  if (hasWhitelist) {
+    if (!isWhitelistedSender(client, msg)) {
+      return;
+    }
+    if (group && !mentioned) {
+      return;
+    }
+  } else if (group && client.config.requireMention && !mentioned) {
+    return;
+  }
+
   if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
     api.logger?.info?.(
       `[infiai] inbound dedup skip: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} serverMsgID=${msg.serverMsgID || ""} sendID=${msg.sendID}`
@@ -480,26 +565,13 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     return;
   }
 
-  const group = isGroupMessage(msg);
-  const mentioned = group && isMentionedInGroup(msg, client.config.userID);
-  const hasWhitelist = client.config.inboundWhitelist.length > 0;
-  if (hasWhitelist) {
-    if (!isWhitelistedSender(client, msg)) {
-      return;
-    }
-    if (group && !mentioned) {
-      return;
-    }
-  } else if (group && client.config.requireMention && !mentioned) {
-    return;
-  }
-
   // 单聊不能只按 sendID（对端用户）建 session：同一真人发给两个托管号时 sendID 相同，
   // 会合并成一条 OpenClaw 会话、同一条 agent 记忆与 dashboard 线程。必须纳入本侧托管号 userID。
   const selfUid = String(client.config.userID).trim();
   const accountScope = String(client.config.accountId || selfUid || "default").trim().toLowerCase();
+  // 群聊 session 加入 sendID 区分不同发言者，防止同群内多人 @ 同一 agent 时记忆串线
   const baseSessionKey = group
-    ? `infiai:group:${accountScope}:${String(msg.groupID).trim()}`.toLowerCase()
+    ? `infiai:group:${accountScope}:${String(msg.groupID).trim()}:${String(msg.sendID).trim()}`.toLowerCase()
     : `infiai:direct:${selfUid}:${String(msg.sendID).trim()}`.toLowerCase();
   const cfg = api.config;
 
@@ -528,7 +600,16 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     );
   }
 
-  const sessionKey = String(route?.sessionKey ?? baseSessionKey).trim() || baseSessionKey;
+  const routedSessionKey = String(route?.sessionKey ?? "").trim();
+  // 单聊：resolveAgentRoute 常返回 agent:<binding>:main，不含对端 sendID，会把不同真人合并成同一条
+  // OpenClaw / dashboard 线程。
+  // 群聊：路由结果常为 agent:<binding>:main，不含 sendID。必须追加 sendID 以防止同群内
+  // 不同发言者共享同一 session 导致记忆串线。baseSessionKey 已在下方构造时纳入了 sendID。
+  const sessionKey = group
+    ? routedSessionKey
+      ? `${routedSessionKey}:${String(msg.sendID).trim()}`.toLowerCase()
+      : baseSessionKey
+    : baseSessionKey;
   const timestamp = msg.sendTime || Date.now();
   const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(cfg, String(route?.agentId ?? "main"));
   const effectiveSessionKey = sessionContinuityEnabled
@@ -568,6 +649,20 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       return;
     }
   }
+  if (group && mentioned && selfManaged && senderManaged && isInboundFromManagedBotSession(msg)) {
+    const pairKey = resolveManagedPairKey(selfUid, senderId);
+    const routeAgentId = String(route?.agentId ?? "main");
+    const replyAgentForCap = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ?? routeAgentId;
+    const groupScopedKey = `${String(msg.groupID).trim().toLowerCase()}|${pairKey}|reply|${replyAgentForCap}`;
+    const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(cfg, replyAgentForCap);
+    const slot = consumeManagedManagedReplySlot(groupScopedKey, maxDialogueRounds);
+    if (!slot.allowed) {
+      api.logger?.warn?.(
+        `[infiai] managed dialogue capped: scope=group pair=${pairKey}, groupID=${String(msg.groupID)}, replyAgent=${replyAgentForCap}, reason=round_cap count=${slot.countAtDecision}, maxRounds=${slot.maxRounds}, counterReset=1, session=${effectiveSessionKey}, clientMsgID=${msg.clientMsgID || ""}`
+      );
+      return;
+    }
+  }
   const mediaResult = await materializeInboundMedia(inbound.media);
   const warningText = mediaResult.warnings.map((warning) => `[Media fetch failed] ${warning}`).join("\n");
   const rawBody = warningText ? `${inbound.body}\n${warningText}` : inbound.body;
@@ -582,7 +677,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const ctxPayload = {
     Body: body,
     RawBody: rawBody,
-    From: group ? `infiai:group:${accountScope}:${msg.groupID}` : `infiai:direct:${selfUid}:${msg.sendID}`,
+    From: group ? `infiai:group:${accountScope}:${msg.groupID}:${msg.sendID}` : `infiai:direct:${selfUid}:${msg.sendID}`,
     To: `infiai:${client.config.userID}`,
     SessionKey: effectiveSessionKey,
     AccountId: client.config.accountId,
@@ -602,27 +697,31 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       isGroup: group,
       senderId,
       groupId: String(msg.groupID || ""),
+      mentionUserIds: mentionedIDs,
       messageKind: inbound.kind,
       mediaCount: inbound.media?.length ?? 0,
       sessionContinuityEnabled,
     },
   };
 
-  obsInboundLog(api, "inbound.accept", {
-    accountId: client.config.accountId,
-    managedUserId: selfUid,
-    agentId: String(route?.agentId ?? "main"),
-    sessionKey,
-    effectiveSessionKey,
-    sessionContinuityEnabled,
-    storePath: storePath || undefined,
-    clientMsgID: msg.clientMsgID || undefined,
-    serverMsgID: msg.serverMsgID || undefined,
-    imSeq: typeof msg.seq === "number" ? msg.seq : undefined,
-    contentType: msg.contentType,
-    senderId,
-    bodyChars: rawBody.length,
-  });
+  const obsGroupOk = !group || mentioned;
+  if (obsGroupOk) {
+    obsInboundLog(api, "inbound.accept", {
+      accountId: client.config.accountId,
+      managedUserId: selfUid,
+      agentId: String(route?.agentId ?? "main"),
+      sessionKey,
+      effectiveSessionKey,
+      sessionContinuityEnabled,
+      storePath: storePath || undefined,
+      clientMsgID: msg.clientMsgID || undefined,
+      serverMsgID: msg.serverMsgID || undefined,
+      imSeq: typeof msg.seq === "number" ? msg.seq : undefined,
+      contentType: msg.contentType,
+      senderId,
+      bodyChars: rawBody.length,
+    });
+  }
 
   if (sessionContinuityEnabled && runtime.channel.session?.recordInboundSession) {
     await runtime.channel.session.recordInboundSession({
@@ -656,17 +755,26 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       cfg,
       dispatcherOptions: {
         deliver: async (payload: { text?: string }) => {
-          if (!payload.text) return;
+          console.warn(`[infiai] deliver called: group=${group}, hasText=${!!payload.text}, textLen=${payload.text?.length || 0}, contentLen=${typeof payload.text === "string" ? payload.text.length : "non-string"}, clientMsgID=${msg.clientMsgID || "-"}`);
+          if (!payload.text) {
+            console.warn(`[infiai] deliver skipped: empty AI reply, serverMsgID=${msg.serverMsgID || ""} clientMsgID=${msg.clientMsgID || ""}`);
+            return;
+          }
           const cleaned = stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(payload.text));
-          if (!cleaned.trim()) return;
+          if (!cleaned.trim()) {
+            console.warn(`[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`);
+            return;
+          }
+          console.warn(`[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`);
           try {
             await sendReplyFromInbound(client, msg, cleaned);
+            console.warn(`[infiai] deliver OK: group=${group}, clientMsgID=${msg.clientMsgID || "-"}`);
           } catch (e: any) {
-            api.logger?.error?.(`[infiai] deliver failed: ${formatSdkError(e)}`);
+            console.warn(`[infiai] deliver failed: ${formatSdkError(e)}`);
           }
         },
         onError: (err: unknown, info: { kind?: string }) => {
-          api.logger?.error?.(`[infiai] ${info?.kind || "reply"} failed: ${String(err)}`);
+          console.warn(`[infiai] dispatch onError: kind=${info?.kind || "reply"}, err=${String(err)}`);
         },
       },
       replyOptions: {
@@ -674,7 +782,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
         images: mediaResult.images,
       },
     });
-    if (dispatchObsStart) {
+    if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.done", {
         accountId: client.config.accountId,
         agentId: String(route?.agentId ?? "main"),
@@ -684,7 +792,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       });
     }
   } catch (err: any) {
-    if (dispatchObsStart) {
+    if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.fail", {
         accountId: client.config.accountId,
         agentId: String(route?.agentId ?? "main"),
@@ -695,6 +803,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       });
     }
     api.logger?.error?.(`[infiai] dispatch failed: ${formatSdkError(err)}`);
+    console.warn(`[infiai] dispatch failed (console): ${formatSdkError(err)}`);
     try {
       const errMsg = formatSdkError(err);
       await sendReplyFromInbound(client, msg, `Processing failed: ${errMsg.slice(0, 80)}`);
