@@ -35,6 +35,21 @@ function obsInboundLog(api: any, event: string, fields: Record<string, unknown>)
 const memoryPolicyCache = new Map<string, { expireAt: number; enabled: boolean }>();
 type ImagePart = { type: "image"; data: string; mimeType: string };
 
+function normalizeSessionKeyPart(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function isAgentScopedSessionKey(sessionKey: string): boolean {
+  return /^agent:[^:]+:.+/.test(sessionKey);
+}
+
+function buildAgentScopedSessionKey(agentId: string, peerSessionKey: string): string {
+  const peer = normalizeSessionKeyPart(peerSessionKey);
+  const agent = String(agentId || "main").trim() || "main";
+  if (!peer) return `agent:${agent}:main`.toLowerCase();
+  return isAgentScopedSessionKey(peer) ? peer : `agent:${agent}:${peer}`.toLowerCase();
+}
+
 function resolveWorkspaceStatePath(agentEntry: any): string {
   const rawWorkspace = String(agentEntry?.workspace ?? "").trim();
   if (!rawWorkspace) return "";
@@ -570,7 +585,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const selfUid = String(client.config.userID).trim();
   const accountScope = String(client.config.accountId || selfUid || "default").trim().toLowerCase();
   // 群聊 session 加入 sendID 区分不同发言者，防止同群内多人 @ 同一 agent 时记忆串线
-  const baseSessionKey = group
+  const peerSessionKey = group
     ? `infiai:group:${accountScope}:${String(msg.groupID).trim()}:${String(msg.sendID).trim()}`.toLowerCase()
     : `infiai:direct:${selfUid}:${String(msg.sendID).trim()}`.toLowerCase();
   const cfg = api.config;
@@ -578,10 +593,10 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const route =
     runtime.channel.routing?.resolveAgentRoute?.({
       cfg,
-      sessionKey: baseSessionKey,
+      sessionKey: peerSessionKey,
       channel: "infiai",
       accountId: client.config.accountId,
-    }) ?? { agentId: "main", sessionKey: baseSessionKey };
+    }) ?? { agentId: "main", sessionKey: buildAgentScopedSessionKey("main", peerSessionKey) };
 
   const matchedBy =
     route && typeof route === "object" && "matchedBy" in route
@@ -600,25 +615,19 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     );
   }
 
-  const routedSessionKey = String(route?.sessionKey ?? "").trim();
-  // 单聊：resolveAgentRoute 常返回 agent:<binding>:main，不含对端 sendID，会把不同真人合并成同一条
-  // OpenClaw / dashboard 线程。
-  // 群聊：路由结果常为 agent:<binding>:main，不含 sendID。必须追加 sendID 以防止同群内
-  // 不同发言者共享同一 session 导致记忆串线。baseSessionKey 已在下方构造时纳入了 sendID。
-  const sessionKey = group
-    ? routedSessionKey
-      ? `${routedSessionKey}:${String(msg.sendID).trim()}`.toLowerCase()
-      : baseSessionKey
-    : baseSessionKey;
+  // OpenClaw dispatch resolves the execution agent from ctx.SessionKey. A bare
+  // infiai:* key falls back to the default agent, so always scope by route.agentId.
+  const routeAgentId = String(route?.agentId ?? "main");
+  const sessionKey = buildAgentScopedSessionKey(routeAgentId, peerSessionKey);
   const timestamp = msg.sendTime || Date.now();
-  const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(cfg, String(route?.agentId ?? "main"));
+  const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(cfg, routeAgentId);
   const effectiveSessionKey = sessionContinuityEnabled
     ? sessionKey
     : `${sessionKey}:ephemeral:${msg.clientMsgID || msg.serverMsgID || timestamp}`;
 
   const storePath =
     runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
-      agentId: route.agentId,
+      agentId: routeAgentId,
     }) ?? "";
 
   const chatType: ChatType = group ? "group" : "direct";
@@ -630,7 +639,6 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   // human (e.g. Web); those sends carry a non-bot senderPlatformID and must not trip the cap.
   if (!group && selfManaged && senderManaged && isInboundFromManagedBotSession(msg)) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
-    const routeAgentId = String(route?.agentId ?? "main");
     // Round-cap must follow cfg.bindings for this account — resolveAgentRoute can point at another
     // tenant's agent (wrong session) while the Infiai account is still correctly provisioned.
     const replyAgentForCap = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ?? routeAgentId;
@@ -651,7 +659,6 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   }
   if (group && mentioned && selfManaged && senderManaged && isInboundFromManagedBotSession(msg)) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
-    const routeAgentId = String(route?.agentId ?? "main");
     const replyAgentForCap = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ?? routeAgentId;
     const groupScopedKey = `${String(msg.groupID).trim().toLowerCase()}|${pairKey}|reply|${replyAgentForCap}`;
     const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(cfg, replyAgentForCap);
