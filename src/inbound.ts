@@ -1,4 +1,5 @@
 import {
+  MessageType,
   NotificationType,
   SessionType,
   type MessageItem,
@@ -38,6 +39,7 @@ const IMAGE_FETCH_TIMEOUT_MS = 15000;
 const MEMORY_POLICY_CACHE_TTL_MS = 500;
 const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
 const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
+const INFIAI_TYPING_CUSTOM_TYPE = 260;
 
 function parseMessageEx(msg: MessageItem): Record<string, unknown> | null {
   const raw = String((msg as MessageItem & { ex?: string }).ex ?? "").trim();
@@ -60,8 +62,11 @@ function getInfiaiMessageSource(msg: MessageItem): string {
   return String((infiai as Record<string, unknown>).source ?? "");
 }
 
-function isAssistantEchoMessage(msg: MessageItem): boolean {
-  return getInfiaiMessageSource(msg) === ASSISTANT_MESSAGE_SOURCE;
+function isAssistantEchoMessage(msg: MessageItem, selfUserID: string): boolean {
+  return (
+    getInfiaiMessageSource(msg) === ASSISTANT_MESSAGE_SOURCE &&
+    String(msg.sendID || "").trim() === String(selfUserID || "").trim()
+  );
 }
 
 function isHumanSelfAssistantMessage(
@@ -240,6 +245,164 @@ async function resolveInfiaiMaxDialogueRounds(
   const fromWorkspace = await readMaxDialogueRoundsFromWorkspaceState(item);
   if (fromWorkspace && fromWorkspace > 0) return fromWorkspace;
   return resolveManagedMaxDialogueRoundsDefault();
+}
+
+async function readAutomationModeFromWorkspaceState(
+  agentEntry: any,
+): Promise<string | null> {
+  const statePath = resolveWorkspaceStatePath(agentEntry);
+  if (!statePath) return null;
+  try {
+    const raw = await fs.readFile(statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const mode = String(parsed?.automationMode ?? "").trim().toLowerCase();
+    if (mode === "always" || mode === "offline_only" || mode === "none")
+      return mode;
+  } catch {
+    // ignore, cfg fallback below
+  }
+  return null;
+}
+
+async function resolveInfiaiAutomationMode(
+  cfg: any,
+  agentId: string,
+): Promise<"always" | "offline_only" | "none"> {
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  const item = list.find(
+    (entry: any) =>
+      entry && String(entry.id ?? "") === String(agentId || "main"),
+  );
+  const fromWorkspace = await readAutomationModeFromWorkspaceState(item);
+  if (fromWorkspace === "always" || fromWorkspace === "offline_only" || fromWorkspace === "none") {
+    return fromWorkspace;
+  }
+  return "always";
+}
+
+function normalizePlatformId(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.trunc(n);
+}
+
+async function hasRealHumanOnlineSession(
+  client: OpenIMClientState,
+  userID: string,
+): Promise<boolean> {
+  const uid = String(userID || "").trim();
+  if (!uid) return false;
+  const botPlatform = resolveManagedImBotPlatformId();
+  try {
+    const resp = await (client.sdk as any).subscribeUsersStatus?.([uid]);
+    const list = Array.isArray(resp?.data) ? resp.data : Array.isArray(resp) ? resp : [];
+    const item = list.find((row: any) => String(row?.userID ?? "") === uid) ?? list[0];
+    const platforms = Array.isArray(item?.platformIDs) ? item.platformIDs : [];
+    return platforms.some((platform: unknown) => {
+      const pid =
+        typeof platform === "object" && platform !== null
+          ? normalizePlatformId((platform as { platformID?: unknown; platform?: unknown }).platformID ?? (platform as { platform?: unknown }).platform)
+          : normalizePlatformId(platform);
+      return pid > 0 && pid !== botPlatform;
+    });
+  } catch (err: any) {
+    console.warn(
+      `[infiai] offline_only online check failed for ${uid}: ${formatSdkError(err)}`,
+    );
+    return false;
+  }
+}
+
+async function shouldSkipForOfflineOnlyAutomation(
+  cfg: any,
+  client: OpenIMClientState,
+  agentId: string,
+  selfUid: string,
+  humanSelfAssistant: boolean,
+): Promise<boolean> {
+  const mode = await resolveInfiaiAutomationMode(cfg, agentId);
+  if (mode === "none") return true;
+  if (mode !== "offline_only") return false;
+  if (humanSelfAssistant) return false;
+  return hasRealHumanOnlineSession(client, selfUid);
+}
+
+function resolveInfiaiConversationID(msg: MessageItem): string {
+  const explicit = String(
+    (msg as MessageItem & { conversationID?: string }).conversationID ?? "",
+  ).trim();
+  if (explicit) return explicit;
+
+  if (isGroupMessage(msg)) {
+    const groupID = String(msg.groupID || "").trim();
+    return groupID ? `sg_${groupID}` : "";
+  }
+
+  const sendID = String(msg.sendID || "").trim();
+  const recvID = String(msg.recvID || "").trim();
+  if (!sendID || !recvID) return "";
+  const [first, second] = [sendID, recvID].sort();
+  return `si_${first}_${second}`;
+}
+
+async function setInboundTypingState(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  focus: boolean,
+): Promise<void> {
+  const conversationID = resolveInfiaiConversationID(msg);
+  const fn = (client.sdk as any).changeInputStates;
+  if (conversationID && typeof fn === "function") {
+    try {
+      await fn.call(client.sdk, { conversationID, focus });
+    } catch (err: any) {
+      console.warn(
+        `[infiai] changeInputStates failed focus=${focus}: ${formatSdkError(err)}`,
+      );
+    }
+  }
+  try {
+    const createCustom = (client.sdk as any).createCustomMessage;
+    if (typeof createCustom !== "function") return;
+    const created = await createCustom.call(client.sdk, {
+      data: JSON.stringify({
+        customType: INFIAI_TYPING_CUSTOM_TYPE,
+        data: {
+          focus,
+          conversationID,
+          sendID: String(client.config.userID || "").trim(),
+          recvID: isGroupMessage(msg) ? "" : String(msg.sendID || "").trim(),
+          groupID: isGroupMessage(msg) ? String(msg.groupID || "").trim() : "",
+          sessionType: isGroupMessage(msg) ? SessionType.Group : SessionType.Single,
+          ts: Date.now(),
+        },
+      }),
+      extension: "",
+      description: "infiai_typing",
+    });
+    const message = created?.data;
+    if (!message) return;
+    await client.sdk.sendMessage({
+      recvID: isGroupMessage(msg) ? "" : String(msg.sendID || "").trim(),
+      groupID: isGroupMessage(msg) ? String(msg.groupID || "").trim() : "",
+      message,
+      isOnlineOnly: true,
+    } as any);
+  } catch (err: any) {
+    console.warn(
+      `[infiai] managed typing custom failed focus=${focus}: ${formatSdkError(err)}`,
+    );
+  }
+}
+
+function isInfiaiTypingCustomMessage(msg: MessageItem): boolean {
+  if (Number(msg.contentType) !== Number(MessageType.CustomMessage)) return false;
+  try {
+    const data = JSON.parse(String((msg as any).customElem?.data || ""));
+    return Number(data?.customType) === INFIAI_TYPING_CUSTOM_TYPE;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -770,7 +933,10 @@ export async function processInboundMessage(
 
   const selfUid = String(client.config.userID).trim();
   const humanSelfAssistant = isHumanSelfAssistantMessage(msg, selfUid);
-  if (isAssistantEchoMessage(msg)) {
+  if (isInfiaiTypingCustomMessage(msg)) {
+    return;
+  }
+  if (isAssistantEchoMessage(msg, selfUid)) {
     api.logger?.info?.(
       `[infiai] ignore assistant echo: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} sendID=${msg.sendID}`,
     );
@@ -938,6 +1104,20 @@ export async function processInboundMessage(
       return;
     }
   }
+  if (
+    await shouldSkipForOfflineOnlyAutomation(
+      cfg,
+      client,
+      routeAgentId,
+      selfUid,
+      humanSelfAssistant,
+    )
+  ) {
+    api.logger?.info?.(
+      `[infiai] automation skipped: mode=offline_only_or_none accountId=${client.config.accountId} agent=${routeAgentId} managedUserId=${selfUid} sender=${senderId} selfAssistant=${humanSelfAssistant ? 1 : 0}`,
+    );
+    return;
+  }
   const mediaResult = await materializeInboundMedia(inbound.media);
   const warningText = mediaResult.warnings
     .map((warning) => `[Media fetch failed] ${warning}`)
@@ -1042,6 +1222,7 @@ export async function processInboundMessage(
   }
 
   const dispatchObsStart = transcriptObsEnabled() ? Date.now() : 0;
+  await setInboundTypingState(client, msg, true);
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -1121,5 +1302,7 @@ export async function processInboundMessage(
     } catch {
       // ignore secondary send errors
     }
+  } finally {
+    await setInboundTypingState(client, msg, false);
   }
 }
