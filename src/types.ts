@@ -17,6 +17,7 @@ export interface OpenIMAccountConfig {
 export interface OpenIMClientState {
   sdk: ApiService;
   config: OpenIMAccountConfig;
+  gatewayConfig?: any;
   handlers: {
     onRecvNewMessage: (event: CallbackEvent<MessageItem>) => void;
     onRecvNewMessages: (event: CallbackEvent<MessageItem[]>) => void;

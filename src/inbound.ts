@@ -37,9 +37,65 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 /** Short TTL so workspace-state updates after toggling memory apply within a turn. */
 const MEMORY_POLICY_CACHE_TTL_MS = 500;
+const GATEWAY_CONFIG_CACHE_TTL_MS = 250;
 const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
 const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
 const INFIAI_TYPING_CUSTOM_TYPE = 260;
+
+let latestGatewayConfigCache:
+  | {
+      path: string;
+      checkedAt: number;
+      mtimeMs: number;
+      config: any;
+    }
+  | null = null;
+
+function resolveGatewayConfigPath(): string {
+  const explicit = String(
+    process.env.OPENCLAW_CONFIG_PATH || process.env.OPENCLAW_CONFIG || "",
+  ).trim();
+  if (explicit) return explicit;
+  const stateDir = String(process.env.OPENCLAW_STATE_DIR || "").trim();
+  if (stateDir) return path.join(stateDir, "openclaw.json");
+  const home = String(process.env.OPENCLAW_HOME || "").trim() || os.homedir();
+  return path.join(home, ".openclaw", "openclaw.json");
+}
+
+async function resolveLatestGatewayConfig(fallback: any): Promise<any> {
+  const configPath = resolveGatewayConfigPath();
+  const now = Date.now();
+  if (
+    latestGatewayConfigCache &&
+    latestGatewayConfigCache.path === configPath &&
+    now - latestGatewayConfigCache.checkedAt < GATEWAY_CONFIG_CACHE_TTL_MS
+  ) {
+    return latestGatewayConfigCache.config;
+  }
+
+  try {
+    const stat = await fs.stat(configPath);
+    if (
+      latestGatewayConfigCache &&
+      latestGatewayConfigCache.path === configPath &&
+      latestGatewayConfigCache.mtimeMs === stat.mtimeMs
+    ) {
+      latestGatewayConfigCache.checkedAt = now;
+      return latestGatewayConfigCache.config;
+    }
+
+    const parsed = JSON.parse(await fs.readFile(configPath, "utf8"));
+    latestGatewayConfigCache = {
+      path: configPath,
+      checkedAt: now,
+      mtimeMs: stat.mtimeMs,
+      config: parsed,
+    };
+    return parsed;
+  } catch {
+    return fallback;
+  }
+}
 
 function parseMessageEx(msg: MessageItem): Record<string, unknown> | null {
   const raw = String((msg as MessageItem & { ex?: string }).ex ?? "").trim();
@@ -989,7 +1045,24 @@ export async function processInboundMessage(
   const peerSessionKey = group
     ? `infiai:group:${accountScope}:${String(msg.groupID).trim()}:${String(msg.sendID).trim()}`.toLowerCase()
     : `infiai:direct:${selfUid}:${String(msg.sendID).trim()}`.toLowerCase();
-  const cfg = api.config;
+  const cfg = await resolveLatestGatewayConfig(client.gatewayConfig ?? api.config);
+  const accEntry = cfg?.channels?.infiai?.accounts?.[client.config.accountId];
+  if (!accEntry || accEntry.enabled === false) {
+    api.logger?.info?.(
+      `[infiai] automation skipped: account disabled or unbound accountId=${client.config.accountId} userID=${client.config.userID}`,
+    );
+    return;
+  }
+  const bindingAgentId = resolveInfiaiAgentIdForAccount(
+    cfg,
+    client.config.accountId,
+  );
+  if (!bindingAgentId) {
+    api.logger?.warn?.(
+      `[infiai] automation skipped: channels.infiai.accounts['${client.config.accountId}'] exists but no bindings row for channel infiai + this accountId.`,
+    );
+    return;
+  }
 
   const route = runtime.channel.routing?.resolveAgentRoute?.({
     cfg,
@@ -1010,25 +1083,22 @@ export async function processInboundMessage(
       `[infiai] routing: matchedBy=default accountId=${client.config.accountId} userID=${client.config.userID} resolvedAgentId=${String(route?.agentId ?? "main")} — no cfg.bindings route matched this Infiai account; OpenClaw fell back to resolveDefaultAgentId (often agents.list[0]). Fix: ensure orchestrator upsertManagedPoolAgent wrote both channels.infiai.accounts[accountKey] and a bindings row { channel: infiai, accountId }. Orphan agents.list entries alone do not route traffic.`,
     );
   }
-  const bindingAgentId = resolveInfiaiAgentIdForAccount(
-    cfg,
-    client.config.accountId,
-  );
-  const accEntry = cfg?.channels?.infiai?.accounts?.[client.config.accountId];
-  if (accEntry && !bindingAgentId) {
+  const routeAgentId = String(route?.agentId ?? "main");
+  const executionAgentId =
+    matchedBy === "default" && bindingAgentId ? bindingAgentId : routeAgentId;
+  if (executionAgentId !== routeAgentId) {
     api.logger?.warn?.(
-      `[infiai] routing: channels.infiai.accounts['${client.config.accountId}'] exists but no bindings row for channel infiai + this accountId — resolveAgentRoute cannot bind this login to the correct agent.`,
+      `[infiai] routing: overriding default route with binding agent ${executionAgentId} (resolveAgentRoute=${routeAgentId}) accountId=${client.config.accountId}`,
     );
   }
 
   // OpenClaw dispatch resolves the execution agent from ctx.SessionKey. A bare
-  // infiai:* key falls back to the default agent, so always scope by route.agentId.
-  const routeAgentId = String(route?.agentId ?? "main");
-  const sessionKey = buildAgentScopedSessionKey(routeAgentId, peerSessionKey);
+  // infiai:* key falls back to the default agent, so always scope by the resolved execution agent.
+  const sessionKey = buildAgentScopedSessionKey(executionAgentId, peerSessionKey);
   const timestamp = msg.sendTime || Date.now();
   const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(
     cfg,
-    routeAgentId,
+    executionAgentId,
   );
   const effectiveSessionKey = sessionContinuityEnabled
     ? sessionKey
@@ -1036,7 +1106,7 @@ export async function processInboundMessage(
 
   const storePath =
     runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
-      agentId: routeAgentId,
+      agentId: executionAgentId,
     }) ?? "";
 
   const chatType: ChatType = group ? "group" : "direct";
@@ -1057,11 +1127,10 @@ export async function processInboundMessage(
     // Round-cap must follow cfg.bindings for this account — resolveAgentRoute can point at another
     // tenant's agent (wrong session) while the Infiai account is still correctly provisioned.
     const replyAgentForCap =
-      resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ??
-      routeAgentId;
-    if (replyAgentForCap !== routeAgentId) {
+      bindingAgentId ?? executionAgentId;
+    if (replyAgentForCap !== executionAgentId) {
       api.logger?.info?.(
-        `[infiai] managed round-cap: using binding agent ${replyAgentForCap} (resolveAgentRoute=${routeAgentId}) accountId=${client.config.accountId}`,
+        `[infiai] managed round-cap: using binding agent ${replyAgentForCap} (executionAgent=${executionAgentId}) accountId=${client.config.accountId}`,
       );
     }
     const replyCapKey = `${pairKey}|reply|${replyAgentForCap}`;
@@ -1086,8 +1155,7 @@ export async function processInboundMessage(
   ) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
     const replyAgentForCap =
-      resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ??
-      routeAgentId;
+      bindingAgentId ?? executionAgentId;
     const groupScopedKey = `${String(msg.groupID).trim().toLowerCase()}|${pairKey}|reply|${replyAgentForCap}`;
     const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(
       cfg,
@@ -1108,13 +1176,13 @@ export async function processInboundMessage(
     await shouldSkipForOfflineOnlyAutomation(
       cfg,
       client,
-      routeAgentId,
+      bindingAgentId ?? executionAgentId,
       selfUid,
       humanSelfAssistant,
     )
   ) {
     api.logger?.info?.(
-      `[infiai] automation skipped: mode=offline_only_or_none accountId=${client.config.accountId} agent=${routeAgentId} managedUserId=${selfUid} sender=${senderId} selfAssistant=${humanSelfAssistant ? 1 : 0}`,
+      `[infiai] automation skipped: mode=offline_only_or_none accountId=${client.config.accountId} agent=${bindingAgentId ?? executionAgentId} managedUserId=${selfUid} sender=${senderId} selfAssistant=${humanSelfAssistant ? 1 : 0}`,
     );
     return;
   }
@@ -1178,7 +1246,10 @@ export async function processInboundMessage(
     obsInboundLog(api, "inbound.accept", {
       accountId: client.config.accountId,
       managedUserId: selfUid,
-      agentId: String(route?.agentId ?? "main"),
+      agentId: executionAgentId,
+      routeAgentId,
+      bindingAgentId: bindingAgentId || undefined,
+      routeMatchedBy: matchedBy || undefined,
       sessionKey,
       effectiveSessionKey,
       sessionContinuityEnabled,
@@ -1273,7 +1344,10 @@ export async function processInboundMessage(
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.done", {
         accountId: client.config.accountId,
-        agentId: String(route?.agentId ?? "main"),
+        agentId: executionAgentId,
+        routeAgentId,
+        bindingAgentId: bindingAgentId || undefined,
+        routeMatchedBy: matchedBy || undefined,
         effectiveSessionKey,
         clientMsgID: msg.clientMsgID || undefined,
         durationMs: Date.now() - dispatchObsStart,
@@ -1283,7 +1357,10 @@ export async function processInboundMessage(
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.fail", {
         accountId: client.config.accountId,
-        agentId: String(route?.agentId ?? "main"),
+        agentId: executionAgentId,
+        routeAgentId,
+        bindingAgentId: bindingAgentId || undefined,
+        routeMatchedBy: matchedBy || undefined,
         effectiveSessionKey,
         clientMsgID: msg.clientMsgID || undefined,
         durationMs: Date.now() - dispatchObsStart,

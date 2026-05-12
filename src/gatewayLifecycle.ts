@@ -28,7 +28,10 @@ export async function infiaiGatewayStartAccount(ctx: any): Promise<void> {
     return;
   }
 
-  await startAccountClient(api, cfg, { abortSignal: ctx.abortSignal });
+  await startAccountClient(api, cfg, {
+    abortSignal: ctx.abortSignal,
+    gatewayConfig: ctx.cfg ?? api.config,
+  });
 }
 
 export async function infiaiGatewayStopAccount(ctx: any): Promise<void> {

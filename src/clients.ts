@@ -60,13 +60,14 @@ export async function stopAccountClient(api: any, accountId: string): Promise<vo
 export async function startAccountClient(
   api: any,
   config: OpenIMAccountConfig,
-  opts?: { abortSignal?: AbortSignal },
+  opts?: { abortSignal?: AbortSignal; gatewayConfig?: any },
 ): Promise<void> {
   const sdk = getSDK();
 
   const state = {
     sdk,
     config,
+    gatewayConfig: opts?.gatewayConfig ?? api.config,
     handlers: {
       onRecvNewMessage: () => undefined,
       onRecvNewMessages: () => undefined,
