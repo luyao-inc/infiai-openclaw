@@ -12,11 +12,15 @@ function isUrl(input: string): boolean {
 
 function toLocalPath(input: string): string {
   const raw = input.trim();
-  if (raw.startsWith("file://")) return decodeURIComponent(raw.slice("file://".length));
+  if (raw.startsWith("file://"))
+    return decodeURIComponent(raw.slice("file://".length));
   return raw;
 }
 
-function guessMime(pathOrName: string, fallback = "application/octet-stream"): string {
+function guessMime(
+  pathOrName: string,
+  fallback = "application/octet-stream",
+): string {
   const ext = extname(pathOrName).toLowerCase();
   const table: Record<string, string> = {
     ".jpg": "image/jpeg",
@@ -34,9 +38,11 @@ function guessMime(pathOrName: string, fallback = "application/octet-stream"): s
     ".json": "application/json",
     ".zip": "application/zip",
     ".doc": "application/msword",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".docx":
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xls": "application/vnd.ms-excel",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsx":
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   };
   return table[ext] || fallback;
 }
@@ -51,7 +57,10 @@ function inferNameFromUrl(url: string, fallback: string): string {
   }
 }
 
-async function readLocalAsFile(pathInput: string, forcedName?: string): Promise<{
+async function readLocalAsFile(
+  pathInput: string,
+  forcedName?: string,
+): Promise<{
   file: File;
   filePath: string;
   fileName: string;
@@ -61,16 +70,29 @@ async function readLocalAsFile(pathInput: string, forcedName?: string): Promise<
   const filePath = toLocalPath(pathInput);
   const st = await stat(filePath);
   const data = await readFile(filePath);
-  const fileName = forcedName?.trim() || basename(filePath) || `file-${Date.now()}`;
+  const fileName =
+    forcedName?.trim() || basename(filePath) || `file-${Date.now()}`;
   const mime = guessMime(fileName);
   const file = new File([data], fileName, { type: mime });
   return { file, filePath, fileName, size: st.size, mime };
 }
 
-export async function sendTextToTarget(client: OpenIMClientState, target: ParsedTarget, text: string): Promise<void> {
+type SendTextOptions = {
+  ex?: string;
+};
+
+export async function sendTextToTarget(
+  client: OpenIMClientState,
+  target: ParsedTarget,
+  text: string,
+  options?: SendTextOptions,
+): Promise<void> {
   const created = await client.sdk.createTextMessage(text);
   const message = created?.data;
   if (!message) throw new Error("createTextMessage failed");
+  if (options?.ex) {
+    (message as MessageItem & { ex?: string }).ex = options.ex;
+  }
 
   const recvID = target.kind === "user" ? target.id : "";
   const groupID = target.kind === "group" ? target.id : "";
@@ -87,15 +109,19 @@ export async function sendAtTextToGroup(
   groupID: string,
   atUserID: string,
   text: string,
-  atNickname?: string
+  atNickname?: string,
+  options?: SendTextOptions,
 ): Promise<void> {
   const displayName = String(atNickname || atUserID).trim();
   const content = `@${displayName} ${String(text ?? "").trim()}`.trim();
-  const hasCreateAtMsg = typeof (client.sdk as any).createTextAtMessage === "function";
-  console.warn(`[infiai] sendAtTextToGroup: groupID=${groupID}, atUserID=${atUserID}, textLen=${text.length}, hasCreateAtMsg=${hasCreateAtMsg}, sdkExists=${!!client.sdk}`);
+  const hasCreateAtMsg =
+    typeof (client.sdk as any).createTextAtMessage === "function";
+  console.warn(
+    `[infiai] sendAtTextToGroup: groupID=${groupID}, atUserID=${atUserID}, textLen=${text.length}, hasCreateAtMsg=${hasCreateAtMsg}, sdkExists=${!!client.sdk}`,
+  );
   if (!hasCreateAtMsg) {
     console.warn(
-      `[infiai] createTextAtMessage not available on SDK, falling back to createTextMessage — reply will lack formal @-mention, groupID=${groupID}, atUserID=${atUserID}`
+      `[infiai] createTextAtMessage not available on SDK, falling back to createTextMessage — reply will lack formal @-mention, groupID=${groupID}, atUserID=${atUserID}`,
     );
   }
   const created = hasCreateAtMsg
@@ -111,9 +137,16 @@ export async function sendAtTextToGroup(
       })
     : await client.sdk.createTextMessage(content);
   const message = created?.data;
-  console.warn(`[infiai] sendAtTextToGroup: message created, hasData=${!!message}, dataKeys=${message ? Object.keys(message).join(",") : "null"}`);
+  console.warn(
+    `[infiai] sendAtTextToGroup: message created, hasData=${!!message}, dataKeys=${message ? Object.keys(message).join(",") : "null"}`,
+  );
   if (!message) throw new Error("createTextAtMessage failed");
-  console.warn(`[infiai] sendAtTextToGroup: calling sendMessage recvID="" groupID=${groupID}`);
+  if (options?.ex) {
+    (message as MessageItem & { ex?: string }).ex = options.ex;
+  }
+  console.warn(
+    `[infiai] sendAtTextToGroup: calling sendMessage recvID="" groupID=${groupID}`,
+  );
   await client.sdk.sendMessage({
     recvID: "",
     groupID,
@@ -122,7 +155,11 @@ export async function sendAtTextToGroup(
   console.warn(`[infiai] sendAtTextToGroup: sendMessage COMPLETED`);
 }
 
-export async function sendImageToTarget(client: OpenIMClientState, target: ParsedTarget, image: string): Promise<void> {
+export async function sendImageToTarget(
+  client: OpenIMClientState,
+  target: ParsedTarget,
+  image: string,
+): Promise<void> {
   const input = image.trim();
   if (!input) throw new Error("image is empty");
 
@@ -173,7 +210,7 @@ export async function sendVideoToTarget(
   client: OpenIMClientState,
   target: ParsedTarget,
   video: string,
-  name?: string
+  name?: string,
 ): Promise<void> {
   const input = video.trim();
   if (!input) throw new Error("video is empty");
@@ -185,7 +222,7 @@ export async function sendFileToTarget(
   client: OpenIMClientState,
   target: ParsedTarget,
   filePathOrUrl: string,
-  name?: string
+  name?: string,
 ): Promise<void> {
   const input = filePathOrUrl.trim();
   if (!input) throw new Error("file is empty");

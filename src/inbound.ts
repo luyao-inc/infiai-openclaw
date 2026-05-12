@@ -1,13 +1,33 @@
-import { NotificationType, SessionType, type MessageItem } from "@openim/client-sdk";
+import {
+  NotificationType,
+  SessionType,
+  type MessageItem,
+} from "@openim/client-sdk";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { consumeManagedManagedReplySlot, resolveManagedPairKey } from "./managedManagedCap";
-import { resolveManagedMaxDialogueRoundsCap, resolveManagedMaxDialogueRoundsDefault } from "./managedManagedEnv";
-import { isUserInfiaiManagedInCfg, resolveInfiaiAgentIdForAccount } from "./managedManagedPredicate";
+import { randomUUID } from "node:crypto";
+import {
+  consumeManagedManagedReplySlot,
+  resolveManagedPairKey,
+} from "./managedManagedCap";
+import {
+  resolveManagedMaxDialogueRoundsCap,
+  resolveManagedMaxDialogueRoundsDefault,
+} from "./managedManagedEnv";
+import {
+  isUserInfiaiManagedInCfg,
+  resolveInfiaiAgentIdForAccount,
+} from "./managedManagedPredicate";
 import { sendAtTextToGroup, sendTextToTarget } from "./media";
 import { ensureInfiaiReplyReady } from "./replyHeal";
-import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
+import type {
+  ChatType,
+  InboundBodyResult,
+  InboundMediaItem,
+  OpenIMClientState,
+  ParsedTarget,
+} from "./types";
 import { formatSdkError } from "./utils";
 
 const inboundDedup = new Map<string, number>();
@@ -16,13 +36,80 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 /** Short TTL so workspace-state updates after toggling memory apply within a turn. */
 const MEMORY_POLICY_CACHE_TTL_MS = 500;
+const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
+const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
+
+function parseMessageEx(msg: MessageItem): Record<string, unknown> | null {
+  const raw = String((msg as MessageItem & { ex?: string }).ex ?? "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function getInfiaiMessageSource(msg: MessageItem): string {
+  const exObj = parseMessageEx(msg);
+  if (!exObj) return "";
+  const infiai = exObj.infiai;
+  if (!infiai || typeof infiai !== "object" || Array.isArray(infiai)) return "";
+  return String((infiai as Record<string, unknown>).source ?? "");
+}
+
+function isAssistantEchoMessage(msg: MessageItem): boolean {
+  return getInfiaiMessageSource(msg) === ASSISTANT_MESSAGE_SOURCE;
+}
+
+function isHumanSelfAssistantMessage(
+  msg: MessageItem,
+  selfUserID: string,
+): boolean {
+  const self = String(selfUserID || "").trim();
+  if (!self) return false;
+  if (getInfiaiMessageSource(msg) !== HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE)
+    return false;
+  return (
+    String(msg.sendID || "").trim() === self &&
+    String(msg.recvID || "").trim() === self
+  );
+}
+
+function buildAssistantReplyEx(msg: MessageItem): string {
+  const base = parseMessageEx(msg) ?? {};
+  const infiai =
+    base.infiai &&
+    typeof base.infiai === "object" &&
+    !Array.isArray(base.infiai)
+      ? (base.infiai as Record<string, unknown>)
+      : {};
+  const next = {
+    ...base,
+    infiai: {
+      ...infiai,
+      source: ASSISTANT_MESSAGE_SOURCE,
+      traceID: randomUUID(),
+      parentClientMsgID: String(msg.clientMsgID ?? ""),
+    },
+  };
+  return JSON.stringify(next);
+}
 
 function transcriptObsEnabled(): boolean {
-  const v = String(process.env.OPENCLAW_TRANSCRIPT_OBSERVABILITY ?? "").trim().toLowerCase();
+  const v = String(process.env.OPENCLAW_TRANSCRIPT_OBSERVABILITY ?? "")
+    .trim()
+    .toLowerCase();
   return v === "1" || v === "true" || v === "yes";
 }
 
-function obsInboundLog(api: any, event: string, fields: Record<string, unknown>): void {
+function obsInboundLog(
+  api: any,
+  event: string,
+  fields: Record<string, unknown>,
+): void {
   if (!transcriptObsEnabled()) return;
   const line = JSON.stringify({
     ts: new Date().toISOString(),
@@ -32,28 +119,40 @@ function obsInboundLog(api: any, event: string, fields: Record<string, unknown>)
   });
   api.logger?.info?.(`[openclaw-obs] ${line}`);
 }
-const memoryPolicyCache = new Map<string, { expireAt: number; enabled: boolean }>();
+const memoryPolicyCache = new Map<
+  string,
+  { expireAt: number; enabled: boolean }
+>();
 type ImagePart = { type: "image"; data: string; mimeType: string };
 
 function normalizeSessionKeyPart(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase();
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
 }
 
 function isAgentScopedSessionKey(sessionKey: string): boolean {
   return /^agent:[^:]+:.+/.test(sessionKey);
 }
 
-function buildAgentScopedSessionKey(agentId: string, peerSessionKey: string): string {
+function buildAgentScopedSessionKey(
+  agentId: string,
+  peerSessionKey: string,
+): string {
   const peer = normalizeSessionKeyPart(peerSessionKey);
   const agent = String(agentId || "main").trim() || "main";
   if (!peer) return `agent:${agent}:main`.toLowerCase();
-  return isAgentScopedSessionKey(peer) ? peer : `agent:${agent}:${peer}`.toLowerCase();
+  return isAgentScopedSessionKey(peer)
+    ? peer
+    : `agent:${agent}:${peer}`.toLowerCase();
 }
 
 function resolveWorkspaceStatePath(agentEntry: any): string {
   const rawWorkspace = String(agentEntry?.workspace ?? "").trim();
   if (!rawWorkspace) return "";
-  const expanded = rawWorkspace.startsWith("~/") ? path.join(os.homedir(), rawWorkspace.slice(2)) : rawWorkspace;
+  const expanded = rawWorkspace.startsWith("~/")
+    ? path.join(os.homedir(), rawWorkspace.slice(2))
+    : rawWorkspace;
   return path.join(expanded, ".openclaw", "workspace-state.json");
 }
 
@@ -61,7 +160,9 @@ function resolveWorkspaceStatePath(agentEntry: any): string {
  * Workspace-state carries both legacy conversationMemoryEnabled and profile memoryEnabled.
  * Host UI toggles memoryEnabled only; continuity must be off if either flag is explicitly false.
  */
-async function readSessionContinuityFromWorkspaceState(agentEntry: any): Promise<boolean | null> {
+async function readSessionContinuityFromWorkspaceState(
+  agentEntry: any,
+): Promise<boolean | null> {
   const statePath = resolveWorkspaceStatePath(agentEntry);
   if (!statePath) return null;
   try {
@@ -87,21 +188,32 @@ async function readSessionContinuityFromWorkspaceState(agentEntry: any): Promise
  * memory search tooling and may be toggled independently in Control UI; tying it here
  * caused stable-session chats to fall through to :ephemeral: keys while profile memory stayed on.
  */
-async function resolveInfiaiSessionContinuityEnabled(cfg: any, agentId: string): Promise<boolean> {
+async function resolveInfiaiSessionContinuityEnabled(
+  cfg: any,
+  agentId: string,
+): Promise<boolean> {
   const cacheKey = String(agentId || "main");
   const now = Date.now();
   const cached = memoryPolicyCache.get(cacheKey);
   if (cached && cached.expireAt > now) return cached.enabled;
 
   const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
-  const agentEntry = list.find((item: any) => item && String(item.id ?? "") === cacheKey) ?? null;
-  const sessionContinuity = await readSessionContinuityFromWorkspaceState(agentEntry);
+  const agentEntry =
+    list.find((item: any) => item && String(item.id ?? "") === cacheKey) ??
+    null;
+  const sessionContinuity =
+    await readSessionContinuityFromWorkspaceState(agentEntry);
   const effectiveEnabled = sessionContinuity ?? true;
-  memoryPolicyCache.set(cacheKey, { enabled: effectiveEnabled, expireAt: now + MEMORY_POLICY_CACHE_TTL_MS });
+  memoryPolicyCache.set(cacheKey, {
+    enabled: effectiveEnabled,
+    expireAt: now + MEMORY_POLICY_CACHE_TTL_MS,
+  });
   return effectiveEnabled;
 }
 
-async function readMaxDialogueRoundsFromWorkspaceState(agentEntry: any): Promise<number | null> {
+async function readMaxDialogueRoundsFromWorkspaceState(
+  agentEntry: any,
+): Promise<number | null> {
   const statePath = resolveWorkspaceStatePath(agentEntry);
   if (!statePath) return null;
   try {
@@ -116,9 +228,15 @@ async function readMaxDialogueRoundsFromWorkspaceState(agentEntry: any): Promise
   }
 }
 
-async function resolveInfiaiMaxDialogueRounds(cfg: any, agentId: string): Promise<number> {
+async function resolveInfiaiMaxDialogueRounds(
+  cfg: any,
+  agentId: string,
+): Promise<number> {
   const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
-  const item = list.find((entry: any) => entry && String(entry.id ?? "") === String(agentId || "main"));
+  const item = list.find(
+    (entry: any) =>
+      entry && String(entry.id ?? "") === String(agentId || "main"),
+  );
   const fromWorkspace = await readMaxDialogueRoundsFromWorkspaceState(item);
   if (fromWorkspace && fromWorkspace > 0) return fromWorkspace;
   return resolveManagedMaxDialogueRoundsDefault();
@@ -130,7 +248,11 @@ async function resolveInfiaiMaxDialogueRounds(cfg: any, agentId: string): Promis
  * Web/iOS/Android with other IDs — see OpenIM `senderPlatformID` on messages.
  */
 function resolveManagedImBotPlatformId(): number {
-  const raw = String(process.env.OPENCLAW_MANAGED_IM_PLATFORM ?? process.env.INFIAI_MANAGED_IM_PLATFORM ?? "").trim();
+  const raw = String(
+    process.env.OPENCLAW_MANAGED_IM_PLATFORM ??
+      process.env.INFIAI_MANAGED_IM_PLATFORM ??
+      "",
+  ).trim();
   if (!raw) return 12;
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return 12;
@@ -146,12 +268,16 @@ function isInboundFromManagedBotSession(msg: MessageItem): boolean {
 }
 
 function normalizeImageMimeType(value: unknown): string | undefined {
-  const mime = String(value ?? "").trim().toLowerCase();
+  const mime = String(value ?? "")
+    .trim()
+    .toLowerCase();
   return mime.startsWith("image/") ? mime : undefined;
 }
 
 function normalizeMimeType(value: unknown): string | undefined {
-  const mime = String(value ?? "").trim().toLowerCase();
+  const mime = String(value ?? "")
+    .trim()
+    .toLowerCase();
   return mime.includes("/") ? mime : undefined;
 }
 
@@ -205,12 +331,14 @@ function stripVisibleReasoningPreamble(text: string): string {
       s = parts.slice(1).join("\n\n").trim();
     }
   }
-   return s;
+  return s;
 }
 
 /** Remove provider/model placeholders that leak into user-visible replies. */
 function stripInfiaiReplyArtifacts(text: string): string {
-  let s = String(text ?? "").replace(/\r\n/g, "\n").trimEnd();
+  let s = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .trimEnd();
   let prev = "";
   while (s !== prev) {
     prev = s;
@@ -221,7 +349,11 @@ function stripInfiaiReplyArtifacts(text: string): string {
   const lines = s.split("\n");
   while (lines.length > 0) {
     const last = (lines[lines.length - 1] ?? "").trim();
-    if (last === "" || /^NO_REPLY\.?$/i.test(last) || /^NO_ANSWER\.?$/i.test(last)) {
+    if (
+      last === "" ||
+      /^NO_REPLY\.?$/i.test(last) ||
+      /^NO_ANSWER\.?$/i.test(last)
+    ) {
       lines.pop();
       continue;
     }
@@ -230,7 +362,9 @@ function stripInfiaiReplyArtifacts(text: string): string {
   return lines.join("\n").trimEnd();
 }
 
-function mergeInboundResults(parts: Array<InboundBodyResult | null | undefined>): InboundBodyResult {
+function mergeInboundResults(
+  parts: Array<InboundBodyResult | null | undefined>,
+): InboundBodyResult {
   const valid = parts.filter(Boolean) as InboundBodyResult[];
   if (valid.length === 0) return { body: "", kind: "unknown" };
 
@@ -251,7 +385,10 @@ function mergeInboundResults(parts: Array<InboundBodyResult | null | undefined>)
   };
 }
 
-async function fetchImageAsContentPart(url: string, hintedMimeType?: string): Promise<ImagePart> {
+async function fetchImageAsContentPart(
+  url: string,
+  hintedMimeType?: string,
+): Promise<ImagePart> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
   let response: Response;
@@ -267,7 +404,9 @@ async function fetchImageAsContentPart(url: string, hintedMimeType?: string): Pr
   }
 
   if (!response.ok) {
-    throw new Error(`image fetch failed: ${response.status} ${response.statusText}`);
+    throw new Error(
+      `image fetch failed: ${response.status} ${response.statusText}`,
+    );
   }
 
   const contentLength = Number(response.headers.get("content-length") || 0);
@@ -281,7 +420,10 @@ async function fetchImageAsContentPart(url: string, hintedMimeType?: string): Pr
     throw new Error(`image too large: ${buffer.byteLength} bytes`);
   }
 
-  const mimeType = normalizeImageMimeType(response.headers.get("content-type")) ?? normalizeImageMimeType(hintedMimeType) ?? "image/jpeg";
+  const mimeType =
+    normalizeImageMimeType(response.headers.get("content-type")) ??
+    normalizeImageMimeType(hintedMimeType) ??
+    "image/jpeg";
   return {
     type: "image",
     data: buffer.toString("base64"),
@@ -296,9 +438,10 @@ function buildTextEnvelope(
   senderId: string,
   timestamp: number,
   bodyText: string,
-  chatType: ChatType
+  chatType: ChatType,
 ): string {
-  const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
+  const envelopeOptions =
+    runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const formatted = runtime.channel.reply?.formatInboundEnvelope?.({
     channel: "Infiai",
     from: fromLabel,
@@ -311,7 +454,9 @@ function buildTextEnvelope(
   return typeof formatted === "string" ? formatted : bodyText;
 }
 
-async function materializeInboundMedia(media: InboundMediaItem[] | undefined): Promise<{ images: ImagePart[]; warnings: string[] }> {
+async function materializeInboundMedia(
+  media: InboundMediaItem[] | undefined,
+): Promise<{ images: ImagePart[]; warnings: string[] }> {
   if (!Array.isArray(media) || media.length === 0) {
     return { images: [], warnings: [] };
   }
@@ -344,8 +489,14 @@ function extractPictureMedia(msg: MessageItem): InboundMediaItem[] {
   const source = pic.sourcePicture;
   const big = pic.bigPicture;
   const snapshot = pic.snapshotPicture;
-  const url = normalizeString(source?.url) || normalizeString(big?.url) || normalizeString(snapshot?.url);
-  const mimeType = normalizeImageMimeType(source?.type) || normalizeImageMimeType(big?.type) || normalizeImageMimeType(snapshot?.type);
+  const url =
+    normalizeString(source?.url) ||
+    normalizeString(big?.url) ||
+    normalizeString(snapshot?.url);
+  const mimeType =
+    normalizeImageMimeType(source?.type) ||
+    normalizeImageMimeType(big?.type) ||
+    normalizeImageMimeType(snapshot?.type);
   return [{ kind: "image", url, mimeType }];
 }
 
@@ -357,7 +508,9 @@ function extractVideoMedia(msg: MessageItem): InboundMediaItem[] {
       kind: "video",
       url: normalizeString(video.videoUrl),
       snapshotUrl: normalizeString(video.snapshotUrl),
-      fileName: normalizeString(video.videoName ?? video.fileName ?? video.snapshotName),
+      fileName: normalizeString(
+        video.videoName ?? video.fileName ?? video.snapshotName,
+      ),
       size: normalizeSize(video.videoSize ?? video.duration),
       mimeType: normalizeMimeType(video.videoType ?? video.type),
     },
@@ -379,22 +532,31 @@ function extractFileMedia(msg: MessageItem): InboundMediaItem[] {
 }
 
 function extractInboundBody(msg: MessageItem, depth = 0): InboundBodyResult {
-  const text = String(msg.textElem?.content ?? msg.atTextElem?.text ?? "").trim();
+  const text = String(
+    msg.textElem?.content ?? msg.atTextElem?.text ?? "",
+  ).trim();
   const imageMedia = extractPictureMedia(msg);
   const videoMedia = extractVideoMedia(msg);
   const fileMedia = extractFileMedia(msg);
 
   if (msg.quoteElem?.quoteMessage) {
     const quotedMsg = msg.quoteElem.quoteMessage;
-    const quotedSender = String(quotedMsg.senderNickname || quotedMsg.sendID || "unknown");
-    const quoted = depth < 2 ? extractInboundBody(quotedMsg, depth + 1) : { body: "[quoted message]", kind: "mixed" as const };
+    const quotedSender = String(
+      quotedMsg.senderNickname || quotedMsg.sendID || "unknown",
+    );
+    const quoted =
+      depth < 2
+        ? extractInboundBody(quotedMsg, depth + 1)
+        : { body: "[quoted message]", kind: "mixed" as const };
     const currentParts: string[] = [];
     if (text) currentParts.push(`Reply: ${text}`);
     for (const item of [...imageMedia, ...videoMedia, ...fileMedia]) {
       currentParts.push(`Reply attachment: ${summarizeMedia(item)}`);
     }
 
-    const bodyLines = [`[Quote] ${quotedSender}: ${quoted.body || "[empty message]"}`];
+    const bodyLines = [
+      `[Quote] ${quotedSender}: ${quoted.body || "[empty message]"}`,
+    ];
     if (currentParts.length > 0) bodyLines.push(currentParts.join("\n"));
 
     return {
@@ -417,16 +579,31 @@ function extractInboundBody(msg: MessageItem, depth = 0): InboundBodyResult {
     parts.push({ body: summarizeMedia(item), kind: "file", media: [item] });
   }
 
-  if (msg.customElem?.data || msg.customElem?.description || msg.customElem?.extension) {
-    const customText = msg.customElem.description || msg.customElem.data || msg.customElem.extension || "[Custom message]";
+  if (
+    msg.customElem?.data ||
+    msg.customElem?.description ||
+    msg.customElem?.extension
+  ) {
+    const customText =
+      msg.customElem.description ||
+      msg.customElem.data ||
+      msg.customElem.extension ||
+      "[Custom message]";
     parts.push({ body: `[Custom message] ${customText}`, kind: "mixed" });
   }
 
   return mergeInboundResults(parts);
 }
 
-function shouldProcessInboundMessage(accountId: string, msg: MessageItem): boolean {
-  const idPart = String(msg.clientMsgID || msg.serverMsgID || `${msg.sendID}-${msg.seq || msg.createTime || 0}`);
+function shouldProcessInboundMessage(
+  accountId: string,
+  msg: MessageItem,
+): boolean {
+  const idPart = String(
+    msg.clientMsgID ||
+      msg.serverMsgID ||
+      `${msg.sendID}-${msg.seq || msg.createTime || 0}`,
+  );
   if (!idPart) return true;
 
   const key = `${accountId}:${idPart}`;
@@ -450,16 +627,22 @@ function isGroupMessage(msg: MessageItem): boolean {
 function isOpenIMNotificationMessage(msg: MessageItem): boolean {
   const contentType = Number(msg.contentType);
   if (!Number.isFinite(contentType)) return false;
-  return contentType >= NotificationType.NotificationBegin && contentType <= NotificationType.NotificationEnd;
+  return (
+    contentType >= NotificationType.NotificationBegin &&
+    contentType <= NotificationType.NotificationEnd
+  );
 }
 
 function collectIdsFromUnknown(value: unknown): string[] {
   if (!value) return [];
-  if (Array.isArray(value)) return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  if (Array.isArray(value))
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean);
   return [];
 }
 
-function extractMentionedUserIDsFromAttachedInfo(attachedInfo?: string): string[] {
+function extractMentionedUserIDsFromAttachedInfo(
+  attachedInfo?: string,
+): string[] {
   const raw = String(attachedInfo ?? "").trim();
   if (!raw) return [];
   try {
@@ -487,20 +670,39 @@ function extractMentionedUserIDs(msg: MessageItem): string[] {
     atUsersInfo?: Array<{ atUserID?: string }>;
   };
   const topLevelList = Array.isArray((msg as any).atUserIDList)
-    ? (msg as any).atUserIDList.map((item: unknown) => String(item || "").trim())
+    ? (msg as any).atUserIDList.map((item: unknown) =>
+        String(item || "").trim(),
+      )
     : [];
-  const fromList = Array.isArray(elem?.atUserList) ? elem.atUserList.map((item) => String(item || "").trim()) : [];
+  const fromList = Array.isArray(elem?.atUserList)
+    ? elem.atUserList.map((item) => String(item || "").trim())
+    : [];
   const fromIDList = Array.isArray(elem?.atUserIDList)
     ? elem.atUserIDList.map((item) => String(item || "").trim())
     : [];
   const fromInfo = Array.isArray(elem?.atUsersInfo)
     ? elem.atUsersInfo.map((item) => String(item?.atUserID || "").trim())
     : [];
-  const fromAttached = extractMentionedUserIDsFromAttachedInfo(msg.attachedInfo);
-  return [...new Set([...topLevelList, ...fromList, ...fromIDList, ...fromInfo, ...fromAttached].filter(Boolean))];
+  const fromAttached = extractMentionedUserIDsFromAttachedInfo(
+    msg.attachedInfo,
+  );
+  return [
+    ...new Set(
+      [
+        ...topLevelList,
+        ...fromList,
+        ...fromIDList,
+        ...fromInfo,
+        ...fromAttached,
+      ].filter(Boolean),
+    ),
+  ];
 }
 
-function isWhitelistedSender(client: OpenIMClientState, msg: MessageItem): boolean {
+function isWhitelistedSender(
+  client: OpenIMClientState,
+  msg: MessageItem,
+): boolean {
   const whitelist = client.config.inboundWhitelist;
   if (!Array.isArray(whitelist) || whitelist.length === 0) return true;
   const senderId = String(msg.sendID || "").trim();
@@ -508,41 +710,73 @@ function isWhitelistedSender(client: OpenIMClientState, msg: MessageItem): boole
   return whitelist.some((id) => id === senderId);
 }
 
-async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem, text: string): Promise<void> {
+async function sendReplyFromInbound(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  text: string,
+): Promise<void> {
   const isGroup = isGroupMessage(msg);
-  console.warn(`[infiai] sendReplyFromInbound: isGroup=${isGroup}, groupID=${String(msg.groupID || "-")}, sendID=${String(msg.sendID || "-")}, textLen=${text.length}, clientMsgID=${msg.clientMsgID || "-"}`);
+  const replyEx = buildAssistantReplyEx(msg);
+  console.warn(
+    `[infiai] sendReplyFromInbound: isGroup=${isGroup}, groupID=${String(msg.groupID || "-")}, sendID=${String(msg.sendID || "-")}, textLen=${text.length}, clientMsgID=${msg.clientMsgID || "-"}`,
+  );
   if (isGroup) {
     const senderID = String(msg.sendID || "").trim();
     if (senderID) {
-      console.warn(`[infiai] sendReplyFromInbound: GROUP path, groupID=${String(msg.groupID)}, senderID=${senderID}, textLen=${text.length}`);
+      console.warn(
+        `[infiai] sendReplyFromInbound: GROUP path, groupID=${String(msg.groupID)}, senderID=${senderID}, textLen=${text.length}`,
+      );
       await sendAtTextToGroup(
         client,
         String(msg.groupID),
         senderID,
         text,
-        String(msg.senderNickname || senderID)
+        String(msg.senderNickname || senderID),
+        { ex: replyEx },
       );
-      console.warn(`[infiai] sendReplyFromInbound: GROUP sendAtTextToGroup COMPLETED`);
+      console.warn(
+        `[infiai] sendReplyFromInbound: GROUP sendAtTextToGroup COMPLETED`,
+      );
       return;
     }
-    console.warn(`[infiai] sendReplyFromInbound: GROUP but senderID empty, falling through to sendTextToTarget`);
+    console.warn(
+      `[infiai] sendReplyFromInbound: GROUP but senderID empty, falling through to sendTextToTarget`,
+    );
   }
-  const target: ParsedTarget = isGroup ? { kind: "group", id: String(msg.groupID) } : { kind: "user", id: String(msg.sendID) };
-  console.warn(`[infiai] sendReplyFromInbound: target kind=${target.kind}, id=${target.id}`);
-  await sendTextToTarget(client, target, text);
+  const target: ParsedTarget = isGroup
+    ? { kind: "group", id: String(msg.groupID) }
+    : { kind: "user", id: String(msg.sendID) };
+  console.warn(
+    `[infiai] sendReplyFromInbound: target kind=${target.kind}, id=${target.id}`,
+  );
+  await sendTextToTarget(client, target, text, { ex: replyEx });
   console.warn(`[infiai] sendReplyFromInbound: sendTextToTarget COMPLETED`);
 }
 
-export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
+export async function processInboundMessage(
+  api: any,
+  client: OpenIMClientState,
+  msg: MessageItem,
+): Promise<void> {
   await ensureInfiaiReplyReady(api);
 
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
-    api.logger?.warn?.("[infiai] runtime.channel.reply not available after self-heal");
+    api.logger?.warn?.(
+      "[infiai] runtime.channel.reply not available after self-heal",
+    );
     return;
   }
 
-  if (String(msg.sendID) === String(client.config.userID)) {
+  const selfUid = String(client.config.userID).trim();
+  const humanSelfAssistant = isHumanSelfAssistantMessage(msg, selfUid);
+  if (isAssistantEchoMessage(msg)) {
+    api.logger?.info?.(
+      `[infiai] ignore assistant echo: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} sendID=${msg.sendID}`,
+    );
+    return;
+  }
+  if (String(msg.sendID || "").trim() === selfUid && !humanSelfAssistant) {
     return;
   }
   if (isOpenIMNotificationMessage(msg)) {
@@ -567,7 +801,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
 
   if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
     api.logger?.info?.(
-      `[infiai] inbound dedup skip: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} serverMsgID=${msg.serverMsgID || ""} sendID=${msg.sendID}`
+      `[infiai] inbound dedup skip: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} serverMsgID=${msg.serverMsgID || ""} sendID=${msg.sendID}`,
     );
     return;
   }
@@ -575,28 +809,31 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const inbound = extractInboundBody(msg);
   if (!inbound.body) {
     api.logger?.info?.(
-      `[infiai] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`
+      `[infiai] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`,
     );
     return;
   }
 
   // 单聊不能只按 sendID（对端用户）建 session：同一真人发给两个托管号时 sendID 相同，
   // 会合并成一条 OpenClaw 会话、同一条 agent 记忆与 dashboard 线程。必须纳入本侧托管号 userID。
-  const selfUid = String(client.config.userID).trim();
-  const accountScope = String(client.config.accountId || selfUid || "default").trim().toLowerCase();
+  const accountScope = String(client.config.accountId || selfUid || "default")
+    .trim()
+    .toLowerCase();
   // 群聊 session 加入 sendID 区分不同发言者，防止同群内多人 @ 同一 agent 时记忆串线
   const peerSessionKey = group
     ? `infiai:group:${accountScope}:${String(msg.groupID).trim()}:${String(msg.sendID).trim()}`.toLowerCase()
     : `infiai:direct:${selfUid}:${String(msg.sendID).trim()}`.toLowerCase();
   const cfg = api.config;
 
-  const route =
-    runtime.channel.routing?.resolveAgentRoute?.({
-      cfg,
-      sessionKey: peerSessionKey,
-      channel: "infiai",
-      accountId: client.config.accountId,
-    }) ?? { agentId: "main", sessionKey: buildAgentScopedSessionKey("main", peerSessionKey) };
+  const route = runtime.channel.routing?.resolveAgentRoute?.({
+    cfg,
+    sessionKey: peerSessionKey,
+    channel: "infiai",
+    accountId: client.config.accountId,
+  }) ?? {
+    agentId: "main",
+    sessionKey: buildAgentScopedSessionKey("main", peerSessionKey),
+  };
 
   const matchedBy =
     route && typeof route === "object" && "matchedBy" in route
@@ -604,14 +841,17 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       : "";
   if (matchedBy === "default") {
     api.logger?.warn?.(
-      `[infiai] routing: matchedBy=default accountId=${client.config.accountId} userID=${client.config.userID} resolvedAgentId=${String(route?.agentId ?? "main")} — no cfg.bindings route matched this Infiai account; OpenClaw fell back to resolveDefaultAgentId (often agents.list[0]). Fix: ensure orchestrator upsertManagedPoolAgent wrote both channels.infiai.accounts[accountKey] and a bindings row { channel: infiai, accountId }. Orphan agents.list entries alone do not route traffic.`
+      `[infiai] routing: matchedBy=default accountId=${client.config.accountId} userID=${client.config.userID} resolvedAgentId=${String(route?.agentId ?? "main")} — no cfg.bindings route matched this Infiai account; OpenClaw fell back to resolveDefaultAgentId (often agents.list[0]). Fix: ensure orchestrator upsertManagedPoolAgent wrote both channels.infiai.accounts[accountKey] and a bindings row { channel: infiai, accountId }. Orphan agents.list entries alone do not route traffic.`,
     );
   }
-  const bindingAgentId = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId);
+  const bindingAgentId = resolveInfiaiAgentIdForAccount(
+    cfg,
+    client.config.accountId,
+  );
   const accEntry = cfg?.channels?.infiai?.accounts?.[client.config.accountId];
   if (accEntry && !bindingAgentId) {
     api.logger?.warn?.(
-      `[infiai] routing: channels.infiai.accounts['${client.config.accountId}'] exists but no bindings row for channel infiai + this accountId — resolveAgentRoute cannot bind this login to the correct agent.`
+      `[infiai] routing: channels.infiai.accounts['${client.config.accountId}'] exists but no bindings row for channel infiai + this accountId — resolveAgentRoute cannot bind this login to the correct agent.`,
     );
   }
 
@@ -620,7 +860,10 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const routeAgentId = String(route?.agentId ?? "main");
   const sessionKey = buildAgentScopedSessionKey(routeAgentId, peerSessionKey);
   const timestamp = msg.sendTime || Date.now();
-  const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(cfg, routeAgentId);
+  const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(
+    cfg,
+    routeAgentId,
+  );
   const effectiveSessionKey = sessionContinuityEnabled
     ? sessionKey
     : `${sessionKey}:ephemeral:${msg.clientMsgID || msg.serverMsgID || timestamp}`;
@@ -637,43 +880,80 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const senderManaged = isUserInfiaiManagedInCfg(cfg, senderId);
   // Round-cap only for managed↔managed **bot traffic**. Same OpenIM userId may also log in as a
   // human (e.g. Web); those sends carry a non-bot senderPlatformID and must not trip the cap.
-  if (!group && selfManaged && senderManaged && isInboundFromManagedBotSession(msg)) {
+  if (
+    !humanSelfAssistant &&
+    !group &&
+    selfManaged &&
+    senderManaged &&
+    isInboundFromManagedBotSession(msg)
+  ) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
     // Round-cap must follow cfg.bindings for this account — resolveAgentRoute can point at another
     // tenant's agent (wrong session) while the Infiai account is still correctly provisioned.
-    const replyAgentForCap = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ?? routeAgentId;
+    const replyAgentForCap =
+      resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ??
+      routeAgentId;
     if (replyAgentForCap !== routeAgentId) {
       api.logger?.info?.(
-        `[infiai] managed round-cap: using binding agent ${replyAgentForCap} (resolveAgentRoute=${routeAgentId}) accountId=${client.config.accountId}`
+        `[infiai] managed round-cap: using binding agent ${replyAgentForCap} (resolveAgentRoute=${routeAgentId}) accountId=${client.config.accountId}`,
       );
     }
     const replyCapKey = `${pairKey}|reply|${replyAgentForCap}`;
-    const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(cfg, replyAgentForCap);
+    const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(
+      cfg,
+      replyAgentForCap,
+    );
     const slot = consumeManagedManagedReplySlot(replyCapKey, maxDialogueRounds);
     if (!slot.allowed) {
       api.logger?.warn?.(
-        `[infiai] managed dialogue capped: pair=${pairKey}, replyAgent=${replyAgentForCap}, reason=round_cap count=${slot.countAtDecision}, maxRounds=${slot.maxRounds}, counterReset=1, session=${effectiveSessionKey}, clientMsgID=${msg.clientMsgID || ""}`
+        `[infiai] managed dialogue capped: pair=${pairKey}, replyAgent=${replyAgentForCap}, reason=round_cap count=${slot.countAtDecision}, maxRounds=${slot.maxRounds}, counterReset=1, session=${effectiveSessionKey}, clientMsgID=${msg.clientMsgID || ""}`,
       );
       return;
     }
   }
-  if (group && mentioned && selfManaged && senderManaged && isInboundFromManagedBotSession(msg)) {
+  if (
+    group &&
+    mentioned &&
+    selfManaged &&
+    senderManaged &&
+    isInboundFromManagedBotSession(msg)
+  ) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
-    const replyAgentForCap = resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ?? routeAgentId;
+    const replyAgentForCap =
+      resolveInfiaiAgentIdForAccount(cfg, client.config.accountId) ??
+      routeAgentId;
     const groupScopedKey = `${String(msg.groupID).trim().toLowerCase()}|${pairKey}|reply|${replyAgentForCap}`;
-    const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(cfg, replyAgentForCap);
-    const slot = consumeManagedManagedReplySlot(groupScopedKey, maxDialogueRounds);
+    const maxDialogueRounds = await resolveInfiaiMaxDialogueRounds(
+      cfg,
+      replyAgentForCap,
+    );
+    const slot = consumeManagedManagedReplySlot(
+      groupScopedKey,
+      maxDialogueRounds,
+    );
     if (!slot.allowed) {
       api.logger?.warn?.(
-        `[infiai] managed dialogue capped: scope=group pair=${pairKey}, groupID=${String(msg.groupID)}, replyAgent=${replyAgentForCap}, reason=round_cap count=${slot.countAtDecision}, maxRounds=${slot.maxRounds}, counterReset=1, session=${effectiveSessionKey}, clientMsgID=${msg.clientMsgID || ""}`
+        `[infiai] managed dialogue capped: scope=group pair=${pairKey}, groupID=${String(msg.groupID)}, replyAgent=${replyAgentForCap}, reason=round_cap count=${slot.countAtDecision}, maxRounds=${slot.maxRounds}, counterReset=1, session=${effectiveSessionKey}, clientMsgID=${msg.clientMsgID || ""}`,
       );
       return;
     }
   }
   const mediaResult = await materializeInboundMedia(inbound.media);
-  const warningText = mediaResult.warnings.map((warning) => `[Media fetch failed] ${warning}`).join("\n");
-  const rawBody = warningText ? `${inbound.body}\n${warningText}` : inbound.body;
-  const body = buildTextEnvelope(runtime, cfg, fromLabel, senderId, timestamp, rawBody, chatType);
+  const warningText = mediaResult.warnings
+    .map((warning) => `[Media fetch failed] ${warning}`)
+    .join("\n");
+  const rawBody = warningText
+    ? `${inbound.body}\n${warningText}`
+    : inbound.body;
+  const body = buildTextEnvelope(
+    runtime,
+    cfg,
+    fromLabel,
+    senderId,
+    timestamp,
+    rawBody,
+    chatType,
+  );
 
   if (mediaResult.warnings.length > 0) {
     for (const warning of mediaResult.warnings) {
@@ -684,7 +964,9 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const ctxPayload = {
     Body: body,
     RawBody: rawBody,
-    From: group ? `infiai:group:${accountScope}:${msg.groupID}:${msg.sendID}` : `infiai:direct:${selfUid}:${msg.sendID}`,
+    From: group
+      ? `infiai:group:${accountScope}:${msg.groupID}:${msg.sendID}`
+      : `infiai:direct:${selfUid}:${msg.sendID}`,
     To: `infiai:${client.config.userID}`,
     SessionKey: effectiveSessionKey,
     AccountId: client.config.accountId,
@@ -730,7 +1012,10 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     });
   }
 
-  if (sessionContinuityEnabled && runtime.channel.session?.recordInboundSession) {
+  if (
+    sessionContinuityEnabled &&
+    runtime.channel.session?.recordInboundSession
+  ) {
     await runtime.channel.session.recordInboundSession({
       storePath,
       sessionKey: effectiveSessionKey,
@@ -743,7 +1028,8 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
             accountId: client.config.accountId,
           }
         : undefined,
-      onRecordError: (err: unknown) => api.logger?.warn?.(`[infiai] recordInboundSession: ${String(err)}`),
+      onRecordError: (err: unknown) =>
+        api.logger?.warn?.(`[infiai] recordInboundSession: ${String(err)}`),
     });
   }
 
@@ -762,26 +1048,40 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
       cfg,
       dispatcherOptions: {
         deliver: async (payload: { text?: string }) => {
-          console.warn(`[infiai] deliver called: group=${group}, hasText=${!!payload.text}, textLen=${payload.text?.length || 0}, contentLen=${typeof payload.text === "string" ? payload.text.length : "non-string"}, clientMsgID=${msg.clientMsgID || "-"}`);
+          console.warn(
+            `[infiai] deliver called: group=${group}, hasText=${!!payload.text}, textLen=${payload.text?.length || 0}, contentLen=${typeof payload.text === "string" ? payload.text.length : "non-string"}, clientMsgID=${msg.clientMsgID || "-"}`,
+          );
           if (!payload.text) {
-            console.warn(`[infiai] deliver skipped: empty AI reply, serverMsgID=${msg.serverMsgID || ""} clientMsgID=${msg.clientMsgID || ""}`);
+            console.warn(
+              `[infiai] deliver skipped: empty AI reply, serverMsgID=${msg.serverMsgID || ""} clientMsgID=${msg.clientMsgID || ""}`,
+            );
             return;
           }
-          const cleaned = stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(payload.text));
+          const cleaned = stripInfiaiReplyArtifacts(
+            stripVisibleReasoningPreamble(payload.text),
+          );
           if (!cleaned.trim()) {
-            console.warn(`[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`);
+            console.warn(
+              `[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+            );
             return;
           }
-          console.warn(`[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`);
+          console.warn(
+            `[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`,
+          );
           try {
             await sendReplyFromInbound(client, msg, cleaned);
-            console.warn(`[infiai] deliver OK: group=${group}, clientMsgID=${msg.clientMsgID || "-"}`);
+            console.warn(
+              `[infiai] deliver OK: group=${group}, clientMsgID=${msg.clientMsgID || "-"}`,
+            );
           } catch (e: any) {
             console.warn(`[infiai] deliver failed: ${formatSdkError(e)}`);
           }
         },
         onError: (err: unknown, info: { kind?: string }) => {
-          console.warn(`[infiai] dispatch onError: kind=${info?.kind || "reply"}, err=${String(err)}`);
+          console.warn(
+            `[infiai] dispatch onError: kind=${info?.kind || "reply"}, err=${String(err)}`,
+          );
         },
       },
       replyOptions: {
@@ -813,7 +1113,11 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     console.warn(`[infiai] dispatch failed (console): ${formatSdkError(err)}`);
     try {
       const errMsg = formatSdkError(err);
-      await sendReplyFromInbound(client, msg, `Processing failed: ${errMsg.slice(0, 80)}`);
+      await sendReplyFromInbound(
+        client,
+        msg,
+        `Processing failed: ${errMsg.slice(0, 80)}`,
+      );
     } catch {
       // ignore secondary send errors
     }
