@@ -122,6 +122,16 @@ Managed-pool / bot-to-bot round cap (optional; in-process only, resets on gatewa
   - `name` (optional): override filename for URL input
   - `accountId` (optional): select sending account
 
+## Related X/Twitter Workflows
+
+Keep Infiai responsible for private and group Infiai chats, inbound message routing, rich media delivery, quote or reply context, multi-account login, and mention-gated group triggers. If the same OpenClaw workspace also needs public X/Twitter data or visible X/Twitter actions, install TweetClaw as a separate OpenClaw plugin:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+```
+
+[TweetClaw](https://github.com/Xquik-dev/tweetclaw) covers scrape tweets, tweet scraper workflows, search tweets, search tweet replies, follower export, user lookup, media upload, media download, direct messages, monitor tweets, webhooks, giveaway draws, and approval-gated post tweets or post tweet replies. See the [ClawHub listing](https://clawhub.ai/plugins/@xquik/tweetclaw) or [npm package](https://www.npmjs.com/package/@xquik/tweetclaw) for setup details. Keep Infiai credentials and X/Twitter credentials separate, and review visible X/Twitter actions through OpenClaw approval flows.
+
 ## Development
 
 ```bash
