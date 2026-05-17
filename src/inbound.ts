@@ -553,6 +553,61 @@ function stripVisibleReasoningPreamble(text: string): string {
   return s;
 }
 
+const CONTEXT_LIMIT_REPLY =
+  "当前会话过长，已为你开启新会话，请重新发送上一条问题。";
+const GENERIC_MODEL_FAILURE_REPLY =
+  "抱歉，当前服务暂时无法完成回复，请稍后再试。";
+const TOOL_PROGRESS_ONLY_FALLBACK_REPLY =
+  "抱歉，当前搜索没有生成可用摘要，请稍后再试。";
+
+function localizeOpenClawReply(text: string): string {
+  const s = String(text ?? "");
+  if (
+    /Context limit exceeded|Context overflow|maximum context length|context length exceeded|reserveTokensFloor|I've reset our conversation/i.test(
+      s,
+    )
+  ) {
+    return CONTEXT_LIMIT_REPLY;
+  }
+  if (
+    /Something went wrong while processing your request|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|midstream error|invalid params|tool result's tool id/i.test(
+      s,
+    )
+  ) {
+    return GENERIC_MODEL_FAILURE_REPLY;
+  }
+  return s;
+}
+
+function isLocalizedFailureReply(originalText: string, localizedText: string): boolean {
+  return localizedText !== originalText && (
+    localizedText === CONTEXT_LIMIT_REPLY ||
+    localizedText === GENERIC_MODEL_FAILURE_REPLY
+  );
+}
+
+function localizeOpenClawError(errorText: string): string {
+  const localized = localizeOpenClawReply(errorText);
+  return localized === errorText ? GENERIC_MODEL_FAILURE_REPLY : localized;
+}
+
+function isLikelyToolProgressOnlyReply(text: string): boolean {
+  const s = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (!s || s.length > 220 || s.includes("\n")) return false;
+  if (/https?:\/\/|www\.|来源[:：]|参考[:：]|搜索结果|以下(?:是|为)|找到(?:了)?|据.+报道|^\s*\d+[.、]/i.test(s)) {
+    return false;
+  }
+  return (
+    /我已经了解了\s*serper/i.test(s) ||
+    /(?:现在|马上|接下来)?帮[你您].{0,30}(?:搜索|查询|检索|查找)/.test(s) ||
+    /(?:让|由)?我(?:来|先|再)?帮[你您]?.{0,20}(?:搜索|查询|检索|查找|读取|看一下)/.test(s) ||
+    /(?:正在|先|准备|需要).{0,20}(?:搜索|查询|检索|查找|读取|调用)/.test(s) ||
+    /(?:使用|调用).{0,20}(?:serper|搜索|联网|工具)/i.test(s)
+  );
+}
+
 /** Remove provider/model placeholders that leak into user-visible replies. */
 function stripInfiaiReplyArtifacts(text: string): string {
   let s = String(text ?? "")
@@ -1293,6 +1348,9 @@ export async function processInboundMessage(
   }
 
   const dispatchObsStart = transcriptObsEnabled() ? Date.now() : 0;
+  let dispatchedFailureReply = false;
+  let deliveredVisibleReply = false;
+  let suppressedProgressOnlyReply = false;
   await setInboundTypingState(client, msg, true);
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -1309,8 +1367,15 @@ export async function processInboundMessage(
             );
             return;
           }
+          const localized = localizeOpenClawReply(payload.text);
+          if (dispatchedFailureReply) {
+            console.warn(
+              `[infiai] deliver skipped: prior model failure reply already sent, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+            );
+            return;
+          }
           const cleaned = stripInfiaiReplyArtifacts(
-            stripVisibleReasoningPreamble(payload.text),
+            stripVisibleReasoningPreamble(localized),
           );
           if (!cleaned.trim()) {
             console.warn(
@@ -1318,11 +1383,21 @@ export async function processInboundMessage(
             );
             return;
           }
+          if (isLikelyToolProgressOnlyReply(cleaned)) {
+            suppressedProgressOnlyReply = true;
+            console.warn(
+              `[infiai] deliver skipped: tool-progress-only reply suppressed, raw="${cleaned.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+            );
+            return;
+          }
           console.warn(
             `[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`,
           );
           try {
+            const isFailureReply = isLocalizedFailureReply(payload.text, localized);
+            if (isFailureReply) dispatchedFailureReply = true;
             await sendReplyFromInbound(client, msg, cleaned);
+            deliveredVisibleReply = true;
             console.warn(
               `[infiai] deliver OK: group=${group}, clientMsgID=${msg.clientMsgID || "-"}`,
             );
@@ -1353,6 +1428,16 @@ export async function processInboundMessage(
         durationMs: Date.now() - dispatchObsStart,
       });
     }
+    if (!deliveredVisibleReply && !dispatchedFailureReply) {
+      const fallback = suppressedProgressOnlyReply
+        ? TOOL_PROGRESS_ONLY_FALLBACK_REPLY
+        : GENERIC_MODEL_FAILURE_REPLY;
+      console.warn(
+        `[infiai] dispatch completed without visible reply; sending fallback, suppressedProgressOnly=${suppressedProgressOnlyReply ? 1 : 0}, clientMsgID=${msg.clientMsgID || "-"}`,
+      );
+      await sendReplyFromInbound(client, msg, fallback);
+      deliveredVisibleReply = true;
+    }
   } catch (err: any) {
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.fail", {
@@ -1370,11 +1455,10 @@ export async function processInboundMessage(
     api.logger?.error?.(`[infiai] dispatch failed: ${formatSdkError(err)}`);
     console.warn(`[infiai] dispatch failed (console): ${formatSdkError(err)}`);
     try {
-      const errMsg = formatSdkError(err);
       await sendReplyFromInbound(
         client,
         msg,
-        `Processing failed: ${errMsg.slice(0, 80)}`,
+        localizeOpenClawError(formatSdkError(err)),
       );
     } catch {
       // ignore secondary send errors
