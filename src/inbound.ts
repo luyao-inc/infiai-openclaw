@@ -570,7 +570,7 @@ function localizeOpenClawReply(text: string): string {
     return CONTEXT_LIMIT_REPLY;
   }
   if (
-    /Something went wrong while processing your request|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|midstream error|invalid params|tool result's tool id/i.test(
+    /Something went wrong while processing your request|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|Message failed|midstream error|invalid params|tool result's tool id/i.test(
       s,
     )
   ) {
@@ -634,6 +634,40 @@ function stripInfiaiReplyArtifacts(text: string): string {
     break;
   }
   return lines.join("\n").trimEnd();
+}
+
+function isNoReplyMetaReply(text: string): boolean {
+  const s = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (!s) return true;
+  if (/^(NO_REPLY|NO_ANSWER)\.?\s*$/i.test(s)) return true;
+
+  const mentionsNoReply = /\bNO_(?:REPLY|ANSWER)\b/i.test(s);
+  if (!mentionsNoReply) return false;
+
+  return (
+    /(?:应该|应当|需要|必须|我会|我要|我应该|I should|should)\s*(?:输出|返回|回复|respond with|output|return)/i.test(
+      s,
+    ) ||
+    /(?:根据|遵循|按照).{0,40}(?:Silent|NO_REPLY|NO_ANSWER|静默|不回复)/i.test(s) ||
+    /(?:not (?:a|an) actual|不是.{0,12}实际.{0,12}(?:对话|消息|内容)|系统(?:错误)?提示|error prompt|system prompt)/i.test(
+      s,
+    )
+  );
+}
+
+function isNonConversationalSystemReply(text: string): boolean {
+  const s = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (!s) return true;
+  if (isNoReplyMetaReply(s)) return true;
+  return (
+    /^⚠️?\s*(?:✉️\s*)?Message failed\.?$/i.test(s) ||
+    /^抱歉，当前服务暂时无法完成回复，请稍后再试。?$/.test(s) ||
+    /^当前服务暂时无法完成回复，请稍后再试。?$/.test(s)
+  );
 }
 
 function mergeInboundResults(
@@ -1090,6 +1124,16 @@ export async function processInboundMessage(
     );
     return;
   }
+  if (
+    getInfiaiMessageSource(msg) === ASSISTANT_MESSAGE_SOURCE &&
+    isInboundFromManagedBotSession(msg) &&
+    isNonConversationalSystemReply(inbound.body)
+  ) {
+    api.logger?.info?.(
+      `[infiai] ignore assistant system reply: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} sendID=${msg.sendID}`,
+    );
+    return;
+  }
 
   // 单聊不能只按 sendID（对端用户）建 session：同一真人发给两个托管号时 sendID 相同，
   // 会合并成一条 OpenClaw 会话、同一条 agent 记忆与 dashboard 线程。必须纳入本侧托管号 userID。
@@ -1351,6 +1395,7 @@ export async function processInboundMessage(
   let dispatchedFailureReply = false;
   let deliveredVisibleReply = false;
   let suppressedProgressOnlyReply = false;
+  let suppressedNoReplyMetaReply = false;
   await setInboundTypingState(client, msg, true);
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -1377,6 +1422,13 @@ export async function processInboundMessage(
           const cleaned = stripInfiaiReplyArtifacts(
             stripVisibleReasoningPreamble(localized),
           );
+          if (isNoReplyMetaReply(payload.text) || isNoReplyMetaReply(cleaned)) {
+            suppressedNoReplyMetaReply = true;
+            console.warn(
+              `[infiai] deliver skipped: NO_REPLY meta reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+            );
+            return;
+          }
           if (!cleaned.trim()) {
             console.warn(
               `[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
@@ -1428,7 +1480,11 @@ export async function processInboundMessage(
         durationMs: Date.now() - dispatchObsStart,
       });
     }
-    if (!deliveredVisibleReply && !dispatchedFailureReply) {
+    if (
+      !deliveredVisibleReply &&
+      !dispatchedFailureReply &&
+      !suppressedNoReplyMetaReply
+    ) {
       const fallback = suppressedProgressOnlyReply
         ? TOOL_PROGRESS_ONLY_FALLBACK_REPLY
         : GENERIC_MODEL_FAILURE_REPLY;
