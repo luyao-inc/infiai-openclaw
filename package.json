@@ -28,6 +28,16 @@
     "contracts": {
       "tools": true
     },
+    "channels": [
+      "infiai"
+    ],
+    "channelConfigs": {
+      "infiai": {
+        "schema": {
+          "type": "object"
+        }
+      }
+    },
     "channel": {
       "id": "infiai",
       "label": "Infiai",

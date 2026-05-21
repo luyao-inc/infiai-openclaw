@@ -41,6 +41,14 @@ export interface InboundMediaItem {
 
 export interface InboundBodyResult {
   body: string;
-  kind: "text" | "image" | "video" | "file" | "mixed" | "unknown";
+  kind:
+    | "text"
+    | "image"
+    | "video"
+    | "audio"
+    | "file"
+    | "contact"
+    | "mixed"
+    | "unknown";
   media?: InboundMediaItem[];
 }
