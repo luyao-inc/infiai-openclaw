@@ -972,6 +972,8 @@ function isNonConversationalSystemReply(text: string): boolean {
   if (!s) return true;
   if (isNoReplyMetaReply(s)) return true;
   return (
+    /^Gateway restart update error\b/i.test(s) ||
+    /Run:\s*openclaw doctor --non-interactive/i.test(s) ||
     /^⚠️?\s*(?:✉️\s*)?Message failed\.?$/i.test(s) ||
     /^抱歉，当前服务暂时无法完成回复，请稍后再试。?$/.test(s) ||
     /^当前服务暂时无法完成回复，请稍后再试。?$/.test(s)
@@ -1911,6 +1913,13 @@ export async function processInboundMessage(
             suppressedNoReplyMetaReply = true;
             console.warn(
               `[infiai] deliver skipped: NO_REPLY meta reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+            );
+            return;
+          }
+          if (isNonConversationalSystemReply(cleaned)) {
+            suppressedNoReplyMetaReply = true;
+            console.warn(
+              `[infiai] deliver skipped: non-conversational system reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
             );
             return;
           }
