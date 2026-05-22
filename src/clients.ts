@@ -1,12 +1,90 @@
-import { CbEvents, getSDK, type CallbackEvent, type MessageItem } from "@openim/client-sdk";
+import { CbEvents, getSDK, LogLevel, type CallbackEvent, type MessageItem } from "@openim/client-sdk";
+import loglevel from "loglevel";
 import { processInboundMessage } from "./inbound";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
-import { formatSdkError } from "./utils";
+import { formatSdkError, infiaiDebug, resolveOpenIMSdkLogLevel } from "./utils";
 
 const clients = new Map<string, OpenIMClientState>();
 
 /** Serialize sdk.login() on singleton SDK; parallel logins race and break sessions. */
 let loginGate = Promise.resolve();
+let sdkLoggingConfigured = false;
+let openIMConsoleFilterInstalled = false;
+
+function isNoisyOpenIMConsoleLine(args: unknown[]): boolean {
+  const first = args[0] as any;
+  if (typeof first === "string") {
+    return first.includes("OpenIMSDK") || first.includes("SDK =>");
+  }
+  if (
+    first &&
+    typeof first === "object" &&
+    ("unreadCount" in first || Object.keys(first).length === 1) &&
+    Array.isArray(first.conversations)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function installOpenIMConsoleFilter(): void {
+  if (openIMConsoleFilterInstalled || resolveOpenIMSdkLogLevel() !== "silent") return;
+  openIMConsoleFilterInstalled = true;
+  const wrap = <T extends (...args: any[]) => void>(fn: T): T =>
+    ((...args: unknown[]) => {
+      if (isNoisyOpenIMConsoleLine(args)) return;
+      fn(...args);
+    }) as T;
+  console.log = wrap(console.log.bind(console));
+  console.info = wrap(console.info.bind(console));
+  console.debug = wrap(console.debug.bind(console));
+  console.warn = wrap(console.warn.bind(console));
+}
+
+function configureOpenIMSdkLogging(): void {
+  if (sdkLoggingConfigured) return;
+  sdkLoggingConfigured = true;
+  installOpenIMConsoleFilter();
+  try {
+    loglevel.setLevel(resolveOpenIMSdkLogLevel(), false);
+  } catch {
+    // Keep startup resilient if SDK logging internals change.
+  }
+}
+
+function getConfiguredSDK(): ReturnType<typeof getSDK> {
+  configureOpenIMSdkLogging();
+  if (resolveOpenIMSdkLogLevel() !== "silent") return getSDK();
+
+  const originalInfo = console.info;
+  console.info = (...args: unknown[]) => {
+    const first = String(args[0] ?? "");
+    if (first.includes("OpenIMSDK")) return;
+    originalInfo(...args);
+  };
+  try {
+    return getSDK();
+  } finally {
+    console.info = originalInfo;
+  }
+}
+
+function openIMSdkLogLevelValue(): number {
+  switch (resolveOpenIMSdkLogLevel()) {
+    case "trace":
+      return LogLevel.Trace;
+    case "debug":
+      return LogLevel.Debug;
+    case "info":
+      return LogLevel.Info;
+    case "warn":
+      return LogLevel.Warn;
+    case "error":
+      return LogLevel.Error;
+    default:
+      return LogLevel.Silent;
+  }
+}
 
 async function withLoginLock<T>(fn: () => Promise<T>): Promise<T> {
   const run = loginGate.then(fn, fn);
@@ -43,7 +121,7 @@ export async function stopAccountClient(api: any, accountId: string): Promise<vo
   clients.delete(accountId);
   detachHandlers(state);
   if (clients.size > 0) {
-    api.logger?.info?.(`[infiai] account ${accountId} detached (shared SDK kept alive for remaining accounts)`);
+    infiaiDebug(api, `[infiai] account ${accountId} detached (shared SDK kept alive for remaining accounts)`);
     return;
   }
   try {
@@ -62,7 +140,7 @@ export async function startAccountClient(
   config: OpenIMAccountConfig,
   opts?: { abortSignal?: AbortSignal; gatewayConfig?: any },
 ): Promise<void> {
-  const sdk = getSDK();
+  const sdk = getConfiguredSDK();
 
   const state = {
     sdk,
@@ -105,10 +183,11 @@ export async function startAccountClient(
         wsAddr: config.wsAddr,
         apiAddr: config.apiAddr,
         platformID: config.platformID,
+        logLevel: openIMSdkLogLevelValue(),
       });
     });
     clients.set(config.accountId, state);
-    api.logger?.info?.(`[infiai] account ${config.accountId} connected`);
+    infiaiDebug(api, `[infiai] account ${config.accountId} connected`);
   } catch (e: any) {
     detachHandlers(state);
     api.logger?.error?.(`[infiai] account ${config.accountId} login failed: ${formatSdkError(e)}`);

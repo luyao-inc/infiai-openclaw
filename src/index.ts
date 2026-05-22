@@ -12,26 +12,25 @@ import { listEnabledAccountConfigs } from "./config";
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
 
-export default function register(api: any): void {
+function registerCliMetadata(api: any): void {
+  if (typeof api.registerCli !== "function") return;
+  api.registerCli(
+    (ctx: any) => {
+      const prog = ctx.program;
+      if (prog && typeof prog.command === "function") {
+        const infiai = prog.command("infiai").description("Infiai channel configuration");
+        infiai.command("setup").description("Interactive setup for the Infiai default account").action(async () => {
+          await runOpenIMSetup();
+        });
+      }
+    },
+    { commands: ["infiai"] }
+  );
+}
+
+function registerFull(api: any): void {
   (globalThis as any).__openimApi = api;
   (globalThis as any).__openimGatewayConfig = api.config;
-
-  api.registerChannel({ plugin: OpenIMChannelPlugin });
-
-  if (typeof api.registerCli === "function") {
-    api.registerCli(
-      (ctx: any) => {
-        const prog = ctx.program;
-        if (prog && typeof prog.command === "function") {
-          const infiai = prog.command("infiai").description("Infiai channel configuration");
-          infiai.command("setup").description("Interactive setup for the Infiai default account").action(async () => {
-            await runOpenIMSetup();
-          });
-        }
-      },
-      { commands: ["infiai"] }
-    );
-  }
 
   registerOpenIMTools(api);
 
@@ -64,3 +63,28 @@ export default function register(api: any): void {
 
   api.logger?.info?.("[infiai] plugin loaded");
 }
+
+export default {
+  id: "openclaw-channel",
+  name: "Infiai Channel",
+  description: "Infiai protocol channel for OpenClaw",
+  register(api: any): void {
+    if (api.registrationMode === "cli-metadata") {
+      registerCliMetadata(api);
+      return;
+    }
+    if (api.registrationMode === "tool-discovery") {
+      registerFull(api);
+      return;
+    }
+    api.registerChannel({ plugin: OpenIMChannelPlugin });
+    if (api.registrationMode === "discovery") {
+      registerCliMetadata(api);
+      return;
+    }
+    if (api.registrationMode !== "full") return;
+    registerCliMetadata(api);
+    registerFull(api);
+  },
+  channelPlugin: OpenIMChannelPlugin,
+};

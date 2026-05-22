@@ -51,12 +51,20 @@ export async function runOpenIMSetup(): Promise<void> {
     })
   );
 
+  const chatApiAddr = guardCancel(
+    await clackText({
+      message: "Enter Infiai Chat API endpoint",
+      initialValue: process.env.INFIAI_CHAT_API_ADDR || process.env.CHAT_API_ADDR || "http://127.0.0.1:10008",
+    })
+  );
+
   const trimmedToken = String(token).trim();
   const trimmedWsAddr = String(wsAddr).trim();
   const trimmedApiAddr = String(apiAddr).trim();
+  const trimmedChatApiAddr = String(chatApiAddr).trim();
 
-  if (!trimmedToken || !trimmedWsAddr || !trimmedApiAddr) {
-    console.error("Configuration fields `token`, `wsAddr`, and `apiAddr` cannot be empty.");
+  if (!trimmedToken || !trimmedWsAddr || !trimmedApiAddr || !trimmedChatApiAddr) {
+    console.error("Configuration fields `token`, `wsAddr`, `apiAddr`, and `chatApiAddr` cannot be empty.");
     process.exit(1);
   }
 
@@ -78,6 +86,7 @@ export async function runOpenIMSetup(): Promise<void> {
     token: trimmedToken,
     wsAddr: trimmedWsAddr,
     apiAddr: trimmedApiAddr,
+    chatApiAddr: trimmedChatApiAddr,
   };
 
   channels.infiai = {

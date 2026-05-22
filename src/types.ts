@@ -9,6 +9,7 @@ export interface OpenIMAccountConfig {
   token: string;
   wsAddr: string;
   apiAddr: string;
+  chatApiAddr?: string;
   platformID: number;
   requireMention: boolean;
   inboundWhitelist: string[];

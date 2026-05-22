@@ -5,6 +5,7 @@ import { readFile, stat } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { getRecvAndGroupID } from "./targets";
 import type { OpenIMClientState, ParsedTarget } from "./types";
+import { infiaiConsoleDebug } from "./utils";
 
 function isUrl(input: string): boolean {
   return /^https?:\/\//i.test(input.trim());
@@ -116,11 +117,11 @@ export async function sendAtTextToGroup(
   const content = `@${displayName} ${String(text ?? "").trim()}`.trim();
   const hasCreateAtMsg =
     typeof (client.sdk as any).createTextAtMessage === "function";
-  console.warn(
+  infiaiConsoleDebug(
     `[infiai] sendAtTextToGroup: groupID=${groupID}, atUserID=${atUserID}, textLen=${text.length}, hasCreateAtMsg=${hasCreateAtMsg}, sdkExists=${!!client.sdk}`,
   );
   if (!hasCreateAtMsg) {
-    console.warn(
+    infiaiConsoleDebug(
       `[infiai] createTextAtMessage not available on SDK, falling back to createTextMessage — reply will lack formal @-mention, groupID=${groupID}, atUserID=${atUserID}`,
     );
   }
@@ -137,14 +138,14 @@ export async function sendAtTextToGroup(
       })
     : await client.sdk.createTextMessage(content);
   const message = created?.data;
-  console.warn(
+  infiaiConsoleDebug(
     `[infiai] sendAtTextToGroup: message created, hasData=${!!message}, dataKeys=${message ? Object.keys(message).join(",") : "null"}`,
   );
   if (!message) throw new Error("createTextAtMessage failed");
   if (options?.ex) {
     (message as MessageItem & { ex?: string }).ex = options.ex;
   }
-  console.warn(
+  infiaiConsoleDebug(
     `[infiai] sendAtTextToGroup: calling sendMessage recvID="" groupID=${groupID}`,
   );
   await client.sdk.sendMessage({
@@ -152,7 +153,7 @@ export async function sendAtTextToGroup(
     groupID,
     message,
   });
-  console.warn(`[infiai] sendAtTextToGroup: sendMessage COMPLETED`);
+  infiaiConsoleDebug(`[infiai] sendAtTextToGroup: sendMessage COMPLETED`);
 }
 
 export async function sendImageToTarget(

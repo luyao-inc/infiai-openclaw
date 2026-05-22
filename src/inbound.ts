@@ -22,6 +22,7 @@ import {
 } from "./managedManagedPredicate";
 import { sendAtTextToGroup, sendTextToTarget } from "./media";
 import { ensureInfiaiReplyReady } from "./replyHeal";
+import { withInfiaiToolContext } from "./toolContext";
 import type {
   ChatType,
   InboundBodyResult,
@@ -29,7 +30,7 @@ import type {
   OpenIMClientState,
   ParsedTarget,
 } from "./types";
-import { formatSdkError } from "./utils";
+import { formatSdkError, infiaiConsoleDebug, infiaiDebug } from "./utils";
 
 const inboundDedup = new Map<string, number>();
 const INBOUND_DEDUP_TTL_MS = 5 * 60 * 1000;
@@ -1008,22 +1009,38 @@ function buildTextEnvelope(
   cfg: any,
   fromLabel: string,
   senderId: string,
+  managedUserId: string,
   timestamp: number,
   bodyText: string,
   chatType: ChatType,
 ): string {
+  const ownerAuthorized =
+    String(senderId || "").trim() === String(managedUserId || "").trim();
+  const authorityText = ownerAuthorized
+    ? "当前对话者是这个分身的原身。只有这种情况下，才可以使用 Infiai 联系人、群聊、找人、加好友、发消息等会改变或读取账号资料的工具。"
+    : "当前对话者不是这个分身的原身，只是访客或其他用户。禁止使用 Infiai 联系人、群聊、找人、加好友、发消息等会读取或改变原身账号资料的工具；只能进行普通对话，不能替原身操作系统资料。";
+  const bodyWithContext = [
+    "<infiai_conversation_context>",
+    `managed_user_id: ${managedUserId}`,
+    `current_sender_id: ${senderId}`,
+    `owner_authorized: ${ownerAuthorized ? "true" : "false"}`,
+    authorityText,
+    "</infiai_conversation_context>",
+    "",
+    bodyText,
+  ].join("\n");
   const envelopeOptions =
     runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const formatted = runtime.channel.reply?.formatInboundEnvelope?.({
     channel: "Infiai",
     from: fromLabel,
     timestamp,
-    body: bodyText,
+    body: bodyWithContext,
     chatType,
     sender: { name: fromLabel, id: senderId },
     envelope: envelopeOptions,
   });
-  return typeof formatted === "string" ? formatted : bodyText;
+  return typeof formatted === "string" ? formatted : bodyWithContext;
 }
 
 async function materializeInboundMedia(
@@ -1487,13 +1504,13 @@ async function sendReplyFromInbound(
 ): Promise<void> {
   const isGroup = isGroupMessage(msg);
   const replyEx = buildAssistantReplyEx(msg);
-  console.warn(
+  infiaiConsoleDebug(
     `[infiai] sendReplyFromInbound: isGroup=${isGroup}, groupID=${String(msg.groupID || "-")}, sendID=${String(msg.sendID || "-")}, textLen=${text.length}, clientMsgID=${msg.clientMsgID || "-"}`,
   );
   if (isGroup) {
     const senderID = String(msg.sendID || "").trim();
     if (senderID) {
-      console.warn(
+      infiaiConsoleDebug(
         `[infiai] sendReplyFromInbound: GROUP path, groupID=${String(msg.groupID)}, senderID=${senderID}, textLen=${text.length}`,
       );
       await sendAtTextToGroup(
@@ -1504,23 +1521,23 @@ async function sendReplyFromInbound(
         String(msg.senderNickname || senderID),
         { ex: replyEx },
       );
-      console.warn(
+      infiaiConsoleDebug(
         `[infiai] sendReplyFromInbound: GROUP sendAtTextToGroup COMPLETED`,
       );
       return;
     }
-    console.warn(
+    infiaiConsoleDebug(
       `[infiai] sendReplyFromInbound: GROUP but senderID empty, falling through to sendTextToTarget`,
     );
   }
   const target: ParsedTarget = isGroup
     ? { kind: "group", id: String(msg.groupID) }
     : { kind: "user", id: String(msg.sendID) };
-  console.warn(
+  infiaiConsoleDebug(
     `[infiai] sendReplyFromInbound: target kind=${target.kind}, id=${target.id}`,
   );
   await sendTextToTarget(client, target, text, { ex: replyEx });
-  console.warn(`[infiai] sendReplyFromInbound: sendTextToTarget COMPLETED`);
+  infiaiConsoleDebug(`[infiai] sendReplyFromInbound: sendTextToTarget COMPLETED`);
 }
 
 export async function processInboundMessage(
@@ -1544,7 +1561,8 @@ export async function processInboundMessage(
     return;
   }
   if (isAssistantEchoMessage(msg, selfUid)) {
-    api.logger?.info?.(
+    infiaiDebug(
+      api,
       `[infiai] ignore assistant echo: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} sendID=${msg.sendID}`,
     );
     return;
@@ -1573,7 +1591,8 @@ export async function processInboundMessage(
   }
 
   if (!shouldProcessInboundMessage(client.config.accountId, msg)) {
-    api.logger?.info?.(
+    infiaiDebug(
+      api,
       `[infiai] inbound dedup skip: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} serverMsgID=${msg.serverMsgID || ""} sendID=${msg.sendID}`,
     );
     return;
@@ -1581,7 +1600,8 @@ export async function processInboundMessage(
 
   const inbound = extractInboundBody(msg);
   if (!inbound.body) {
-    api.logger?.info?.(
+    infiaiDebug(
+      api,
       `[infiai] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`,
     );
     return;
@@ -1591,7 +1611,8 @@ export async function processInboundMessage(
     isInboundFromManagedBotSession(msg) &&
     isNonConversationalSystemReply(inbound.body)
   ) {
-    api.logger?.info?.(
+    infiaiDebug(
+      api,
       `[infiai] ignore assistant system reply: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} sendID=${msg.sendID}`,
     );
     return;
@@ -1609,7 +1630,8 @@ export async function processInboundMessage(
   const cfg = await resolveLatestGatewayConfig(client.gatewayConfig ?? api.config);
   const accEntry = cfg?.channels?.infiai?.accounts?.[client.config.accountId];
   if (!accEntry || accEntry.enabled === false) {
-    api.logger?.info?.(
+    infiaiDebug(
+      api,
       `[infiai] automation skipped: account disabled or unbound accountId=${client.config.accountId} userID=${client.config.userID}`,
     );
     return;
@@ -1690,7 +1712,8 @@ export async function processInboundMessage(
     const replyAgentForCap =
       bindingAgentId ?? executionAgentId;
     if (replyAgentForCap !== executionAgentId) {
-      api.logger?.info?.(
+      infiaiDebug(
+        api,
         `[infiai] managed round-cap: using binding agent ${replyAgentForCap} (executionAgent=${executionAgentId}) accountId=${client.config.accountId}`,
       );
     }
@@ -1742,7 +1765,8 @@ export async function processInboundMessage(
       humanSelfAssistant,
     )
   ) {
-    api.logger?.info?.(
+    infiaiDebug(
+      api,
       `[infiai] automation skipped: mode=offline_only_or_none accountId=${client.config.accountId} agent=${bindingAgentId ?? executionAgentId} managedUserId=${selfUid} sender=${senderId} selfAssistant=${humanSelfAssistant ? 1 : 0}`,
     );
     return;
@@ -1770,6 +1794,7 @@ export async function processInboundMessage(
     cfg,
     fromLabel,
     senderId,
+    selfUid,
     timestamp,
     rawBody,
     chatType,
@@ -1885,23 +1910,33 @@ export async function processInboundMessage(
   let suppressedNoReplyMetaReply = false;
   await setInboundTypingState(client, msg, true);
   try {
-    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx: ctxPayload,
-      cfg,
-      dispatcherOptions: {
+    await withInfiaiToolContext(
+      {
+        accountId: client.config.accountId,
+        managedUserId: selfUid,
+        senderId,
+        agentId: executionAgentId,
+        sessionKey: effectiveSessionKey,
+        ownerAuthorized: String(senderId).trim() === String(selfUid).trim(),
+        source: "inbound",
+      },
+      async () => runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx: ctxPayload,
+        cfg,
+        dispatcherOptions: {
         deliver: async (payload: { text?: string }) => {
-          console.warn(
+          infiaiConsoleDebug(
             `[infiai] deliver called: group=${group}, hasText=${!!payload.text}, textLen=${payload.text?.length || 0}, contentLen=${typeof payload.text === "string" ? payload.text.length : "non-string"}, clientMsgID=${msg.clientMsgID || "-"}`,
           );
           if (!payload.text) {
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver skipped: empty AI reply, serverMsgID=${msg.serverMsgID || ""} clientMsgID=${msg.clientMsgID || ""}`,
             );
             return;
           }
           const localized = localizeOpenClawReply(payload.text);
           if (dispatchedFailureReply) {
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver skipped: prior model failure reply already sent, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
             );
             return;
@@ -1911,32 +1946,32 @@ export async function processInboundMessage(
           );
           if (isNoReplyMetaReply(payload.text) || isNoReplyMetaReply(cleaned)) {
             suppressedNoReplyMetaReply = true;
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver skipped: NO_REPLY meta reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
             );
             return;
           }
           if (isNonConversationalSystemReply(cleaned)) {
             suppressedNoReplyMetaReply = true;
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver skipped: non-conversational system reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
             );
             return;
           }
           if (!cleaned.trim()) {
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
             );
             return;
           }
           if (isLikelyToolProgressOnlyReply(cleaned)) {
             suppressedProgressOnlyReply = true;
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver skipped: tool-progress-only reply suppressed, raw="${cleaned.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
             );
             return;
           }
-          console.warn(
+          infiaiConsoleDebug(
             `[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`,
           );
           try {
@@ -1944,7 +1979,7 @@ export async function processInboundMessage(
             if (isFailureReply) dispatchedFailureReply = true;
             await sendReplyFromInbound(client, msg, cleaned);
             deliveredVisibleReply = true;
-            console.warn(
+            infiaiConsoleDebug(
               `[infiai] deliver OK: group=${group}, clientMsgID=${msg.clientMsgID || "-"}`,
             );
           } catch (e: any) {
@@ -1956,12 +1991,13 @@ export async function processInboundMessage(
             `[infiai] dispatch onError: kind=${info?.kind || "reply"}, err=${String(err)}`,
           );
         },
-      },
-      replyOptions: {
-        disableBlockStreaming: true,
-        images: mediaResult.images,
-      },
-    });
+        },
+        replyOptions: {
+          disableBlockStreaming: true,
+          images: mediaResult.images,
+        },
+      }),
+    );
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.done", {
         accountId: client.config.accountId,
@@ -1982,7 +2018,7 @@ export async function processInboundMessage(
       const fallback = suppressedProgressOnlyReply
         ? TOOL_PROGRESS_ONLY_FALLBACK_REPLY
         : GENERIC_MODEL_FAILURE_REPLY;
-      console.warn(
+      infiaiConsoleDebug(
         `[infiai] dispatch completed without visible reply; sending fallback, suppressedProgressOnly=${suppressedProgressOnlyReply ? 1 : 0}, clientMsgID=${msg.clientMsgID || "-"}`,
       );
       await sendReplyFromInbound(client, msg, fallback);
@@ -2003,7 +2039,6 @@ export async function processInboundMessage(
       });
     }
     api.logger?.error?.(`[infiai] dispatch failed: ${formatSdkError(err)}`);
-    console.warn(`[infiai] dispatch failed (console): ${formatSdkError(err)}`);
     try {
       await sendReplyFromInbound(
         client,

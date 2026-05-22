@@ -49,6 +49,7 @@ function envDefaultAccount(): Record<string, unknown> | null {
   const token = String(process.env.INFIAI_TOKEN ?? process.env.OPENIM_TOKEN ?? "").trim();
   const wsAddr = String(process.env.INFIAI_WS_ADDR ?? process.env.OPENIM_WS_ADDR ?? "").trim();
   const apiAddr = String(process.env.INFIAI_API_ADDR ?? process.env.OPENIM_API_ADDR ?? "").trim();
+  const chatApiAddr = String(process.env.INFIAI_CHAT_API_ADDR ?? process.env.CHAT_API_ADDR ?? "").trim();
   if (!token || !wsAddr || !apiAddr) return null;
 
   const hints = extractAccountHintsFromToken(token);
@@ -61,6 +62,7 @@ function envDefaultAccount(): Record<string, unknown> | null {
     token,
     wsAddr,
     apiAddr,
+    ...(chatApiAddr ? { chatApiAddr } : {}),
     platformID,
     enabled: true,
     requireMention: true,
@@ -83,6 +85,7 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
   const token = String(raw.token ?? "").trim();
   const wsAddr = String(raw.wsAddr ?? "").trim();
   const apiAddr = String(raw.apiAddr ?? "").trim();
+  const chatApiAddr = String(raw.chatApiAddr ?? raw.chatAPIAddr ?? "").trim();
   if (!token || !wsAddr || !apiAddr) return null;
 
   const hints = extractAccountHintsFromToken(token);
@@ -101,6 +104,7 @@ function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | nu
     token,
     wsAddr,
     apiAddr,
+    ...(chatApiAddr ? { chatApiAddr } : {}),
     platformID,
     requireMention,
     inboundWhitelist,

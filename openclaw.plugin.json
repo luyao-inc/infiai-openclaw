@@ -4,8 +4,26 @@
   "version": "0.3.2",
   "description": "Infiai protocol channel for OpenClaw",
   "author": "openclaw-infiai",
+  "activation": {
+    "onStartup": true
+  },
   "contracts": {
-    "tools": true
+    "tools": [
+      "infiai_send_text",
+      "infiai_list_my_friends",
+      "infiai_list_my_groups",
+      "infiai_search_people",
+      "infiai_search_groups",
+      "infiai_apply_friends",
+      "infiai_apply_groups",
+      "infiai_list_group_members",
+      "infiai_get_friend_chat_history",
+      "infiai_get_group_chat_history",
+      "infiai_get_task_context",
+      "infiai_send_image",
+      "infiai_send_video",
+      "infiai_send_file"
+    ]
   },
   "channels": [
     "infiai"
@@ -40,6 +58,10 @@
       "apiAddr": {
         "type": "string",
         "description": "Infiai API endpoint, e.g. http://127.0.0.1:10002"
+      },
+      "chatApiAddr": {
+        "type": "string",
+        "description": "Infiai Chat API endpoint for business tools, e.g. http://127.0.0.1:10008"
       },
       "platformID": {
         "type": "number",
@@ -82,6 +104,9 @@
             "apiAddr": {
               "type": "string"
             },
+            "chatApiAddr": {
+              "type": "string"
+            },
             "platformID": {
               "type": "number"
             },
@@ -113,6 +138,10 @@
     "apiAddr": {
       "label": "API Endpoint",
       "placeholder": "http://127.0.0.1:10002"
+    },
+    "chatApiAddr": {
+      "label": "Chat API Endpoint",
+      "placeholder": "http://127.0.0.1:10008"
     },
     "requireMention": {
       "label": "Require Mention in Group"
