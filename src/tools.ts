@@ -12,14 +12,19 @@ export function registerOpenIMTools(api: any): void {
   }
   infiaiDebug(api, "[infiai] registering social tools");
 
-  const chatToolCall = async (client: any, path: string, payload: Record<string, unknown>) => {
+  type InfiaiToolParams = {
+    accountId?: string;
+    taskID?: string;
+    runID?: string;
+  };
+
+  const chatToolCall = async (client: any | null, path: string, payload: Record<string, unknown>) => {
     const base = String(client?.config?.chatApiAddr || process.env.INFIAI_CHAT_API_ADDR || process.env.CHAT_API_ADDR || "http://openim-chat:10008").replace(/\/+$/, "");
     if (!base) throw new Error("Infiai Chat API endpoint is not configured.");
-    const requestBody = JSON.stringify({
-      ...(payload || {}),
-      ownerUserID: client?.config?.userID,
-      accountId: client?.config?.accountId,
-    });
+    const requestPayload: Record<string, unknown> = { ...(payload || {}) };
+    if (client?.config?.userID) requestPayload.ownerUserID = client.config.userID;
+    if (client?.config?.accountId) requestPayload.accountId = client.config.accountId;
+    const requestBody = JSON.stringify(requestPayload);
     const sharedSecret = String(process.env.OPENCLAW_SHARED_SECRET || process.env.INFIAI_TOOL_SHARED_SECRET || "").trim();
     const resp = await fetch(`${base}${path}`, {
       method: "POST",
@@ -123,24 +128,54 @@ export function registerOpenIMTools(api: any): void {
     return { ok: true as const };
   };
 
-  const ensureClient = (accountId?: string) => {
-    const normalizedAccountId = String(accountId || "").trim();
+  const resolveAccountContext = (params?: InfiaiToolParams) => {
+    const explicitAccountId = String(params?.accountId || "").trim();
+    const context = getInfiaiToolContext(explicitAccountId || undefined);
+    const normalizedAccountId = explicitAccountId || context?.accountId || "";
+    const taskID = String(params?.taskID || "").trim();
+    return { normalizedAccountId, taskID };
+  };
+
+  const ensureClient = (params?: string | InfiaiToolParams) => {
+    const rawParams = typeof params === "string" ? { accountId: params } : params;
+    const { normalizedAccountId, taskID } = resolveAccountContext(rawParams);
     const authorized = authorizeSocialTool(normalizedAccountId || undefined);
     if (!authorized.ok) return authorized;
-    if (!normalizedAccountId && connectedClientCount() > 1) {
+    if (!normalizedAccountId && !taskID && connectedClientCount() > 1) {
       return {
         ok: false as const,
         result: ambiguousAccountFailure(),
       };
     }
+    if (!normalizedAccountId && taskID) {
+      return { ok: true as const, client: null };
+    }
     const client = getConnectedClient(normalizedAccountId || undefined);
     if (!client) {
+      if (taskID) {
+        return { ok: true as const, client: null };
+      }
       return {
         ok: false as const,
         result: notConnectedFailure(normalizedAccountId || undefined),
       };
     }
     return { ok: true as const, client };
+  };
+
+  const ensureTargetAndChatTool = (params: { target?: string } & InfiaiToolParams) => {
+    const target = parseTarget(params.target);
+    if (!target) {
+      return {
+        ok: false as const,
+        result: {
+          content: [{ type: "text", text: "Invalid target format. Expected user:<id> or group:<id>." }],
+        },
+      };
+    }
+    const checked = ensureClient(params);
+    if (!checked.ok) return checked;
+    return { ok: true as const, target, client: checked.client };
   };
 
   const ensureTargetAndClient = (params: { target?: string; accountId?: string }) => {
@@ -187,7 +222,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["target", "text"],
     },
     async execute(_id: string, params: { target: string; text: string; taskID?: string; runID?: string; accountId?: string }) {
-      const checked = ensureTargetAndClient(params);
+      const checked = ensureTargetAndChatTool(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/send_message", {
@@ -195,6 +230,7 @@ export function registerOpenIMTools(api: any): void {
           text: params.text,
           taskID: params.taskID,
           runID: params.runID,
+          accountId: params.accountId,
         });
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (e: any) {
@@ -211,11 +247,13 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         query: { type: "string", description: "Optional nickname/remark/profile keyword" },
         limit: { type: "number", description: "Maximum results, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
     },
-    async execute(_id: string, params: { query?: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { query?: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/list_my_friends", params as any);
@@ -234,11 +272,13 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         query: { type: "string", description: "Optional group name/introduction/type keyword" },
         limit: { type: "number", description: "Maximum results, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
     },
-    async execute(_id: string, params: { query?: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { query?: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/list_my_groups", params as any);
@@ -257,17 +297,22 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         query: { type: "string", description: "Search keyword describing nickname/category/profile/introduction" },
         limit: { type: "number", description: "Maximum results, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
       required: ["query"],
     },
-    async execute(_id: string, params: { query: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { query: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/search_people", {
           keyword: params.query,
           pagination: { pageNumber: 1, showNumber: Math.min(Math.max(Number(params.limit || 20), 1), 100) },
+          taskID: params.taskID,
+          runID: params.runID,
+          accountId: params.accountId,
         });
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (e: any) {
@@ -284,18 +329,23 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         query: { type: "string", description: "Search keyword describing group name/type/introduction" },
         limit: { type: "number", description: "Maximum results, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
       required: ["query"],
     },
-    async execute(_id: string, params: { query: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { query: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/search_groups", {
           keyword: params.query,
           sort: "hot",
           pagination: { pageNumber: 1, showNumber: Math.min(Math.max(Number(params.limit || 20), 1), 100) },
+          taskID: params.taskID,
+          runID: params.runID,
+          accountId: params.accountId,
         });
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (e: any) {
@@ -320,7 +370,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["userIDs", "message"],
     },
     async execute(_id: string, params: { userIDs: string[]; message: string; reason?: string; taskID?: string; runID?: string; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/apply_friends", params as any);
@@ -347,7 +397,7 @@ export function registerOpenIMTools(api: any): void {
       required: ["groupIDs", "message"],
     },
     async execute(_id: string, params: { groupIDs: string[]; message: string; reason?: string; taskID?: string; runID?: string; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/apply_groups", params as any);
@@ -367,12 +417,14 @@ export function registerOpenIMTools(api: any): void {
         groupID: { type: "string", description: "Joined group ID" },
         query: { type: "string", description: "Optional member nickname/userID keyword" },
         limit: { type: "number", description: "Maximum results, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
       required: ["groupID"],
     },
-    async execute(_id: string, params: { groupID: string; query?: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { groupID: string; query?: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/list_group_members", params as any);
@@ -391,12 +443,14 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         userID: { type: "string", description: "Friend user ID" },
         limit: { type: "number", description: "Maximum messages, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
       required: ["userID"],
     },
-    async execute(_id: string, params: { userID: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { userID: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/friend_chat_history", params as any);
@@ -415,12 +469,14 @@ export function registerOpenIMTools(api: any): void {
       properties: {
         groupID: { type: "string", description: "Joined group ID" },
         limit: { type: "number", description: "Maximum messages, default 20, max 100" },
+        taskID: { type: "string", description: "Optional Infiai scheduled task ID" },
+        runID: { type: "string", description: "Optional Infiai scheduled run ID" },
         accountId: { type: "string", description: "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected." },
       },
       required: ["groupID"],
     },
-    async execute(_id: string, params: { groupID: string; limit?: number; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+    async execute(_id: string, params: { groupID: string; limit?: number; taskID?: string; runID?: string; accountId?: string }) {
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/group_chat_history", params as any);
@@ -444,7 +500,7 @@ export function registerOpenIMTools(api: any): void {
       },
     },
     async execute(_id: string, params: { taskID?: string; runID?: string; agentID?: string; accountId?: string }) {
-      const checked = ensureClient(params.accountId);
+      const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
         const result = await chatToolCall(checked.client, "/claw/internal/tools/context", {
