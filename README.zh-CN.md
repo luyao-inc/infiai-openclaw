@@ -121,6 +121,16 @@ openclaw infiai setup
   - `name`（可选）：URL 输入时覆盖文件名
   - `accountId`（可选）：指定发送账号
 
+## 相关 X/Twitter 工作流
+
+Infiai 继续负责私聊、群聊、入站消息路由、富媒体发送、引用或回复上下文、多账号登录和群聊提及触发。如果同一个 OpenClaw 工作区还需要公开 X/Twitter 数据或可见的 X/Twitter 操作，请把 TweetClaw 作为独立 OpenClaw 插件安装：
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+```
+
+[TweetClaw](https://github.com/Xquik-dev/tweetclaw) 支持 scrape tweets、tweet scraper workflows、search tweets、search tweet replies、follower export、user lookup、media upload、media download、direct messages、monitor tweets、webhooks、giveaway draws，以及需要审批的 post tweets 或 post tweet replies。安装细节以 TweetClaw GitHub 仓库和 [npm package](https://www.npmjs.com/package/@xquik/tweetclaw) 为准；[ClawHub discovery page](https://clawhub.ai/plugins/@xquik/tweetclaw) 仍可用于浏览，但该 listing 暂时落后于 npm。请分开保存 Infiai 凭据和 X/Twitter 凭据，并通过 OpenClaw 审批流程复核可见的 X/Twitter 操作。
+
 ## 开发
 
 ```bash
