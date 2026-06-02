@@ -44,6 +44,7 @@ const MEMORY_POLICY_CACHE_TTL_MS = 500;
 const GATEWAY_CONFIG_CACHE_TTL_MS = 250;
 const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
 const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
+const ASSISTANT_ONBOARDING_MESSAGE_SOURCE = "assistant_onboarding";
 const INFIAI_CARD_CUSTOM_TYPE = 205;
 const INFIAI_TYPING_CUSTOM_TYPE = 260;
 
@@ -1558,6 +1559,13 @@ export async function processInboundMessage(
   const selfUid = String(client.config.userID).trim();
   const humanSelfAssistant = isHumanSelfAssistantMessage(msg, selfUid);
   if (isInfiaiTypingCustomMessage(msg)) {
+    return;
+  }
+  if (getInfiaiMessageSource(msg) === ASSISTANT_ONBOARDING_MESSAGE_SOURCE) {
+    infiaiDebug(
+      api,
+      `[infiai] ignore assistant onboarding message: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""}`,
+    );
     return;
   }
   if (isAssistantEchoMessage(msg, selfUid)) {
