@@ -911,8 +911,10 @@ function isLikelyToolProgressOnlyReply(text: string): boolean {
   }
   return (
     /我已经了解了\s*serper/i.test(s) ||
+    /(?:知识库|文档|资料).{0,30}(?:没(?:有|啥)?(?:相关)?(?:内容|信息|关系)|无关|不相关).{0,60}(?:查|查一下|搜索|搜一下|查询|检索|看一下)/.test(s) ||
+    /(?:我)?(?:来|先|再|直接)?(?:查|查一下|搜索|搜一下|查询|检索|看一下|了解一下).{0,80}(?:情况|信息|资料|内容|天气|新闻|赛事|近况|结果|动态)[。.!！]*$/.test(s) ||
     /(?:现在|马上|接下来)?帮[你您].{0,30}(?:搜索|查询|检索|查找)/.test(s) ||
-    /(?:让|由)?我(?:来|先|再)?帮[你您]?.{0,20}(?:搜索|查询|检索|查找|读取|看一下)/.test(s) ||
+    /(?:让|由)?我(?:来|先|再|直接)?帮[你您]?.{0,20}(?:搜索|查询|检索|查找|读取|看一下)/.test(s) ||
     /(?:正在|先|准备|需要).{0,20}(?:搜索|查询|检索|查找|读取|调用)/.test(s) ||
     /(?:使用|调用).{0,20}(?:serper|搜索|联网|工具)/i.test(s)
   );
@@ -944,6 +946,38 @@ function stripInfiaiReplyArtifacts(text: string): string {
     break;
   }
   return lines.join("\n").trimEnd();
+}
+
+function infiaiReplyNormalizerEnabled(): boolean {
+  const raw = String(process.env.INFIAI_REPLY_NORMALIZER ?? "on")
+    .trim()
+    .toLowerCase();
+  return raw !== "off" && raw !== "0" && raw !== "false";
+}
+
+/** Minimal formatting cleanup for IM bubbles; do not truncate or summarize. */
+function normalizeInfiaiReplyFormatting(text: string): string {
+  if (!infiaiReplyNormalizerEnabled()) return text;
+  let s = String(text ?? "").replace(/\r\n/g, "\n");
+  if (!s.trim()) return s;
+  if (s.includes("```")) return s;
+
+  const lines = s.split("\n");
+  const normalizedLines = lines
+    .map((line) => {
+      const trimmed = line.trim();
+      if (/^[-*_~—–]{3,}$/.test(trimmed)) return "";
+      return line.replace(/^\s{0,3}#{1,6}\s*/, "");
+    })
+    .filter((line, index, arr) => {
+      if (line.trim() !== "") return true;
+      return index > 0 && arr[index - 1]?.trim() !== "";
+    });
+
+  s = normalizedLines.join("\n");
+  s = s.replace(/(^|[^\*])\*\*([^*\n]+?)\*\*(?!\*)/g, "$1$2");
+  s = s.replace(/(^|[^_])__([^_\n]+?)__(?!_)/g, "$1$2");
+  return s.replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
 function isNoReplyMetaReply(text: string): boolean {
@@ -1949,8 +1983,8 @@ export async function processInboundMessage(
             );
             return;
           }
-          const cleaned = stripInfiaiReplyArtifacts(
-            stripVisibleReasoningPreamble(localized),
+          const cleaned = normalizeInfiaiReplyFormatting(
+            stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(localized)),
           );
           if (isNoReplyMetaReply(payload.text) || isNoReplyMetaReply(cleaned)) {
             suppressedNoReplyMetaReply = true;
