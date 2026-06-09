@@ -534,6 +534,15 @@ function summarizeMedia(item: InboundMediaItem, includeUrl = false): string {
     return includeUrl && item.url ? `[Image] ${item.url}` : "[Image]";
   }
 
+  if (item.kind === "audio") {
+    const parts = ["[Audio]"];
+    if (item.fileName) parts.push(`name=${item.fileName}`);
+    if (item.mimeType) parts.push(`type=${item.mimeType}`);
+    if (includeUrl && item.url) parts.push(`url=${item.url}`);
+    if (item.size) parts.push(`size=${item.size}`);
+    return parts.join(" ");
+  }
+
   if (item.kind === "video") {
     const parts = ["[Video]"];
     if (item.fileName) parts.push(`name=${item.fileName}`);
@@ -585,6 +594,7 @@ function resolveOpenClawMediaType(item: InboundMediaItem): string {
   if (item.mimeType) return item.mimeType;
   if (item.kind === "image") return "image/jpeg";
   if (item.kind === "video") return "video/mp4";
+  if (item.kind === "audio") return "audio/webm";
   const fileName = String(item.fileName ?? "").toLowerCase();
   if (fileName.endsWith(".txt")) return "text/plain";
   if (fileName.endsWith(".md") || fileName.endsWith(".markdown"))
@@ -607,6 +617,7 @@ function lowerFileName(item: InboundMediaItem): string {
 }
 
 function isAudioMediaItem(item: InboundMediaItem): boolean {
+  if (item.kind === "audio") return true;
   const mime = String(item.mimeType ?? "").trim().toLowerCase();
   if (mime.startsWith("audio/")) return true;
   const name = lowerFileName(item);
@@ -1348,12 +1359,33 @@ function extractFileMedia(msg: MessageItem): InboundMediaItem[] {
   ];
 }
 
+function extractSoundMedia(msg: MessageItem): InboundMediaItem[] {
+  const sound = msg.soundElem as any;
+  if (!sound) return [];
+  const soundType = normalizeString(sound.soundType);
+  const mimeType = normalizeMimeType(soundType)
+    ?? (soundType ? `audio/${soundType.replace(/^\./, "")}` : undefined);
+  const fileName =
+    normalizeString(sound.fileName) ??
+    (soundType ? `voice.${soundType.replace(/^\./, "")}` : "voice.webm");
+  return [
+    {
+      kind: "audio",
+      url: normalizeString(sound.sourceUrl) ?? normalizeString(sound.soundPath),
+      fileName,
+      size: normalizeSize(sound.dataSize),
+      mimeType,
+    },
+  ];
+}
+
 function extractInboundBody(msg: MessageItem, depth = 0): InboundBodyResult {
   const text = String(
     msg.textElem?.content ?? msg.atTextElem?.text ?? "",
   ).trim();
   const imageMedia = extractPictureMedia(msg);
   const videoMedia = extractVideoMedia(msg);
+  const audioMedia = extractSoundMedia(msg);
   const fileMedia = extractFileMedia(msg);
 
   if (msg.quoteElem?.quoteMessage) {
@@ -1367,7 +1399,7 @@ function extractInboundBody(msg: MessageItem, depth = 0): InboundBodyResult {
         : { body: "[quoted message]", kind: "mixed" as const };
     const currentParts: string[] = [];
     if (text) currentParts.push(`Reply: ${text}`);
-    for (const item of [...imageMedia, ...videoMedia, ...fileMedia]) {
+    for (const item of [...imageMedia, ...videoMedia, ...audioMedia, ...fileMedia]) {
       currentParts.push(`Reply attachment: ${summarizeMedia(item)}`);
     }
 
@@ -1379,7 +1411,7 @@ function extractInboundBody(msg: MessageItem, depth = 0): InboundBodyResult {
     return {
       body: bodyLines.join("\n"),
       kind: currentParts.length > 0 ? "mixed" : quoted.kind,
-      media: [...imageMedia, ...videoMedia, ...fileMedia],
+      media: [...imageMedia, ...videoMedia, ...audioMedia, ...fileMedia],
     };
   }
 
@@ -1391,6 +1423,9 @@ function extractInboundBody(msg: MessageItem, depth = 0): InboundBodyResult {
   }
   for (const item of videoMedia) {
     parts.push({ body: summarizeMedia(item), kind: "video", media: [item] });
+  }
+  for (const item of audioMedia) {
+    parts.push({ body: summarizeMedia(item), kind: "file", media: [item] });
   }
   for (const item of fileMedia) {
     parts.push({ body: summarizeMedia(item), kind: "file", media: [item] });

@@ -79,8 +79,18 @@ function normalizeInboundWhitelist(raw: unknown): string[] {
   return Array.from(new Set(normalized));
 }
 
+function accountLooksConnectable(raw: any): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  if (raw.enabled === false) return false;
+  const token = String(raw.token ?? "").trim();
+  const wsAddr = String(raw.wsAddr ?? "").trim();
+  const apiAddr = String(raw.apiAddr ?? "").trim();
+  return Boolean(token && wsAddr && apiAddr);
+}
+
 function normalizeAccount(accountId: string, raw: any): OpenIMAccountConfig | null {
   if (!raw || typeof raw !== "object") return null;
+  if (raw.enabled === false) return null;
 
   const token = String(raw.token ?? "").trim();
   const wsAddr = String(raw.wsAddr ?? "").trim();
@@ -116,7 +126,7 @@ export function listAccountIds(apiOrCfg: any): string[] {
   const accounts = ch?.accounts;
 
   if (accounts && typeof accounts === "object") {
-    const ids = Object.keys(accounts);
+    const ids = Object.keys(accounts).filter((id) => accountLooksConnectable(accounts[id]));
     if (ids.length > 0) return ids;
   }
 

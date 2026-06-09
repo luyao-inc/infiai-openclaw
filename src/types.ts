@@ -32,7 +32,7 @@ export interface ParsedTarget {
 }
 
 export interface InboundMediaItem {
-  kind: "image" | "video" | "file";
+  kind: "image" | "video" | "audio" | "file";
   url?: string;
   mimeType?: string;
   fileName?: string;

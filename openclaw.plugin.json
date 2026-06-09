@@ -30,10 +30,86 @@
   ],
   "channelConfigs": {
     "infiai": {
+      "label": "Infiai",
+      "description": "Infiai/OpenIM channel configuration. Managed agents should route through explicit bindings.match.accountId; default is a disabled sentinel.",
       "schema": {
-        "type": "object"
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "defaultAccount": { "type": "string", "default": "default" },
+          "token": { "type": "string" },
+          "wsAddr": { "type": "string" },
+          "apiAddr": { "type": "string" },
+          "chatApiAddr": { "type": "string" },
+          "userID": { "type": "string" },
+          "platformID": { "type": "number" },
+          "requireMention": { "type": "boolean", "default": true },
+          "inboundWhitelist": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "accounts": {
+            "type": "object",
+            "default": {},
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean", "default": true },
+                "token": { "type": "string" },
+                "wsAddr": { "type": "string" },
+                "apiAddr": { "type": "string" },
+                "chatApiAddr": { "type": "string" },
+                "userID": { "type": "string" },
+                "platformID": { "type": "number" },
+                "requireMention": { "type": "boolean", "default": true },
+                "inboundWhitelist": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "default": []
+                }
+              }
+            }
+          }
+        }
       }
     }
+  },
+  "channelEnvVars": {
+    "infiai": [
+      "INFIAI_TOKEN",
+      "OPENIM_TOKEN",
+      "INFIAI_WS_ADDR",
+      "OPENIM_WS_ADDR",
+      "INFIAI_API_ADDR",
+      "OPENIM_API_ADDR",
+      "INFIAI_CHAT_API_ADDR",
+      "CHAT_API_ADDR",
+      "INFIAI_USER_ID",
+      "OPENIM_USER_ID",
+      "INFIAI_PLATFORM_ID",
+      "OPENIM_PLATFORM_ID",
+      "OPENCLAW_SHARED_SECRET",
+      "INFIAI_TOOL_SHARED_SECRET"
+    ]
+  },
+  "toolMetadata": {
+    "infiai_send_text": { "description": "Send a text message through the configured Infiai account." },
+    "infiai_send_image": { "description": "Send an image message through the configured Infiai account." },
+    "infiai_send_video": { "description": "Send a video message through the configured Infiai account." },
+    "infiai_send_file": { "description": "Send a file message through the configured Infiai account." },
+    "infiai_list_my_friends": { "description": "List friends for the configured Infiai account." },
+    "infiai_list_my_groups": { "description": "List groups for the configured Infiai account." },
+    "infiai_search_people": { "description": "Search Infiai/OpenIM users." },
+    "infiai_search_groups": { "description": "Search Infiai/OpenIM groups." },
+    "infiai_apply_friends": { "description": "Apply to add an Infiai/OpenIM friend." },
+    "infiai_apply_groups": { "description": "Apply to join an Infiai/OpenIM group." },
+    "infiai_list_group_members": { "description": "List members for an Infiai/OpenIM group." },
+    "infiai_get_friend_chat_history": { "description": "Read friend chat history for the configured Infiai account." },
+    "infiai_get_group_chat_history": { "description": "Read group chat history for the configured Infiai account." },
+    "infiai_get_task_context": { "description": "Read task context from Infiai Chat API for the configured account." }
   },
   "configSchema": {
     "type": "object",
@@ -42,6 +118,11 @@
       "enabled": {
         "type": "boolean",
         "default": true
+      },
+      "defaultAccount": {
+        "type": "string",
+        "default": "default",
+        "description": "Default account id. Managed pools use a disabled 'default' sentinel and exact bindings.match.accountId for real accounts."
       },
       "token": {
         "type": "string",
