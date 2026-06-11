@@ -37,6 +37,7 @@ export interface InboundMediaItem {
   mimeType?: string;
   fileName?: string;
   size?: number;
+  durationSeconds?: number;
   snapshotUrl?: string;
 }
 
