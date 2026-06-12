@@ -935,10 +935,6 @@ const GENERIC_MODEL_FAILURE_REPLY =
   "抱歉，当前服务暂时无法完成回复，请稍后再试。";
 const TOOL_PROGRESS_ONLY_FALLBACK_REPLY =
   "抱歉，当前搜索没有生成可用摘要，请稍后再试。";
-const INSUFFICIENT_MEDIA_TOKEN_REPLY =
-  "这条消息需要使用付费的媒体理解能力，但当前 Token 余额不足，暂时无法处理。";
-const INSUFFICIENT_MODEL_TOKEN_REPLY =
-  "当前 Token 余额不足，暂时无法使用模型回复。";
 const IMAGE_UNDERSTANDING_FAILED_REPLY =
   "这张图片暂时无法完成理解，请稍后重试或换一张图片。";
 
@@ -1308,6 +1304,7 @@ async function chargeInboundMediaUsage(
     quantity: number;
     durationSeconds?: number;
     dryRun?: boolean;
+    allowOverdraft?: boolean;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1330,6 +1327,7 @@ async function chargeInboundMediaUsage(
     quantity: params.quantity,
     durationSeconds: params.durationSeconds,
     dryRun: Boolean(params.dryRun),
+    allowOverdraft: Boolean(params.allowOverdraft && !params.dryRun),
     idempotencyKey,
     rawUsage: {
       contentType: msg.contentType,
@@ -1361,6 +1359,7 @@ async function chargeActualCostUsage(
     outputTokens?: number;
     actualCostMicros: number;
     rawUsage?: Record<string, unknown>;
+    allowOverdraft?: boolean;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1379,6 +1378,7 @@ async function chargeActualCostUsage(
     inputTokens: Math.ceil(Number(params.inputTokens || 0)),
     outputTokens: Math.ceil(Number(params.outputTokens || 0)),
     actualCostMicros: Math.ceil(Number(params.actualCostMicros || 0)),
+    allowOverdraft: Boolean(params.allowOverdraft),
     idempotencyKey: ["inbound", params.chargeCode, params.payerUserID, sourceMsgID || Date.now()].join(":"),
     rawUsage: {
       contentType: msg.contentType,
@@ -1550,6 +1550,7 @@ async function chargeLanguageModelOutputUsage(
     conversationID: string;
     storePath: string;
     dispatchStartedAtMs: number;
+    allowOverdraft?: boolean;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1596,6 +1597,7 @@ async function chargeLanguageModelOutputUsage(
     inputTokens: usage?.inputTokens || 0,
     outputTokens: usage?.outputTokens || 0,
     actualCostMicros,
+    allowOverdraft: Boolean(params.allowOverdraft),
     rawUsage,
     idempotencyKey,
   });
@@ -2636,42 +2638,28 @@ export async function processInboundMessage(
     );
     return;
   }
+  try {
+    const billing = await checkLanguageModelOutputPreflight(client, msg, {
+      payerUserID: selfUid,
+      actorUserID: senderId,
+      agentID: executionAgentId,
+      conversationID: effectiveSessionKey,
+    });
+    if (!billing.allowed) {
+      api.logger?.warn?.(
+        `[infiai] inbound paid pipeline skipped: insufficient billing status=${billing.status || "unknown"} payer=${selfUid} required=${billing.requiredUnits || 0} available=${billing.availableUnits || 0} clientMsgID=${msg.clientMsgID || ""}`,
+      );
+      return;
+    }
+  } catch (err) {
+    api.logger?.warn?.(
+      `[infiai] inbound billing preflight failed; skip paid pipeline: ${formatSdkError(err)}`,
+    );
+    return;
+  }
   const transcribableMedia = (inbound.media ?? []).filter(isTranscribableMediaItem);
   if (transcribableMedia.length > 0) {
     await probeTranscribableMediaDurations(client, transcribableMedia, api.logger);
-    const audioItems = transcribableMedia.filter((item) => transcribableMediaKind(item) === "audio");
-    const videoItems = transcribableMedia.filter((item) => transcribableMediaKind(item) === "video");
-    for (const [chargeCode, module, items] of [
-      ["audio_understanding", "media_audio", audioItems],
-      ["video_understanding", "media_video", videoItems],
-    ] as const) {
-      if (items.length === 0) continue;
-      try {
-        const billing = await chargeInboundMediaUsage(client, msg, {
-          payerUserID: selfUid,
-          actorUserID: senderId,
-          agentID: executionAgentId,
-          conversationID: effectiveSessionKey,
-          chargeCode,
-          module,
-          quantity: items.length,
-          durationSeconds: billableMediaDurationSeconds(items),
-          dryRun: true,
-        });
-        if (!billing.allowed) {
-          api.logger?.warn?.(
-            `[infiai] ${chargeCode} skipped: insufficient billing status=${billing.status || "unknown"} payer=${selfUid} required=${billing.requiredUnits || 0} available=${billing.availableUnits || 0} count=${items.length} clientMsgID=${msg.clientMsgID || ""}`,
-          );
-          await sendReplyFromInbound(client, msg, INSUFFICIENT_MEDIA_TOKEN_REPLY);
-          return;
-        }
-      } catch (err) {
-        api.logger?.warn?.(
-          `[infiai] ${chargeCode} billing check failed; skip paid media pipeline: ${formatSdkError(err)}`,
-        );
-        return;
-      }
-    }
   }
   const transcriptResult = await extractTranscribableMediaText(
     client,
@@ -2696,6 +2684,7 @@ export async function processInboundMessage(
         outputTokens: fileTextResult.visionOutputTokens || 0,
         actualCostMicros: fileTextResult.visionActualCostMicros || 0,
         rawUsage: fileTextResult.rawUsage,
+        allowOverdraft: true,
       });
       if (!charged.allowed) {
         api.logger?.warn?.(
@@ -2729,6 +2718,7 @@ export async function processInboundMessage(
           module,
           quantity: items.length,
           durationSeconds: billableMediaDurationSeconds(items),
+          allowOverdraft: true,
         });
         if (!charged.allowed) {
           api.logger?.warn?.(
@@ -2745,32 +2735,6 @@ export async function processInboundMessage(
     }
   }
   const imageMedia = (inbound.media ?? []).filter(isImageMediaItem);
-  if (imageMedia.length > 0) {
-    try {
-      const billing = await chargeInboundMediaUsage(client, msg, {
-        payerUserID: selfUid,
-        actorUserID: senderId,
-        agentID: executionAgentId,
-        conversationID: effectiveSessionKey,
-        chargeCode: "image_understanding",
-        module: "media_image",
-        quantity: imageMedia.length,
-        dryRun: true,
-      });
-      if (!billing.allowed) {
-        api.logger?.warn?.(
-          `[infiai] image understanding skipped: insufficient billing status=${billing.status || "unknown"} payer=${selfUid} required=${billing.requiredUnits || 0} available=${billing.availableUnits || 0} count=${imageMedia.length} clientMsgID=${msg.clientMsgID || ""}`,
-        );
-        await sendReplyFromInbound(client, msg, INSUFFICIENT_MEDIA_TOKEN_REPLY);
-        return;
-      }
-    } catch (err) {
-      api.logger?.warn?.(
-        `[infiai] image billing check failed; skip paid image pipeline: ${formatSdkError(err)}`,
-      );
-      return;
-    }
-  }
   const imageMediaResult = imageMedia.length > 0
     ? await materializeInboundMedia(client, imageMedia)
     : { images: [], warnings: [], urls: [], types: [], paths: [] };
@@ -2798,6 +2762,7 @@ export async function processInboundMessage(
         chargeCode: "image_understanding",
         module: "media_image",
         quantity: imageTextResult.extractedCount,
+        allowOverdraft: true,
       });
       if (!charged.allowed) {
         api.logger?.warn?.(
@@ -2958,26 +2923,6 @@ export async function processInboundMessage(
   let sentNoVisibleFallbackReply = false;
   let suppressedProgressOnlyReply = false;
   let suppressedNoReplyMetaReply = false;
-  try {
-    const billing = await checkLanguageModelOutputPreflight(client, msg, {
-      payerUserID: selfUid,
-      actorUserID: senderId,
-      agentID: executionAgentId,
-      conversationID: effectiveSessionKey,
-    });
-    if (!billing.allowed) {
-      api.logger?.warn?.(
-        `[infiai] language model output skipped: insufficient billing status=${billing.status || "unknown"} payer=${selfUid} required=${billing.requiredUnits || 0} available=${billing.availableUnits || 0} clientMsgID=${msg.clientMsgID || ""}`,
-      );
-      await sendReplyFromInbound(client, msg, INSUFFICIENT_MODEL_TOKEN_REPLY);
-      return;
-    }
-  } catch (err) {
-    api.logger?.warn?.(
-      `[infiai] language model output billing check failed; skip paid model pipeline: ${formatSdkError(err)}`,
-    );
-    return;
-  }
   await setInboundTypingState(client, msg, true);
   try {
     await withInfiaiToolContext(
@@ -3108,6 +3053,7 @@ export async function processInboundMessage(
           conversationID: effectiveSessionKey,
           storePath,
           dispatchStartedAtMs: llmDispatchStartedAt,
+          allowOverdraft: true,
         });
         if (!charged.allowed) {
           api.logger?.warn?.(
