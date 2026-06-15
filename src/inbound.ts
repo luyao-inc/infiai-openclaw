@@ -234,6 +234,11 @@ type LanguageModelUsageSnapshot = {
   rawUsage: Record<string, unknown>;
 };
 
+type AssistantTextSnapshot = {
+  text: string;
+  timestamp?: string;
+};
+
 function normalizeSessionKeyPart(value: unknown): string {
   return String(value ?? "")
     .trim()
@@ -935,6 +940,8 @@ const GENERIC_MODEL_FAILURE_REPLY =
   "抱歉，当前服务暂时无法完成回复，请稍后再试。";
 const TOOL_PROGRESS_ONLY_FALLBACK_REPLY =
   "抱歉，当前搜索没有生成可用摘要，请稍后再试。";
+const GROUP_MENTION_SILENT_FALLBACK_REPLY =
+  "我在，想聊什么？";
 const IMAGE_UNDERSTANDING_FAILED_REPLY =
   "这张图片暂时无法完成理解，请稍后重试或换一张图片。";
 
@@ -1069,6 +1076,41 @@ function isNoReplyMetaReply(text: string): boolean {
   );
 }
 
+export function shouldSuppressNoVisibleFallbackForAssistantText(
+  text: string,
+): boolean {
+  const cleaned = normalizeInfiaiReplyFormatting(
+    stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(text)),
+  );
+  return isNoReplyMetaReply(text) || isNoReplyMetaReply(cleaned);
+}
+
+export function resolveNoVisibleFallbackReply(params: {
+  silentNoReply: boolean;
+  explicitGroupMention: boolean;
+  suppressedProgressOnly: boolean;
+}): string | null {
+  if (params.silentNoReply) {
+    return params.explicitGroupMention ? GROUP_MENTION_SILENT_FALLBACK_REPLY : null;
+  }
+  return params.suppressedProgressOnly
+    ? TOOL_PROGRESS_ONLY_FALLBACK_REPLY
+    : GENERIC_MODEL_FAILURE_REPLY;
+}
+
+export function buildInfiaiOriginatingTo(params: {
+  isGroup: boolean;
+  groupID?: unknown;
+  senderID?: unknown;
+}): string {
+  if (params.isGroup) {
+    const groupID = String(params.groupID ?? "").trim();
+    return groupID ? `group:${groupID}` : "";
+  }
+  const senderID = String(params.senderID ?? "").trim();
+  return senderID ? `user:${senderID}` : "";
+}
+
 function isNonConversationalSystemReply(text: string): boolean {
   const s = String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -1116,18 +1158,24 @@ function buildTextEnvelope(
   timestamp: number,
   bodyText: string,
   chatType: ChatType,
+  explicitlyMentionedSelf = false,
 ): string {
   const ownerAuthorized =
     String(senderId || "").trim() === String(managedUserId || "").trim();
   const authorityText = ownerAuthorized
     ? "当前对话者是这个分身的原身。只有这种情况下，才可以使用 Infiai 联系人、群聊、找人、加好友、发消息等会改变或读取账号资料的工具。"
     : "当前对话者不是这个分身的原身，只是访客或其他用户。禁止使用 Infiai 联系人、群聊、找人、加好友、发消息等会读取或改变原身账号资料的工具；只能进行普通对话，不能替原身操作系统资料。";
+  const explicitMentionText =
+    chatType === "group" && explicitlyMentionedSelf
+      ? "当前群消息明确 @ 了这个分身。必须用这个分身的口吻回复一句简短、自然、可见的话；如果不知道聊什么，回复“我在，想聊什么？”；如果安全上必须拒答，也要给出可见的简短拒绝。不要输出 NO_REPLY 或 NO_ANSWER。"
+      : "";
   const bodyWithContext = [
     "<infiai_conversation_context>",
     `managed_user_id: ${managedUserId}`,
     `current_sender_id: ${senderId}`,
     `owner_authorized: ${ownerAuthorized ? "true" : "false"}`,
     authorityText,
+    ...(explicitMentionText ? [explicitMentionText] : []),
     "</infiai_conversation_context>",
     "",
     bodyText,
@@ -1484,6 +1532,74 @@ async function resolveSessionFileFromStore(
     }
   }
   return null;
+}
+
+function textFromAssistantContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object" || Array.isArray(part)) return "";
+      const record = part as Record<string, unknown>;
+      if (typeof record.text === "string") return record.text;
+      if (typeof record.content === "string") return record.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function extractAssistantTextSnapshotFromSessionLine(
+  line: string,
+  lowerBoundMs = 0,
+): AssistantTextSnapshot | null {
+  if (!line.trim()) return null;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const message = parsed?.message;
+  if (parsed?.type !== "message" || message?.role !== "assistant") return null;
+  const tsRaw = String(parsed.timestamp || "").trim();
+  const ts = Date.parse(tsRaw);
+  if (lowerBoundMs > 0 && Number.isFinite(ts) && ts < lowerBoundMs) return null;
+  return {
+    text: textFromAssistantContent(message?.content),
+    timestamp: tsRaw || undefined,
+  };
+}
+
+async function readLatestAssistantText(
+  storePath: string,
+  sessionKey: string,
+  agentId: string,
+  startedAtMs: number,
+): Promise<AssistantTextSnapshot | null> {
+  const sessionFile = await resolveSessionFileFromStore(
+    storePath,
+    sessionKey,
+    agentId,
+  );
+  if (!sessionFile) return null;
+  let content = "";
+  try {
+    content = await fs.readFile(sessionFile, "utf8");
+  } catch {
+    return null;
+  }
+
+  const lowerBound = startedAtMs > 0 ? startedAtMs - 5000 : 0;
+  let latest: AssistantTextSnapshot | null = null;
+  for (const line of content.split(/\r?\n/)) {
+    const snapshot = extractAssistantTextSnapshotFromSessionLine(
+      line,
+      lowerBound,
+    );
+    if (snapshot) latest = snapshot;
+  }
+  return latest;
 }
 
 async function readLatestLanguageModelUsage(
@@ -2806,7 +2922,13 @@ export async function processInboundMessage(
     timestamp,
     rawBody,
     chatType,
+    mentioned,
   );
+  const originatingTo = buildInfiaiOriginatingTo({
+    isGroup: group,
+    groupID: msg.groupID,
+    senderID: senderId,
+  });
 
   if (transcriptResult.warnings.length + fileTextResult.warnings.length + imageMediaResult.warnings.length + mediaResult.warnings.length + imageTextResult.warnings.length > 0) {
     for (const warning of [...transcriptResult.warnings, ...fileTextResult.warnings, ...imageMediaResult.warnings, ...mediaResult.warnings, ...imageTextResult.warnings]) {
@@ -2816,6 +2938,7 @@ export async function processInboundMessage(
 
   const ctxPayload = {
     Body: body,
+    BodyForAgent: body,
     RawBody: rawBody,
     From: group
       ? `infiai:group:${accountScope}:${msg.groupID}:${msg.sendID}`
@@ -2832,7 +2955,7 @@ export async function processInboundMessage(
     MessageSid: msg.clientMsgID || `infiai-${Date.now()}`,
     Timestamp: timestamp,
     OriginatingChannel: "infiai",
-    OriginatingTo: `infiai:${client.config.userID}`,
+    OriginatingTo: originatingTo,
     CommandAuthorized: true,
     ...(mediaResult.paths.length > 0
       ? {
@@ -2923,6 +3046,7 @@ export async function processInboundMessage(
   let sentNoVisibleFallbackReply = false;
   let suppressedProgressOnlyReply = false;
   let suppressedNoReplyMetaReply = false;
+  let noVisibleFallbackReply: string | null = null;
   await setInboundTypingState(client, msg, true);
   try {
     await withInfiaiToolContext(
@@ -3030,9 +3154,40 @@ export async function processInboundMessage(
       !dispatchedFailureReply &&
       !suppressedNoReplyMetaReply
     ) {
-      const fallback = suppressedProgressOnlyReply
-        ? TOOL_PROGRESS_ONLY_FALLBACK_REPLY
-        : GENERIC_MODEL_FAILURE_REPLY;
+      const latestAssistant = await readLatestAssistantText(
+        storePath,
+        effectiveSessionKey,
+        executionAgentId,
+        llmDispatchStartedAt,
+      );
+      if (
+        latestAssistant &&
+        shouldSuppressNoVisibleFallbackForAssistantText(latestAssistant.text)
+      ) {
+        noVisibleFallbackReply = resolveNoVisibleFallbackReply({
+          silentNoReply: true,
+          explicitGroupMention: group && mentioned,
+          suppressedProgressOnly: false,
+        });
+        suppressedNoReplyMetaReply = noVisibleFallbackReply === null;
+        infiaiConsoleDebug(
+          `[infiai] dispatch completed with silent NO_REPLY assistant text; ${noVisibleFallbackReply ? "using group mention fallback" : "fallback suppressed"}, groupMentionSilent=${group && mentioned ? 1 : 0}, agentId=${executionAgentId}, groupId=${String(msg.groupID || "-")}, timestamp=${latestAssistant.timestamp || "-"}, clientMsgID=${msg.clientMsgID || "-"}`,
+        );
+      }
+    }
+    if (
+      !deliveredVisibleReply &&
+      !dispatchedFailureReply &&
+      !suppressedNoReplyMetaReply
+    ) {
+      const fallback =
+        noVisibleFallbackReply ??
+        resolveNoVisibleFallbackReply({
+          silentNoReply: false,
+          explicitGroupMention: group && mentioned,
+          suppressedProgressOnly: suppressedProgressOnlyReply,
+        }) ??
+        GENERIC_MODEL_FAILURE_REPLY;
       infiaiConsoleDebug(
         `[infiai] dispatch completed without visible reply; sending fallback, suppressedProgressOnly=${suppressedProgressOnlyReply ? 1 : 0}, clientMsgID=${msg.clientMsgID || "-"}`,
       );
