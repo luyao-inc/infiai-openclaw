@@ -56,3 +56,30 @@ export function resolveInfiaiAgentIdForAccount(cfg: any, accountId: string): str
   }
   return null;
 }
+
+export function normalizeRuntimeAgentIDToBusinessAgentID(
+  runtimeAgentID: string,
+  ownerUserID?: string,
+): string {
+  const value = String(runtimeAgentID ?? "").trim();
+  if (!value) return "";
+  if (!value.startsWith("mg_")) return value;
+
+  const parts = value.split("__");
+  if (parts.length >= 3) {
+    const agentID = String(parts[parts.length - 1] ?? "").trim();
+    if (agentID) return agentID;
+  }
+
+  const owner = String(ownerUserID ?? "").trim();
+  if (owner) {
+    const marker = `__${owner}__`;
+    const idx = value.lastIndexOf(marker);
+    if (idx >= 0) {
+      const agentID = value.slice(idx + marker.length).trim();
+      if (agentID) return agentID;
+    }
+  }
+
+  return value;
+}
