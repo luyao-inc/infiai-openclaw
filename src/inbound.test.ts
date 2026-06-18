@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildInfiaiOriginatingTo,
   extractAssistantTextSnapshotFromSessionLine,
+  parseAgentSubscriptionPreflightDecision,
   resolveNoVisibleFallbackReply,
   shouldSuppressNoVisibleFallbackForAssistantText,
 } from "./inbound";
@@ -89,5 +90,53 @@ test("builds source reply targets for OpenClaw pending delivery", () => {
       senderID: "4839235718",
     }),
     "user:4839235718",
+  );
+});
+
+test("parses agent subscription preflight decisions from lower and Pascal case fields", () => {
+  const defaults = {
+    subscriberUserID: "8225049637",
+    ownerUserID: "8225049637",
+    agentID: "default",
+  };
+
+  assert.deepEqual(
+    parseAgentSubscriptionPreflightDecision(
+      {
+        allowed: true,
+        reason: "excluded",
+        subscriberUserID: "8225049637",
+        ownerUserID: "8225049637",
+        agentID: "default",
+      },
+      defaults,
+    ),
+    {
+      allowed: true,
+      reason: "excluded",
+      message: "",
+      subscriptionID: "",
+      subscriberUserID: "8225049637",
+      ownerUserID: "8225049637",
+      agentID: "default",
+      freeRoundsUsed: 0,
+      freeRoundsLimit: 0,
+      costUsedUnits: 0,
+      costLimitUnits: 0,
+    },
+  );
+
+  assert.equal(
+    parseAgentSubscriptionPreflightDecision(
+      {
+        Allowed: true,
+        Reason: "excluded",
+        SubscriberUserID: "8225049637",
+        OwnerUserID: "8225049637",
+        AgentID: "default",
+      },
+      defaults,
+    ).allowed,
+    true,
   );
 });

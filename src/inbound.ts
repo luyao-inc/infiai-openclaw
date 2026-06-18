@@ -18,6 +18,7 @@ import {
 } from "./managedManagedEnv";
 import {
   isUserInfiaiManagedInCfg,
+  normalizeRuntimeAgentIDToBusinessAgentID,
   resolveInfiaiAgentIdForAccount,
 } from "./managedManagedPredicate";
 import { sendAtTextToGroup, sendTextToTarget } from "./media";
@@ -47,6 +48,8 @@ const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
 const ASSISTANT_ONBOARDING_MESSAGE_SOURCE = "assistant_onboarding";
 const INFIAI_CARD_CUSTOM_TYPE = 205;
 const INFIAI_TYPING_CUSTOM_TYPE = 260;
+const AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY =
+  "当前分身订阅状态校验失败，请稍后重试。";
 
 let latestGatewayConfigCache:
   | {
@@ -218,6 +221,19 @@ type BillingChargeResult = {
   status?: string;
   requiredUnits?: number;
   availableUnits?: number;
+};
+type AgentSubscriptionPreflightResult = {
+  allowed: boolean;
+  reason?: string;
+  message?: string;
+  subscriptionID?: string;
+  subscriberUserID?: string;
+  ownerUserID?: string;
+  agentID?: string;
+  freeRoundsUsed?: number;
+  freeRoundsLimit?: number;
+  costUsedUnits?: number;
+  costLimitUnits?: number;
 };
 type LanguageModelUsageSnapshot = {
   provider: string;
@@ -1353,6 +1369,8 @@ async function chargeInboundMediaUsage(
     durationSeconds?: number;
     dryRun?: boolean;
     allowOverdraft?: boolean;
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1367,6 +1385,8 @@ async function chargeInboundMediaUsage(
     actorUserID: params.actorUserID,
     receiverUserID: params.payerUserID,
     agentOwnerUserID: params.payerUserID,
+    subscriberUserID: params.subscriberUserID || "",
+    agentSubscriptionID: params.agentSubscriptionID || "",
     agentID: params.agentID,
     conversationID: params.conversationID,
     sourceMsgID,
@@ -1408,6 +1428,8 @@ async function chargeActualCostUsage(
     actualCostMicros: number;
     rawUsage?: Record<string, unknown>;
     allowOverdraft?: boolean;
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1416,6 +1438,8 @@ async function chargeActualCostUsage(
     actorUserID: params.actorUserID,
     receiverUserID: params.payerUserID,
     agentOwnerUserID: params.payerUserID,
+    subscriberUserID: params.subscriberUserID || "",
+    agentSubscriptionID: params.agentSubscriptionID || "",
     agentID: params.agentID,
     conversationID: params.conversationID,
     sourceMsgID,
@@ -1667,6 +1691,8 @@ async function chargeLanguageModelOutputUsage(
     storePath: string;
     dispatchStartedAtMs: number;
     allowOverdraft?: boolean;
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1703,6 +1729,8 @@ async function chargeLanguageModelOutputUsage(
     actorUserID: params.actorUserID,
     receiverUserID: params.payerUserID,
     agentOwnerUserID: params.payerUserID,
+    subscriberUserID: params.subscriberUserID || "",
+    agentSubscriptionID: params.agentSubscriptionID || "",
     agentID: params.agentID,
     conversationID: params.conversationID,
     sourceMsgID,
@@ -1733,6 +1761,8 @@ async function checkLanguageModelOutputPreflight(
     actorUserID: string;
     agentID: string;
     conversationID: string;
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
   },
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -1742,6 +1772,8 @@ async function checkLanguageModelOutputPreflight(
     actorUserID: params.actorUserID,
     receiverUserID: params.payerUserID,
     agentOwnerUserID: params.payerUserID,
+    subscriberUserID: params.subscriberUserID || "",
+    agentSubscriptionID: params.agentSubscriptionID || "",
     agentID: params.agentID,
     conversationID: params.conversationID,
     sourceMsgID,
@@ -1762,6 +1794,51 @@ async function checkLanguageModelOutputPreflight(
     status: String(data?.status || data?.usage?.BillingStatus || data?.usage?.billingStatus || ""),
     requiredUnits: Number(data?.requiredUnits || data?.usage?.ChargeUnits || data?.usage?.chargeUnits || minimumUnits),
     availableUnits: Number(data?.availableUnits || data?.usage?.AvailableUnits || data?.usage?.availableUnits || 0),
+  };
+}
+
+async function checkAgentSubscriptionPreflight(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  params: {
+    subscriberUserID: string;
+    ownerUserID: string;
+    agentID: string;
+    taskID?: string;
+  },
+): Promise<AgentSubscriptionPreflightResult> {
+  const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
+  const data = await signedChatApiCall(client, "/claw/internal/agent-subscription/preflight", {
+    subscriberUserID: params.subscriberUserID,
+    ownerUserID: params.ownerUserID,
+    agentID: params.agentID,
+    sourceMsgID,
+    taskID: params.taskID || "",
+  });
+  return parseAgentSubscriptionPreflightDecision(data, params);
+}
+
+export function parseAgentSubscriptionPreflightDecision(
+  data: any,
+  params: {
+    subscriberUserID: string;
+    ownerUserID: string;
+    agentID: string;
+  },
+): AgentSubscriptionPreflightResult {
+  const read = (lowerKey: string, upperKey: string) => data?.[lowerKey] ?? data?.[upperKey];
+  return {
+    allowed: Boolean(read("allowed", "Allowed")),
+    reason: String(read("reason", "Reason") || ""),
+    message: String(read("message", "Message") || ""),
+    subscriptionID: String(read("subscriptionID", "SubscriptionID") || ""),
+    subscriberUserID: String(read("subscriberUserID", "SubscriberUserID") || params.subscriberUserID || ""),
+    ownerUserID: String(read("ownerUserID", "OwnerUserID") || params.ownerUserID || ""),
+    agentID: String(read("agentID", "AgentID") || params.agentID || ""),
+    freeRoundsUsed: Number(read("freeRoundsUsed", "FreeRoundsUsed") || 0),
+    freeRoundsLimit: Number(read("freeRoundsLimit", "FreeRoundsLimit") || 0),
+    costUsedUnits: Number(read("costUsedUnits", "CostUsedUnits") || 0),
+    costLimitUnits: Number(read("costLimitUnits", "CostLimitUnits") || 0),
   };
 }
 
@@ -2550,7 +2627,15 @@ export async function processInboundMessage(
     );
     return;
   }
-  if (String(msg.sendID || "").trim() === selfUid && !humanSelfAssistant) {
+  if (
+    String(msg.sendID || "").trim() === selfUid &&
+    !humanSelfAssistant &&
+    isInboundFromManagedBotSession(msg)
+  ) {
+    infiaiDebug(
+      api,
+      `[infiai] ignore managed self echo: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} sendID=${msg.sendID}`,
+    );
     return;
   }
   if (isOpenIMNotificationMessage(msg)) {
@@ -2657,6 +2742,8 @@ export async function processInboundMessage(
       `[infiai] routing: overriding default route with binding agent ${executionAgentId} (resolveAgentRoute=${routeAgentId}) accountId=${client.config.accountId}`,
     );
   }
+  const businessAgentID =
+    normalizeRuntimeAgentIDToBusinessAgentID(executionAgentId, selfUid) || executionAgentId;
 
   // OpenClaw dispatch resolves the execution agent from ctx.SessionKey. A bare
   // infiai:* key falls back to the default agent, so always scope by the resolved execution agent.
@@ -2754,12 +2841,36 @@ export async function processInboundMessage(
     );
     return;
   }
+  let agentSubscription: AgentSubscriptionPreflightResult | null = null;
+  try {
+    agentSubscription = await checkAgentSubscriptionPreflight(client, msg, {
+      subscriberUserID: senderId,
+      ownerUserID: selfUid,
+      agentID: businessAgentID,
+    });
+    if (!agentSubscription.allowed) {
+      api.logger?.warn?.(
+        `[infiai] agent subscription preflight blocked: reason=${agentSubscription.reason || "unknown"} owner=${selfUid} subscriber=${senderId} runtimeAgent=${executionAgentId} businessAgent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""}`,
+      );
+      const message = agentSubscription.message || "请订阅该分身后继续聊天。";
+      await sendReplyFromInbound(client, msg, message);
+      return;
+    }
+  } catch (err) {
+    api.logger?.warn?.(
+      `[infiai] agent subscription preflight failed; skip paid pipeline: owner=${selfUid} subscriber=${senderId} runtimeAgent=${executionAgentId} businessAgent=${businessAgentID} sourceMsgID=${String(msg.clientMsgID || msg.serverMsgID || "")} error=${formatSdkError(err)}`,
+    );
+    await sendReplyFromInbound(client, msg, AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY);
+    return;
+  }
   try {
     const billing = await checkLanguageModelOutputPreflight(client, msg, {
       payerUserID: selfUid,
       actorUserID: senderId,
-      agentID: executionAgentId,
+      agentID: businessAgentID,
       conversationID: effectiveSessionKey,
+      subscriberUserID: agentSubscription?.subscriberUserID || "",
+      agentSubscriptionID: agentSubscription?.subscriptionID || "",
     });
     if (!billing.allowed) {
       api.logger?.warn?.(
@@ -2790,7 +2901,7 @@ export async function processInboundMessage(
       const charged = await chargeActualCostUsage(client, msg, {
         payerUserID: selfUid,
         actorUserID: senderId,
-        agentID: executionAgentId,
+        agentID: businessAgentID,
         conversationID: effectiveSessionKey,
         chargeCode: "vision_model_output",
         module: "media_vision",
@@ -2801,6 +2912,8 @@ export async function processInboundMessage(
         actualCostMicros: fileTextResult.visionActualCostMicros || 0,
         rawUsage: fileTextResult.rawUsage,
         allowOverdraft: true,
+        subscriberUserID: agentSubscription?.subscriberUserID || "",
+        agentSubscriptionID: agentSubscription?.subscriptionID || "",
       });
       if (!charged.allowed) {
         api.logger?.warn?.(
@@ -2828,13 +2941,15 @@ export async function processInboundMessage(
         const charged = await chargeInboundMediaUsage(client, msg, {
           payerUserID: selfUid,
           actorUserID: senderId,
-          agentID: executionAgentId,
+          agentID: businessAgentID,
           conversationID: effectiveSessionKey,
           chargeCode,
           module,
           quantity: items.length,
           durationSeconds: billableMediaDurationSeconds(items),
           allowOverdraft: true,
+          subscriberUserID: agentSubscription?.subscriberUserID || "",
+          agentSubscriptionID: agentSubscription?.subscriptionID || "",
         });
         if (!charged.allowed) {
           api.logger?.warn?.(
@@ -2873,12 +2988,14 @@ export async function processInboundMessage(
       const charged = await chargeInboundMediaUsage(client, msg, {
         payerUserID: selfUid,
         actorUserID: senderId,
-        agentID: executionAgentId,
+        agentID: businessAgentID,
         conversationID: effectiveSessionKey,
         chargeCode: "image_understanding",
         module: "media_image",
         quantity: imageTextResult.extractedCount,
         allowOverdraft: true,
+        subscriberUserID: agentSubscription?.subscriberUserID || "",
+        agentSubscriptionID: agentSubscription?.subscriptionID || "",
       });
       if (!charged.allowed) {
         api.logger?.warn?.(
@@ -3204,11 +3321,13 @@ export async function processInboundMessage(
         const charged = await chargeLanguageModelOutputUsage(client, msg, {
           payerUserID: selfUid,
           actorUserID: senderId,
-          agentID: executionAgentId,
+          agentID: businessAgentID,
           conversationID: effectiveSessionKey,
           storePath,
           dispatchStartedAtMs: llmDispatchStartedAt,
           allowOverdraft: true,
+          subscriberUserID: agentSubscription?.subscriberUserID || "",
+          agentSubscriptionID: agentSubscription?.subscriptionID || "",
         });
         if (!charged.allowed) {
           api.logger?.warn?.(
