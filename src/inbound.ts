@@ -46,6 +46,19 @@ const GATEWAY_CONFIG_CACHE_TTL_MS = 250;
 const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
 const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
 const ASSISTANT_ONBOARDING_MESSAGE_SOURCE = "assistant_onboarding";
+const TASK_MESSAGE_SOURCE = "claw_cron_task";
+const MESSAGE_KIND_TASK_OUTBOUND = "task_outbound";
+const MESSAGE_KIND_ASSISTANT_REPLY = "assistant_reply";
+const MESSAGE_KIND_MODEL_ERROR = "model_error";
+const MESSAGE_KIND_BILLING_NOTICE = "billing_notice";
+const MESSAGE_KIND_LOOP_GUARD_NOTICE = "loop_guard_notice";
+const MESSAGE_KIND_SYSTEM_NOTICE = "system_notice";
+const NON_CONVERSATIONAL_MESSAGE_KINDS = new Set([
+  MESSAGE_KIND_MODEL_ERROR,
+  MESSAGE_KIND_BILLING_NOTICE,
+  MESSAGE_KIND_LOOP_GUARD_NOTICE,
+  MESSAGE_KIND_SYSTEM_NOTICE,
+]);
 const INFIAI_CARD_CUSTOM_TYPE = 205;
 const INFIAI_TYPING_CUSTOM_TYPE = 260;
 const AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY =
@@ -127,6 +140,44 @@ function getInfiaiMessageSource(msg: MessageItem): string {
   return String((infiai as Record<string, unknown>).source ?? "");
 }
 
+function getInfiaiExField(msg: MessageItem, field: string): string {
+  const exObj = parseMessageEx(msg);
+  if (!exObj) return "";
+  const infiai = exObj.infiai;
+  if (!infiai || typeof infiai !== "object" || Array.isArray(infiai)) return "";
+  return String((infiai as Record<string, unknown>)[field] ?? "").trim();
+}
+
+export function getInfiaiMessageKind(msg: MessageItem): string {
+  return getInfiaiExField(msg, "messageKind");
+}
+
+function getInfiaiTaskID(msg: MessageItem): string {
+  return getInfiaiExField(msg, "taskID");
+}
+
+function getInfiaiRunID(msg: MessageItem): string {
+  return getInfiaiExField(msg, "runID");
+}
+
+export function isManagedBotNonConversationalMessage(params: {
+  fromManagedBotSession: boolean;
+  senderManaged: boolean;
+  messageKind: string;
+}): boolean {
+  if (!params.fromManagedBotSession || !params.senderManaged) return false;
+  return NON_CONVERSATIONAL_MESSAGE_KINDS.has(params.messageKind);
+}
+
+function resolveEffectiveInfiaiMessageKind(msg: MessageItem): string {
+  const explicit = getInfiaiMessageKind(msg);
+  if (explicit) return explicit;
+  const source = getInfiaiMessageSource(msg);
+  if (source === TASK_MESSAGE_SOURCE) return MESSAGE_KIND_TASK_OUTBOUND;
+  if (source === ASSISTANT_MESSAGE_SOURCE) return MESSAGE_KIND_ASSISTANT_REPLY;
+  return "";
+}
+
 function isAssistantEchoMessage(msg: MessageItem, selfUserID: string): boolean {
   return (
     getInfiaiMessageSource(msg) === ASSISTANT_MESSAGE_SOURCE &&
@@ -148,7 +199,7 @@ function isHumanSelfAssistantMessage(
   );
 }
 
-function buildAssistantReplyEx(msg: MessageItem): string {
+function buildAssistantReplyEx(msg: MessageItem, messageKind = MESSAGE_KIND_ASSISTANT_REPLY): string {
   const base = parseMessageEx(msg) ?? {};
   const infiai =
     base.infiai &&
@@ -161,6 +212,7 @@ function buildAssistantReplyEx(msg: MessageItem): string {
     infiai: {
       ...infiai,
       source: ASSISTANT_MESSAGE_SOURCE,
+      messageKind,
       traceID: randomUUID(),
       parentClientMsgID: String(msg.clientMsgID ?? ""),
     },
@@ -960,6 +1012,77 @@ const GROUP_MENTION_SILENT_FALLBACK_REPLY =
   "我在，想聊什么？";
 const IMAGE_UNDERSTANDING_FAILED_REPLY =
   "这张图片暂时无法完成理解，请稍后重试或换一张图片。";
+const DEFAULT_AGNES_FALLBACK_MODEL = "deepseek/deepseek-v4-flash";
+
+function isAgnesRuntimeModel(model: string): boolean {
+  const s = String(model || "").trim().toLowerCase();
+  return s.startsWith("agnes/") || s.startsWith("agnes-");
+}
+
+function isDeepSeekRuntimeModel(model: string): boolean {
+  const s = String(model || "").trim().toLowerCase();
+  return s.startsWith("deepseek/") || s.startsWith("deepseek-");
+}
+
+export function resolveAgnesFallbackModel(): string {
+  return (
+    String(process.env.OPENCLAW_AGNES_FALLBACK_MODEL || "").trim() ||
+    DEFAULT_AGNES_FALLBACK_MODEL
+  );
+}
+
+export function isAgnesFallbackEnabled(): boolean {
+  const raw = String(process.env.OPENCLAW_AGNES_FALLBACK_ENABLED || "").trim().toLowerCase();
+  return raw !== "false" && raw !== "0" && raw !== "off" && raw !== "no";
+}
+
+function hasAgnesFallbackModelCredentials(model: string): boolean {
+  if (isDeepSeekRuntimeModel(model)) {
+    return Boolean(String(process.env.DEEPSEEK_API_KEY || "").trim());
+  }
+  return true;
+}
+
+export function isAgnesFallbackTriggerText(text: unknown): boolean {
+  const s = String(text ?? "");
+  if (!s.trim()) return false;
+  return /(?:\b429\b|rate[-\s_]?limit(?:ed)?|cooldown|temporar(?:ily|y)\s+(?:unavailable|rate[-\s_]?limited)|provider\s+(?:unavailable|cooldown)|all\s+models\s+(?:are\s+temporarily\s+rate[-\s_]?limited|failed)|ready\s+in\s+~?\d+\s*s)/i.test(s);
+}
+
+function getAgentPrimaryModel(cfg: any, agentId: string): string {
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  const agent = list.find(
+    (entry: any) => entry && String(entry.id ?? "") === String(agentId || ""),
+  );
+  return String(agent?.model?.primary ?? cfg?.agents?.defaults?.model?.primary ?? "").trim();
+}
+
+export function cloneConfigWithAgentPrimaryModel(
+  cfg: any,
+  agentId: string,
+  model: string,
+): any {
+  const next = structuredClone(cfg);
+  next.agents = next.agents && typeof next.agents === "object" ? next.agents : {};
+  next.agents.list = Array.isArray(next.agents.list) ? next.agents.list : [];
+  const target = String(agentId || "");
+  let updated = false;
+  next.agents.list = next.agents.list.map((entry: any) => {
+    if (!entry || String(entry.id ?? "") !== target) return entry;
+    updated = true;
+    return {
+      ...entry,
+      model: {
+        ...(entry.model && typeof entry.model === "object" ? entry.model : {}),
+        primary: model,
+      },
+    };
+  });
+  if (!updated && target) {
+    next.agents.list.push({ id: target, model: { primary: model } });
+  }
+  return next;
+}
 
 function localizeOpenClawReply(text: string): string {
   const s = String(text ?? "");
@@ -973,7 +1096,8 @@ function localizeOpenClawReply(text: string): string {
   if (
     /Something went wrong while processing your request|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|Message failed|midstream error|invalid params|tool result's tool id/i.test(
       s,
-    )
+    ) ||
+    isAgnesFallbackTriggerText(s)
   ) {
     return GENERIC_MODEL_FAILURE_REPLY;
   }
@@ -2554,9 +2678,13 @@ async function sendReplyFromInbound(
   client: OpenIMClientState,
   msg: MessageItem,
   text: string,
+  options: { messageKind?: string } = {},
 ): Promise<void> {
   const isGroup = isGroupMessage(msg);
-  const replyEx = buildAssistantReplyEx(msg);
+  const replyEx = buildAssistantReplyEx(
+    msg,
+    options.messageKind || MESSAGE_KIND_ASSISTANT_REPLY,
+  );
   infiaiConsoleDebug(
     `[infiai] sendReplyFromInbound: isGroup=${isGroup}, groupID=${String(msg.groupID || "-")}, sendID=${String(msg.sendID || "-")}, textLen=${text.length}, clientMsgID=${msg.clientMsgID || "-"}`,
   );
@@ -2593,6 +2721,42 @@ async function sendReplyFromInbound(
   infiaiConsoleDebug(`[infiai] sendReplyFromInbound: sendTextToTarget COMPLETED`);
 }
 
+function shouldSuppressGeneratedReplyToManagedBot(params: {
+  senderManaged: boolean;
+  fromManagedBotSession: boolean;
+  messageKind: string;
+}): boolean {
+  return isManagedBotNonConversationalMessage({
+    senderManaged: params.senderManaged,
+    fromManagedBotSession: params.fromManagedBotSession,
+    messageKind: params.messageKind,
+  });
+}
+
+async function sendClassifiedReplyFromInbound(
+  api: any,
+  client: OpenIMClientState,
+  msg: MessageItem,
+  text: string,
+  params: {
+    messageKind: string;
+    senderManaged: boolean;
+    fromManagedBotSession: boolean;
+    reason: string;
+  },
+): Promise<boolean> {
+  if (shouldSuppressGeneratedReplyToManagedBot(params)) {
+    api.logger?.warn?.(
+      `[infiai] generated reply suppressed for managed bot: kind=${params.messageKind} reason=${params.reason} accountId=${client.config.accountId} sender=${String(msg.sendID || "")} clientMsgID=${msg.clientMsgID || ""}`,
+    );
+    return false;
+  }
+  await sendReplyFromInbound(client, msg, text, {
+    messageKind: params.messageKind,
+  });
+  return true;
+}
+
 export async function processInboundMessage(
   api: any,
   client: OpenIMClientState,
@@ -2610,10 +2774,15 @@ export async function processInboundMessage(
 
   const selfUid = String(client.config.userID).trim();
   const humanSelfAssistant = isHumanSelfAssistantMessage(msg, selfUid);
+  const inboundSource = getInfiaiMessageSource(msg);
+  const inboundProtocolMessageKind = resolveEffectiveInfiaiMessageKind(msg);
+  const inboundTaskID = getInfiaiTaskID(msg);
+  const inboundRunID = getInfiaiRunID(msg);
+  const inboundFromManagedBot = isInboundFromManagedBotSession(msg);
   if (isInfiaiTypingCustomMessage(msg)) {
     return;
   }
-  if (getInfiaiMessageSource(msg) === ASSISTANT_ONBOARDING_MESSAGE_SOURCE) {
+  if (inboundSource === ASSISTANT_ONBOARDING_MESSAGE_SOURCE) {
     infiaiDebug(
       api,
       `[infiai] ignore assistant onboarding message: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""}`,
@@ -2675,8 +2844,8 @@ export async function processInboundMessage(
     return;
   }
   if (
-    getInfiaiMessageSource(msg) === ASSISTANT_MESSAGE_SOURCE &&
-    isInboundFromManagedBotSession(msg) &&
+    inboundSource === ASSISTANT_MESSAGE_SOURCE &&
+    inboundFromManagedBot &&
     isNonConversationalSystemReply(inbound.body)
   ) {
     infiaiDebug(
@@ -2767,6 +2936,18 @@ export async function processInboundMessage(
   const senderId = String(msg.sendID);
   const selfManaged = isUserInfiaiManagedInCfg(cfg, selfUid);
   const senderManaged = isUserInfiaiManagedInCfg(cfg, senderId);
+  if (
+    isManagedBotNonConversationalMessage({
+      fromManagedBotSession: inboundFromManagedBot,
+      senderManaged,
+      messageKind: inboundProtocolMessageKind,
+    })
+  ) {
+    api.logger?.warn?.(
+      `[infiai] automation skipped: managed bot non-conversational message kind=${inboundProtocolMessageKind} source=${inboundSource || "-"} accountId=${client.config.accountId} sender=${senderId} clientMsgID=${msg.clientMsgID || ""}`,
+    );
+    return;
+  }
   // Round-cap only for managed↔managed **bot traffic**. Same OpenIM userId may also log in as a
   // human (e.g. Web); those sends carry a non-bot senderPlatformID and must not trip the cap.
   if (
@@ -2774,7 +2955,7 @@ export async function processInboundMessage(
     !group &&
     selfManaged &&
     senderManaged &&
-    isInboundFromManagedBotSession(msg)
+    inboundFromManagedBot
   ) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
     // Round-cap must follow cfg.bindings for this account — resolveAgentRoute can point at another
@@ -2805,7 +2986,7 @@ export async function processInboundMessage(
     mentioned &&
     selfManaged &&
     senderManaged &&
-    isInboundFromManagedBotSession(msg)
+    inboundFromManagedBot
   ) {
     const pairKey = resolveManagedPairKey(selfUid, senderId);
     const replyAgentForCap =
@@ -2853,14 +3034,24 @@ export async function processInboundMessage(
         `[infiai] agent subscription preflight blocked: reason=${agentSubscription.reason || "unknown"} owner=${selfUid} subscriber=${senderId} runtimeAgent=${executionAgentId} businessAgent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""}`,
       );
       const message = agentSubscription.message || "请订阅该分身后继续聊天。";
-      await sendReplyFromInbound(client, msg, message);
+      await sendClassifiedReplyFromInbound(api, client, msg, message, {
+        messageKind: MESSAGE_KIND_BILLING_NOTICE,
+        senderManaged,
+        fromManagedBotSession: inboundFromManagedBot,
+        reason: "agent_subscription_blocked",
+      });
       return;
     }
   } catch (err) {
     api.logger?.warn?.(
       `[infiai] agent subscription preflight failed; skip paid pipeline: owner=${selfUid} subscriber=${senderId} runtimeAgent=${executionAgentId} businessAgent=${businessAgentID} sourceMsgID=${String(msg.clientMsgID || msg.serverMsgID || "")} error=${formatSdkError(err)}`,
     );
-    await sendReplyFromInbound(client, msg, AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY);
+    await sendClassifiedReplyFromInbound(api, client, msg, AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY, {
+      messageKind: MESSAGE_KIND_SYSTEM_NOTICE,
+      senderManaged,
+      fromManagedBotSession: inboundFromManagedBot,
+      reason: "agent_subscription_preflight_failed",
+    });
     return;
   }
   try {
@@ -2980,7 +3171,12 @@ export async function processInboundMessage(
     }
     await cleanupStagedInboundMedia(imageMediaResult);
     await cleanupStagedInboundMedia(mediaResult);
-    await sendReplyFromInbound(client, msg, IMAGE_UNDERSTANDING_FAILED_REPLY);
+    await sendClassifiedReplyFromInbound(api, client, msg, IMAGE_UNDERSTANDING_FAILED_REPLY, {
+      messageKind: MESSAGE_KIND_MODEL_ERROR,
+      senderManaged,
+      fromManagedBotSession: inboundFromManagedBot,
+      reason: "image_understanding_failed",
+    });
     return;
   }
   if (imageMedia.length > 0 && imageTextResult.extractedCount > 0) {
@@ -3095,6 +3291,10 @@ export async function processInboundMessage(
       conversationId: effectiveSessionKey,
       mentionUserIds: mentionedIDs,
       messageKind: inbound.kind,
+      protocolMessageKind: inboundProtocolMessageKind,
+      source: inboundSource,
+      taskID: inboundTaskID,
+      runID: inboundRunID,
       mediaCount: inbound.media?.length ?? 0,
       mediaTranscriptsCount: transcriptResult.extractedCount,
       fileTextExtractCount: fileTextResult.extractedCount,
@@ -3123,6 +3323,10 @@ export async function processInboundMessage(
       imSeq: typeof msg.seq === "number" ? msg.seq : undefined,
       contentType: msg.contentType,
       senderId,
+      source: inboundSource || undefined,
+      messageKind: inboundProtocolMessageKind || undefined,
+      taskID: inboundTaskID || undefined,
+      runID: inboundRunID || undefined,
       bodyChars: rawBody.length,
     });
   }
@@ -3164,96 +3368,175 @@ export async function processInboundMessage(
   let suppressedProgressOnlyReply = false;
   let suppressedNoReplyMetaReply = false;
   let noVisibleFallbackReply: string | null = null;
+  const primaryModel = getAgentPrimaryModel(cfg, executionAgentId);
+  const agnesFallbackModel = resolveAgnesFallbackModel();
+  const agnesFallbackReady =
+    isAgnesFallbackEnabled() &&
+    isAgnesRuntimeModel(primaryModel) &&
+    agnesFallbackModel &&
+    agnesFallbackModel !== primaryModel &&
+    hasAgnesFallbackModelCredentials(agnesFallbackModel);
+  let agnesFallbackAttempted = false;
+  let primaryModelFailureText = "";
   await setInboundTypingState(client, msg, true);
   try {
-    await withInfiaiToolContext(
-      {
-        accountId: client.config.accountId,
-        managedUserId: selfUid,
-        senderId,
-        agentId: executionAgentId,
-        sessionKey: effectiveSessionKey,
-        ownerAuthorized: String(senderId).trim() === String(selfUid).trim(),
-        source: "inbound",
-      },
-      async () => runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-        ctx: ctxPayload,
+    const runDispatchAttempt = async (
+      attemptCfg: any,
+      attemptModel: string,
+      attempt: "primary" | "agnes_fallback",
+    ): Promise<void> => {
+      await withInfiaiToolContext(
+        {
+          accountId: client.config.accountId,
+          managedUserId: selfUid,
+          senderId,
+          agentId: executionAgentId,
+          sessionKey: effectiveSessionKey,
+          ownerAuthorized: String(senderId).trim() === String(selfUid).trim(),
+          source: "inbound",
+        },
+        async () => runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx: ctxPayload,
+          cfg: attemptCfg,
+          dispatcherOptions: {
+            deliver: async (payload: { text?: string }) => {
+              infiaiConsoleDebug(
+                `[infiai] deliver called: attempt=${attempt}, model=${attemptModel || "-"}, group=${group}, hasText=${!!payload.text}, textLen=${payload.text?.length || 0}, contentLen=${typeof payload.text === "string" ? payload.text.length : "non-string"}, clientMsgID=${msg.clientMsgID || "-"}`,
+              );
+              if (!payload.text) {
+                infiaiConsoleDebug(
+                  `[infiai] deliver skipped: empty AI reply, serverMsgID=${msg.serverMsgID || ""} clientMsgID=${msg.clientMsgID || ""}`,
+                );
+                return;
+              }
+              const localized = localizeOpenClawReply(payload.text);
+              if (dispatchedFailureReply) {
+                infiaiConsoleDebug(
+                  `[infiai] deliver skipped: prior model failure reply already sent, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+                );
+                return;
+              }
+              const cleaned = normalizeInfiaiReplyFormatting(
+                stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(localized)),
+              );
+              if (
+                attempt === "primary" &&
+                agnesFallbackReady &&
+                isLocalizedFailureReply(payload.text, localized) &&
+                isAgnesFallbackTriggerText(payload.text)
+              ) {
+                primaryModelFailureText = payload.text;
+                infiaiConsoleDebug(
+                  `[infiai] Agnes model failure captured for fallback: from=${primaryModel}, to=${agnesFallbackModel}, raw="${payload.text.slice(0, 200)}", clientMsgID=${msg.clientMsgID || "-"}`,
+                );
+                return;
+              }
+              if (isNoReplyMetaReply(payload.text) || isNoReplyMetaReply(cleaned)) {
+                suppressedNoReplyMetaReply = true;
+                infiaiConsoleDebug(
+                  `[infiai] deliver skipped: NO_REPLY meta reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+                );
+                return;
+              }
+              if (isNonConversationalSystemReply(cleaned)) {
+                suppressedNoReplyMetaReply = true;
+                infiaiConsoleDebug(
+                  `[infiai] deliver skipped: non-conversational system reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+                );
+                return;
+              }
+              if (!cleaned.trim()) {
+                infiaiConsoleDebug(
+                  `[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+                );
+                return;
+              }
+              if (isLikelyToolProgressOnlyReply(cleaned)) {
+                suppressedProgressOnlyReply = true;
+                infiaiConsoleDebug(
+                  `[infiai] deliver skipped: tool-progress-only reply suppressed, raw="${cleaned.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
+                );
+                return;
+              }
+              infiaiConsoleDebug(
+                `[infiai] deliver cleaned: attempt=${attempt}, len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`,
+              );
+              try {
+                const isFailureReply = isLocalizedFailureReply(payload.text, localized);
+                if (isFailureReply) dispatchedFailureReply = true;
+                const sent = await sendClassifiedReplyFromInbound(api, client, msg, cleaned, {
+                  messageKind: isFailureReply ? MESSAGE_KIND_MODEL_ERROR : MESSAGE_KIND_ASSISTANT_REPLY,
+                  senderManaged,
+                  fromManagedBotSession: inboundFromManagedBot,
+                  reason: isFailureReply ? "localized_model_failure_reply" : "assistant_reply",
+                });
+                deliveredVisibleReply = sent;
+                infiaiConsoleDebug(
+                  `[infiai] deliver ${sent ? "OK" : "SUPPRESSED"}: attempt=${attempt}, group=${group}, clientMsgID=${msg.clientMsgID || "-"}`,
+                );
+              } catch (e: any) {
+                console.warn(`[infiai] deliver failed: ${formatSdkError(e)}`);
+              }
+            },
+            onError: (err: unknown, info: { kind?: string }) => {
+              const errText = String(err);
+              if (
+                attempt === "primary" &&
+                agnesFallbackReady &&
+                isAgnesFallbackTriggerText(errText)
+              ) {
+                primaryModelFailureText = errText;
+              }
+              console.warn(
+                `[infiai] dispatch onError: attempt=${attempt}, kind=${info?.kind || "reply"}, err=${errText}`,
+              );
+            },
+          },
+          replyOptions: {
+            disableBlockStreaming: true,
+            images: [],
+          },
+        }),
+      );
+    };
+
+    let primaryDispatchError: unknown = null;
+    try {
+      await runDispatchAttempt(cfg, primaryModel, "primary");
+    } catch (err) {
+      primaryDispatchError = err;
+      const errText = formatSdkError(err);
+      if (agnesFallbackReady && isAgnesFallbackTriggerText(errText)) {
+        primaryModelFailureText = errText;
+      }
+    }
+
+    if (
+      agnesFallbackReady &&
+      primaryModelFailureText &&
+      !deliveredVisibleReply &&
+      !agnesFallbackAttempted
+    ) {
+      agnesFallbackAttempted = true;
+      suppressedNoReplyMetaReply = false;
+      suppressedProgressOnlyReply = false;
+      dispatchedFailureReply = false;
+      api.logger?.warn?.(
+        `[infiai] Agnes model failure fallback: from=${primaryModel} to=${agnesFallbackModel} accountId=${client.config.accountId} agentId=${executionAgentId} clientMsgID=${msg.clientMsgID || ""} reason=${primaryModelFailureText.slice(0, 300)}`,
+      );
+      const fallbackCfg = cloneConfigWithAgentPrimaryModel(
         cfg,
-        dispatcherOptions: {
-        deliver: async (payload: { text?: string }) => {
-          infiaiConsoleDebug(
-            `[infiai] deliver called: group=${group}, hasText=${!!payload.text}, textLen=${payload.text?.length || 0}, contentLen=${typeof payload.text === "string" ? payload.text.length : "non-string"}, clientMsgID=${msg.clientMsgID || "-"}`,
-          );
-          if (!payload.text) {
-            infiaiConsoleDebug(
-              `[infiai] deliver skipped: empty AI reply, serverMsgID=${msg.serverMsgID || ""} clientMsgID=${msg.clientMsgID || ""}`,
-            );
-            return;
-          }
-          const localized = localizeOpenClawReply(payload.text);
-          if (dispatchedFailureReply) {
-            infiaiConsoleDebug(
-              `[infiai] deliver skipped: prior model failure reply already sent, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
-            );
-            return;
-          }
-          const cleaned = normalizeInfiaiReplyFormatting(
-            stripInfiaiReplyArtifacts(stripVisibleReasoningPreamble(localized)),
-          );
-          if (isNoReplyMetaReply(payload.text) || isNoReplyMetaReply(cleaned)) {
-            suppressedNoReplyMetaReply = true;
-            infiaiConsoleDebug(
-              `[infiai] deliver skipped: NO_REPLY meta reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
-            );
-            return;
-          }
-          if (isNonConversationalSystemReply(cleaned)) {
-            suppressedNoReplyMetaReply = true;
-            infiaiConsoleDebug(
-              `[infiai] deliver skipped: non-conversational system reply suppressed, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
-            );
-            return;
-          }
-          if (!cleaned.trim()) {
-            infiaiConsoleDebug(
-              `[infiai] deliver skipped: AI reply stripped to empty, raw="${payload.text.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
-            );
-            return;
-          }
-          if (isLikelyToolProgressOnlyReply(cleaned)) {
-            suppressedProgressOnlyReply = true;
-            infiaiConsoleDebug(
-              `[infiai] deliver skipped: tool-progress-only reply suppressed, raw="${cleaned.slice(0, 200)}", serverMsgID=${msg.serverMsgID || ""}`,
-            );
-            return;
-          }
-          infiaiConsoleDebug(
-            `[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`,
-          );
-          try {
-            const isFailureReply = isLocalizedFailureReply(payload.text, localized);
-            if (isFailureReply) dispatchedFailureReply = true;
-            await sendReplyFromInbound(client, msg, cleaned);
-            deliveredVisibleReply = true;
-            infiaiConsoleDebug(
-              `[infiai] deliver OK: group=${group}, clientMsgID=${msg.clientMsgID || "-"}`,
-            );
-          } catch (e: any) {
-            console.warn(`[infiai] deliver failed: ${formatSdkError(e)}`);
-          }
-        },
-        onError: (err: unknown, info: { kind?: string }) => {
-          console.warn(
-            `[infiai] dispatch onError: kind=${info?.kind || "reply"}, err=${String(err)}`,
-          );
-        },
-        },
-        replyOptions: {
-          disableBlockStreaming: true,
-          images: [],
-        },
-      }),
-    );
+        executionAgentId,
+        agnesFallbackModel,
+      );
+      await runDispatchAttempt(fallbackCfg, agnesFallbackModel, "agnes_fallback");
+    } else if (primaryDispatchError) {
+      throw primaryDispatchError;
+    }
+
+    if (primaryDispatchError && !agnesFallbackAttempted) {
+      throw primaryDispatchError;
+    }
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.done", {
         accountId: client.config.accountId,
@@ -3308,9 +3591,14 @@ export async function processInboundMessage(
       infiaiConsoleDebug(
         `[infiai] dispatch completed without visible reply; sending fallback, suppressedProgressOnly=${suppressedProgressOnlyReply ? 1 : 0}, clientMsgID=${msg.clientMsgID || "-"}`,
       );
-      await sendReplyFromInbound(client, msg, fallback);
-      deliveredVisibleReply = true;
-      sentNoVisibleFallbackReply = true;
+      const sent = await sendClassifiedReplyFromInbound(api, client, msg, fallback, {
+        messageKind: suppressedProgressOnlyReply ? MESSAGE_KIND_SYSTEM_NOTICE : MESSAGE_KIND_MODEL_ERROR,
+        senderManaged,
+        fromManagedBotSession: inboundFromManagedBot,
+        reason: suppressedProgressOnlyReply ? "progress_only_fallback" : "no_visible_model_reply",
+      });
+      deliveredVisibleReply = sent;
+      sentNoVisibleFallbackReply = sent;
     }
     if (
       deliveredVisibleReply &&
@@ -3356,10 +3644,17 @@ export async function processInboundMessage(
     }
     api.logger?.error?.(`[infiai] dispatch failed: ${formatSdkError(err)}`);
     try {
-      await sendReplyFromInbound(
+      await sendClassifiedReplyFromInbound(
+        api,
         client,
         msg,
         localizeOpenClawError(formatSdkError(err)),
+        {
+          messageKind: MESSAGE_KIND_MODEL_ERROR,
+          senderManaged,
+          fromManagedBotSession: inboundFromManagedBot,
+          reason: "dispatch_failed",
+        },
       );
     } catch {
       // ignore secondary send errors
