@@ -3,11 +3,99 @@ import assert from "node:assert/strict";
 
 import {
   buildInfiaiOriginatingTo,
+  cloneConfigWithAgentPrimaryModel,
   extractAssistantTextSnapshotFromSessionLine,
+  getInfiaiMessageKind,
+  isAgnesFallbackTriggerText,
+  isManagedBotNonConversationalMessage,
   parseAgentSubscriptionPreflightDecision,
+  resolveAgnesFallbackModel,
   resolveNoVisibleFallbackReply,
   shouldSuppressNoVisibleFallbackForAssistantText,
 } from "./inbound";
+
+test("detects Agnes provider failures eligible for DeepSeek fallback", () => {
+  assert.equal(
+    isAgnesFallbackTriggerText("All models are temporarily rate-limited. Please try again in a few minutes."),
+    true,
+  );
+  assert.equal(
+    isAgnesFallbackTriggerText("Rate-limited — ready in ~23s. Please wait a moment."),
+    true,
+  );
+  assert.equal(isAgnesFallbackTriggerText("HTTP 429 provider cooldown"), true);
+  assert.equal(isAgnesFallbackTriggerText("这是一条正常回复"), false);
+});
+
+test("resolves Agnes fallback model default and env override", () => {
+  const original = process.env.OPENCLAW_AGNES_FALLBACK_MODEL;
+  delete process.env.OPENCLAW_AGNES_FALLBACK_MODEL;
+  assert.equal(resolveAgnesFallbackModel(), "deepseek/deepseek-v4-flash");
+  process.env.OPENCLAW_AGNES_FALLBACK_MODEL = "deepseek/deepseek-chat";
+  assert.equal(resolveAgnesFallbackModel(), "deepseek/deepseek-chat");
+  if (original === undefined) delete process.env.OPENCLAW_AGNES_FALLBACK_MODEL;
+  else process.env.OPENCLAW_AGNES_FALLBACK_MODEL = original;
+});
+
+test("clones config with per-agent fallback primary model only", () => {
+  const cfg = {
+    agents: {
+      list: [
+        { id: "a1", model: { primary: "agnes/agnes-2.0-flash" } },
+        { id: "a2", model: { primary: "deepseek/deepseek-v4-flash" } },
+      ],
+    },
+  };
+  const next = cloneConfigWithAgentPrimaryModel(cfg, "a1", "deepseek/deepseek-v4-flash");
+  assert.equal(next.agents.list[0].model.primary, "deepseek/deepseek-v4-flash");
+  assert.equal(next.agents.list[1].model.primary, "deepseek/deepseek-v4-flash");
+  assert.equal(cfg.agents.list[0].model.primary, "agnes/agnes-2.0-flash");
+});
+
+test("parses Infiai structured message kind from nested message ex", () => {
+  assert.equal(
+    getInfiaiMessageKind({
+      ex: JSON.stringify({ infiai: { messageKind: "model_error" } }),
+    } as any),
+    "model_error",
+  );
+  assert.equal(getInfiaiMessageKind({ ex: "{}" } as any), "");
+});
+
+test("suppresses only non-conversational managed-bot messages", () => {
+  assert.equal(
+    isManagedBotNonConversationalMessage({
+      fromManagedBotSession: true,
+      senderManaged: true,
+      messageKind: "model_error",
+    }),
+    true,
+  );
+  assert.equal(
+    isManagedBotNonConversationalMessage({
+      fromManagedBotSession: true,
+      senderManaged: true,
+      messageKind: "billing_notice",
+    }),
+    true,
+  );
+  assert.equal(
+    isManagedBotNonConversationalMessage({
+      fromManagedBotSession: true,
+      senderManaged: true,
+      messageKind: "assistant_reply",
+    }),
+    false,
+  );
+  assert.equal(
+    isManagedBotNonConversationalMessage({
+      fromManagedBotSession: true,
+      senderManaged: false,
+      messageKind: "model_error",
+    }),
+    false,
+  );
+});
 
 test("suppresses no-visible fallback for exact silent assistant replies", () => {
   assert.equal(shouldSuppressNoVisibleFallbackForAssistantText("NO_REPLY"), true);
