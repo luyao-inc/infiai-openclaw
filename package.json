@@ -41,11 +41,6 @@
         "infiai_get_friend_chat_history",
         "infiai_get_group_chat_history",
         "infiai_get_task_context",
-        "infiai_memory_search",
-        "infiai_memory_get",
-        "infiai_memory_store",
-        "infiai_memory_update",
-        "infiai_memory_archive",
         "infiai_send_image",
         "infiai_send_video",
         "infiai_send_file"
@@ -206,21 +201,6 @@
       },
       "infiai_get_task_context": {
         "description": "Read task context from Infiai Chat API for the configured account."
-      },
-      "infiai_memory_search": {
-        "description": "Gray-gated active-memory search through Infiai Chat Memory Gateway only."
-      },
-      "infiai_memory_get": {
-        "description": "Gray-gated active-memory get through Infiai Chat Memory Gateway only."
-      },
-      "infiai_memory_store": {
-        "description": "Gray-gated active-memory store through Infiai Chat Memory Gateway only."
-      },
-      "infiai_memory_update": {
-        "description": "Gray-gated active-memory update through Infiai Chat Memory Gateway only."
-      },
-      "infiai_memory_archive": {
-        "description": "Gray-gated active-memory archive through Infiai Chat Memory Gateway only."
       }
     },
     "channel": {

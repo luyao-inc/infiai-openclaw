@@ -10,16 +10,19 @@ import {
   buildInfiaiOriginatingTo,
   cloneConfigWithAgentPrimaryModel,
   extractAssistantTextSnapshotFromSessionLine,
+  inspectInfiaiSessionWorkspaceProjectionState,
   getInfiaiMessageKind,
   isAgnesFallbackTriggerText,
   isInfiaiSessionControlCommand,
   isManagedBotNonConversationalMessage,
+  memoryGatewayTimeoutMs,
   parseAgentSubscriptionPreflightDecision,
   resetInfiaiSessionIfWorkspaceProjectionChanged,
   resetInfiaiSessionStoreEntry,
   resolveAgnesFallbackModel,
   resolveNoVisibleFallbackReply,
-  shouldSubmitInfiaiMemoryExtract,
+  shouldSubmitInfiaiMemoryIngest,
+  shouldResetStaleSessionOnWorkspaceUpdate,
   shouldSuppressNoVisibleFallbackForAssistantText,
 } from "./inbound";
 
@@ -150,9 +153,9 @@ test("appends long-term memory context to agent body only once", () => {
   assert.equal(appendLongTermMemoryContextToBodyForAgent(body, ""), body);
 });
 
-test("submits memory extraction only for visible assistant replies", () => {
+test("submits memory ingest only for visible assistant replies", () => {
   assert.equal(
-    shouldSubmitInfiaiMemoryExtract({
+    shouldSubmitInfiaiMemoryIngest({
       sent: true,
       messageKind: "assistant_reply",
       userText: "我喜欢科幻电影",
@@ -166,7 +169,7 @@ test("submits memory extraction only for visible assistant replies", () => {
     "billing_notice",
   ]) {
     assert.equal(
-      shouldSubmitInfiaiMemoryExtract({
+      shouldSubmitInfiaiMemoryIngest({
         sent: true,
         messageKind,
         userText: "用户输入",
@@ -176,7 +179,7 @@ test("submits memory extraction only for visible assistant replies", () => {
     );
   }
   assert.equal(
-    shouldSubmitInfiaiMemoryExtract({
+    shouldSubmitInfiaiMemoryIngest({
       sent: true,
       messageKind: "assistant_reply",
       userText: "用户输入",
@@ -185,6 +188,38 @@ test("submits memory extraction only for visible assistant replies", () => {
     }),
     false,
   );
+});
+
+test("memory gateway timeout honors configured 20s ingest timeout", () => {
+  const oldValue = process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
+  process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS = "20000";
+  try {
+    assert.equal(memoryGatewayTimeoutMs("ingest"), 20000);
+  } finally {
+    if (oldValue === undefined) {
+      delete process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
+    } else {
+      process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS = oldValue;
+    }
+  }
+});
+
+test("memory gateway timeout defaults to 20s", () => {
+  const oldContextValue = process.env.INFIAI_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS;
+  const oldIngestValue = process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
+  delete process.env.INFIAI_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS;
+  delete process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
+  try {
+    assert.equal(memoryGatewayTimeoutMs("context"), 20000);
+    assert.equal(memoryGatewayTimeoutMs("ingest"), 20000);
+  } finally {
+    if (oldContextValue !== undefined) {
+      process.env.INFIAI_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS = oldContextValue;
+    }
+    if (oldIngestValue !== undefined) {
+      process.env.INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS = oldIngestValue;
+    }
+  }
 });
 
 test("extracts latest assistant text snapshots from session jsonl lines", () => {
@@ -378,35 +413,89 @@ test("resets only the current Infiai session mapping for slash new", async () =>
   assert.ok(next["agent:a:infiai:direct:a:u2"]);
 });
 
-test("resets stale Infiai session when workspace projection changed after session start", async () => {
+test("stale workspace projection does not reset Infiai session by default", async () => {
+  const original = process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE;
+  delete process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE;
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "infiai-stale-session-"));
-  const storePath = path.join(dir, "sessions.json");
-  const workspaceDir = path.join(dir, "workspace-a");
-  await fs.mkdir(path.join(workspaceDir, ".openclaw"), { recursive: true });
-  const soulPath = path.join(workspaceDir, "SOUL.md");
-  await fs.writeFile(soulPath, "new role card\n", "utf8");
-  await fs.writeFile(
-    storePath,
-    JSON.stringify({
-      "agent:a:infiai:direct:a:u1": {
-        sessionFile: path.join(dir, "old-session.jsonl"),
-        sessionStartedAt: 1000,
-      },
-    }),
-    "utf8",
-  );
-  const freshMtime = new Date(5000);
-  await fs.utimes(soulPath, freshMtime, freshMtime);
+  try {
+    const storePath = path.join(dir, "sessions.json");
+    const workspaceDir = path.join(dir, "workspace-a");
+    await fs.mkdir(path.join(workspaceDir, ".openclaw"), { recursive: true });
+    const soulPath = path.join(workspaceDir, "SOUL.md");
+    await fs.writeFile(soulPath, "new role card\n", "utf8");
+    await fs.writeFile(
+      storePath,
+      JSON.stringify({
+        "agent:a:infiai:direct:a:u1": {
+          sessionFile: path.join(dir, "old-session.jsonl"),
+          sessionStartedAt: 1000,
+        },
+      }),
+      "utf8",
+    );
+    const freshMtime = new Date(5000);
+    await fs.utimes(soulPath, freshMtime, freshMtime);
 
-  const result = await resetInfiaiSessionIfWorkspaceProjectionChanged({
-    storePath,
-    sessionKey: "agent:a:infiai:direct:a:u1",
-    agentId: "a",
-    workspaceDir,
-  });
-  assert.equal(result.removed, true);
-  const next = JSON.parse(await fs.readFile(storePath, "utf8"));
-  assert.equal(next["agent:a:infiai:direct:a:u1"], undefined);
+    assert.equal(shouldResetStaleSessionOnWorkspaceUpdate(), false);
+    const state = await inspectInfiaiSessionWorkspaceProjectionState({
+      storePath,
+      sessionKey: "agent:a:infiai:direct:a:u1",
+      agentId: "a",
+      workspaceDir,
+    });
+    assert.equal(state.found, true);
+    assert.equal(state.stale, true);
+    const next = JSON.parse(await fs.readFile(storePath, "utf8"));
+    assert.ok(next["agent:a:infiai:direct:a:u1"]);
+  } finally {
+    if (original === undefined) {
+      delete process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE;
+    } else {
+      process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE = original;
+    }
+  }
+});
+
+test("legacy stale Infiai session reset remains available behind env flag", async () => {
+  const original = process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE;
+  process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE = "1";
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "infiai-stale-session-"));
+  try {
+    const storePath = path.join(dir, "sessions.json");
+    const workspaceDir = path.join(dir, "workspace-a");
+    await fs.mkdir(path.join(workspaceDir, ".openclaw"), { recursive: true });
+    const soulPath = path.join(workspaceDir, "SOUL.md");
+    await fs.writeFile(soulPath, "new role card\n", "utf8");
+    await fs.writeFile(
+      storePath,
+      JSON.stringify({
+        "agent:a:infiai:direct:a:u1": {
+          sessionFile: path.join(dir, "old-session.jsonl"),
+          sessionStartedAt: 1000,
+        },
+      }),
+      "utf8",
+    );
+    const freshMtime = new Date(5000);
+    await fs.utimes(soulPath, freshMtime, freshMtime);
+
+    assert.equal(shouldResetStaleSessionOnWorkspaceUpdate(), true);
+    const result = await resetInfiaiSessionIfWorkspaceProjectionChanged({
+      storePath,
+      sessionKey: "agent:a:infiai:direct:a:u1",
+      agentId: "a",
+      workspaceDir,
+    });
+    assert.equal(result.removed, true);
+    const next = JSON.parse(await fs.readFile(storePath, "utf8"));
+    assert.equal(next["agent:a:infiai:direct:a:u1"], undefined);
+  } finally {
+    if (original === undefined) {
+      delete process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE;
+    } else {
+      process.env.INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE = original;
+    }
+  }
 });
 
 test("parses agent subscription preflight decisions from lower and Pascal case fields", () => {

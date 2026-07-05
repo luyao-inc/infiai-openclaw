@@ -43,6 +43,8 @@ const DEFAULT_OPENCLAW_STATE_DIR = "/root/.openclaw";
 /** Short TTL so workspace-state updates after toggling memory apply within a turn. */
 const MEMORY_POLICY_CACHE_TTL_MS = 500;
 const GATEWAY_CONFIG_CACHE_TTL_MS = 250;
+const RESET_STALE_SESSION_ON_WORKSPACE_UPDATE_ENV =
+  "INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE";
 const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
 const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
 const ASSISTANT_ONBOARDING_MESSAGE_SOURCE = "assistant_onboarding";
@@ -53,8 +55,9 @@ const MESSAGE_KIND_MODEL_ERROR = "model_error";
 const MESSAGE_KIND_BILLING_NOTICE = "billing_notice";
 const MESSAGE_KIND_LOOP_GUARD_NOTICE = "loop_guard_notice";
 const MESSAGE_KIND_SYSTEM_NOTICE = "system_notice";
-const DEFAULT_MEMORY_GATEWAY_RECALL_TIMEOUT_MS = 2500;
-const DEFAULT_MEMORY_GATEWAY_EXTRACT_TIMEOUT_MS = 3000;
+const DEFAULT_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS = 20000;
+const DEFAULT_MEMORY_GATEWAY_INGEST_TIMEOUT_MS = 20000;
+const MAX_MEMORY_GATEWAY_TIMEOUT_MS = 120000;
 const NON_CONVERSATIONAL_MESSAGE_KINDS = new Set([
   MESSAGE_KIND_MODEL_ERROR,
   MESSAGE_KIND_BILLING_NOTICE,
@@ -82,6 +85,22 @@ function resolveGatewayConfigPath(): string {
   if (stateDir) return path.join(stateDir, "openclaw.json");
   const home = String(process.env.OPENCLAW_HOME || "").trim() || os.homedir();
   return path.join(home, ".openclaw", "openclaw.json");
+}
+
+function envFlagEnabled(value: unknown): boolean {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  );
+}
+
+export function shouldResetStaleSessionOnWorkspaceUpdate(): boolean {
+  return envFlagEnabled(process.env[RESET_STALE_SESSION_ON_WORKSPACE_UPDATE_ENV]);
 }
 
 async function resolveLatestGatewayConfig(fallback: any): Promise<any> {
@@ -1646,18 +1665,18 @@ async function signedChatApiCall(
   return body?.data ?? body;
 }
 
-function memoryGatewayTimeoutMs(kind: "recall" | "extract"): number {
-  const envName =
-    kind === "recall"
-      ? "INFIAI_MEMORY_GATEWAY_RECALL_TIMEOUT_MS"
-      : "INFIAI_MEMORY_GATEWAY_EXTRACT_TIMEOUT_MS";
-  const fallback =
-    kind === "recall"
-      ? DEFAULT_MEMORY_GATEWAY_RECALL_TIMEOUT_MS
-      : DEFAULT_MEMORY_GATEWAY_EXTRACT_TIMEOUT_MS;
+export function memoryGatewayTimeoutMs(kind: "context" | "ingest"): number {
+	const envName =
+		kind === "context"
+			? "INFIAI_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS"
+			: "INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS";
+	const fallback =
+		kind === "context"
+			? DEFAULT_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS
+			: DEFAULT_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
   const n = Number(process.env[envName] || "");
   return Number.isFinite(n) && n > 0
-    ? Math.min(Math.floor(n), 15000)
+    ? Math.min(Math.floor(n), MAX_MEMORY_GATEWAY_TIMEOUT_MS)
     : fallback;
 }
 
@@ -1675,10 +1694,10 @@ export function appendLongTermMemoryContextToBodyForAgent(
     .join("\n\n");
 }
 
-export function shouldSubmitInfiaiMemoryExtract(params: {
-  sent: boolean;
-  messageKind: string;
-  userText: string;
+export function shouldSubmitInfiaiMemoryIngest(params: {
+	sent: boolean;
+	messageKind: string;
+	userText: string;
   assistantText: string;
   dispatchedFailureReply?: boolean;
   sentNoVisibleFallbackReply?: boolean;
@@ -1692,9 +1711,9 @@ export function shouldSubmitInfiaiMemoryExtract(params: {
   return true;
 }
 
-async function recallInfiaiLongTermMemory(
-  client: OpenIMClientState,
-  params: {
+async function fetchInfiaiLongTermMemoryContext(
+	client: OpenIMClientState,
+	params: {
     ownerUserID: string;
     agentID: string;
     sourceUserID: string;
@@ -1707,23 +1726,28 @@ async function recallInfiaiLongTermMemory(
     query: string;
   },
 ): Promise<{ contextText: string; provider?: string; skippedReason?: string }> {
-  const data = await signedChatApiCall(
-    client,
-    "/claw/internal/memory/gateway/recall",
-    {
-      ownerUserID: params.ownerUserID,
-      agentID: params.agentID,
-      sourceUserID: params.sourceUserID,
-      sourceUserName: params.sourceUserName,
-      conversationType: params.conversationType,
-      conversationID: params.conversationID,
-      groupID: params.groupID || "",
-      groupName: params.groupName || "",
-      messageID: params.messageID || "",
-      query: params.query,
-    },
-    { timeoutMs: memoryGatewayTimeoutMs("recall") },
-  );
+	const data = await signedChatApiCall(
+		client,
+		"/claw/internal/memory/context",
+		{
+			ownerUserID: params.ownerUserID,
+			agentID: params.agentID,
+			sourceUserID: params.sourceUserID,
+			sourceUserName: params.sourceUserName,
+			threadID: params.conversationID,
+			conversationID: params.conversationID,
+			query: params.query,
+			messages: [
+				{
+					role: "user",
+					content: params.query,
+					alias: params.sourceUserName,
+					messageID: params.messageID || "",
+				},
+			],
+		},
+		{ timeoutMs: memoryGatewayTimeoutMs("context") },
+	);
   return {
     contextText: String(data?.contextText || ""),
     provider: String(data?.provider || ""),
@@ -1731,8 +1755,8 @@ async function recallInfiaiLongTermMemory(
   };
 }
 
-async function submitInfiaiLongTermMemoryExtract(
-  client: OpenIMClientState,
+async function submitInfiaiLongTermMemoryIngest(
+	client: OpenIMClientState,
   params: {
     ownerUserID: string;
     agentID: string;
@@ -1751,33 +1775,39 @@ async function submitInfiaiLongTermMemoryExtract(
     occurredAt: number;
   },
 ): Promise<{
-  accepted?: boolean;
-  provider?: string;
-  skippedReason?: string;
-  jobID?: string;
+	accepted?: boolean;
+	provider?: string;
+	skippedReason?: string;
+	bufferID?: string;
+	providerBlobID?: string;
 }> {
-  return await signedChatApiCall(
-    client,
-    "/claw/internal/memory/gateway/extract",
-    {
-      ownerUserID: params.ownerUserID,
-      agentID: params.agentID,
-      sourceUserID: params.sourceUserID,
-      sourceUserName: params.sourceUserName,
-      conversationType: params.conversationType,
-      conversationID: params.conversationID,
-      groupID: params.groupID || "",
-      groupName: params.groupName || "",
-      messageID: params.messageID || "",
-      userMessageID: params.userMessageID || "",
-      replyMessageID: params.replyMessageID || "",
-      messageKind: params.messageKind,
-      userText: params.userText,
-      assistantText: params.assistantText,
-      occurredAt: params.occurredAt,
-    },
-    { timeoutMs: memoryGatewayTimeoutMs("extract") },
-  );
+	return await signedChatApiCall(
+		client,
+		"/claw/internal/memory/ingest",
+		{
+			ownerUserID: params.ownerUserID,
+			agentID: params.agentID,
+			sourceUserID: params.sourceUserID,
+			sourceUserName: params.sourceUserName,
+			threadID: params.conversationID,
+			conversationID: params.conversationID,
+			messageID: params.messageID || "",
+			userMessageID: params.userMessageID || "",
+			assistantMessageID: params.replyMessageID || "",
+			messageKind: params.messageKind,
+			userText: params.userText,
+			assistantText: params.assistantText,
+			createdAt: params.occurredAt,
+			metadata: {
+				conversationType: params.conversationType,
+				groupID: params.groupID || "",
+				groupName: params.groupName || "",
+				messageKind: params.messageKind,
+				source: "infiai-openclaw-inbound",
+			},
+		},
+		{ timeoutMs: memoryGatewayTimeoutMs("ingest") },
+	);
 }
 
 async function chargeInboundMediaUsage(
@@ -2066,6 +2096,57 @@ async function latestWorkspaceProjectionMtimeMs(
   return latest;
 }
 
+export async function inspectInfiaiSessionWorkspaceProjectionState(params: {
+  storePath: string;
+  sessionKey: string;
+  agentId: string;
+  workspaceDir: string;
+}): Promise<{
+  found: boolean;
+  stale: boolean;
+  storePath: string;
+  sessionFile?: string;
+  sessionStartedAt?: number;
+  workspaceMtimeMs?: number;
+}> {
+  const key = String(params.sessionKey || "").trim();
+  const storePath = normalizeSessionStorePath(params.storePath, params.agentId);
+  if (!key) {
+    return {
+      found: false,
+      stale: false,
+      storePath,
+    };
+  }
+  const store = await readSessionStore(params.storePath, params.agentId);
+  const entry = store.data[key] as Record<string, unknown> | undefined;
+  if (!entry || typeof entry !== "object") {
+    return { found: false, stale: false, storePath: store.path };
+  }
+  const sessionStartedAt = numberOrDateMs(
+    entry.sessionStartedAt ?? entry.createdAt ?? entry.startedAt,
+  );
+  if (!sessionStartedAt) {
+    return {
+      found: true,
+      stale: false,
+      storePath: store.path,
+      sessionFile: String(entry.sessionFile || "").trim() || undefined,
+    };
+  }
+  const workspaceMtimeMs = await latestWorkspaceProjectionMtimeMs(
+    params.workspaceDir,
+  );
+  return {
+    found: true,
+    stale: Boolean(workspaceMtimeMs && workspaceMtimeMs > sessionStartedAt + 1000),
+    storePath: store.path,
+    sessionFile: String(entry.sessionFile || "").trim() || undefined,
+    sessionStartedAt,
+    workspaceMtimeMs: workspaceMtimeMs || undefined,
+  };
+}
+
 export async function resetInfiaiSessionIfWorkspaceProjectionChanged(params: {
   storePath: string;
   sessionKey: string;
@@ -2078,43 +2159,29 @@ export async function resetInfiaiSessionIfWorkspaceProjectionChanged(params: {
   sessionStartedAt?: number;
   workspaceMtimeMs?: number;
 }> {
-  const key = String(params.sessionKey || "").trim();
-  if (!key)
+  const state = await inspectInfiaiSessionWorkspaceProjectionState(params);
+  if (!state.found || !state.stale) {
     return {
       removed: false,
-      storePath: normalizeSessionStorePath(params.storePath, params.agentId),
+      storePath: state.storePath,
+      sessionFile: state.sessionFile,
+      sessionStartedAt: state.sessionStartedAt,
+      workspaceMtimeMs: state.workspaceMtimeMs,
     };
+  }
+  const key = String(params.sessionKey || "").trim();
   const store = await readSessionStore(params.storePath, params.agentId);
   const entry = store.data[key] as Record<string, unknown> | undefined;
-  if (!entry || typeof entry !== "object") {
-    return { removed: false, storePath: store.path };
-  }
-  const sessionStartedAt = numberOrDateMs(
-    entry.sessionStartedAt ?? entry.createdAt ?? entry.startedAt,
-  );
-  if (!sessionStartedAt) {
-    return { removed: false, storePath: store.path };
-  }
-  const workspaceMtimeMs = await latestWorkspaceProjectionMtimeMs(
-    params.workspaceDir,
-  );
-  if (!workspaceMtimeMs || workspaceMtimeMs <= sessionStartedAt + 1000) {
-    return {
-      removed: false,
-      storePath: store.path,
-      sessionStartedAt,
-      workspaceMtimeMs: workspaceMtimeMs || undefined,
-    };
-  }
-  const sessionFile = String(entry.sessionFile || "").trim() || undefined;
+  const sessionFile =
+    String(entry?.sessionFile || "").trim() || state.sessionFile || undefined;
   delete store.data[key];
   await writeSessionStore(store.path, store.data);
   return {
     removed: true,
     storePath: store.path,
     sessionFile,
-    sessionStartedAt,
-    workspaceMtimeMs,
+    sessionStartedAt: state.sessionStartedAt,
+    workspaceMtimeMs: state.workspaceMtimeMs,
   };
 }
 
@@ -3673,16 +3740,33 @@ export async function processInboundMessage(
   }
   if (sessionContinuityEnabled) {
     try {
-      const reset = await resetInfiaiSessionIfWorkspaceProjectionChanged({
-        storePath,
-        sessionKey: effectiveSessionKey,
-        agentId: executionAgentId,
-        workspaceDir: resolveAgentWorkspaceDir(cfg, executionAgentId),
-      });
-      if (reset.removed) {
-        api.logger?.info?.(
-          `[infiai] reset stale session after workspace projection update: accountId=${client.config.accountId} agent=${executionAgentId} sender=${senderId} session=${effectiveSessionKey} sessionStartedAt=${Math.round(reset.sessionStartedAt || 0)} workspaceMtime=${Math.round(reset.workspaceMtimeMs || 0)} storePath=${reset.storePath}`,
-        );
+      const workspaceDir = resolveAgentWorkspaceDir(cfg, executionAgentId);
+      if (shouldResetStaleSessionOnWorkspaceUpdate()) {
+        const reset = await resetInfiaiSessionIfWorkspaceProjectionChanged({
+          storePath,
+          sessionKey: effectiveSessionKey,
+          agentId: executionAgentId,
+          workspaceDir,
+        });
+        if (reset.removed) {
+          api.logger?.info?.(
+            `[infiai] reset stale session after workspace projection update: accountId=${client.config.accountId} agent=${executionAgentId} sender=${senderId} session=${effectiveSessionKey} sessionStartedAt=${Math.round(reset.sessionStartedAt || 0)} workspaceMtime=${Math.round(reset.workspaceMtimeMs || 0)} storePath=${reset.storePath}`,
+          );
+        }
+      } else {
+        const projectionState =
+          await inspectInfiaiSessionWorkspaceProjectionState({
+            storePath,
+            sessionKey: effectiveSessionKey,
+            agentId: executionAgentId,
+            workspaceDir,
+          });
+        if (projectionState.stale) {
+          infiaiDebug(
+            api,
+            `[infiai] workspace projection newer but session kept: accountId=${client.config.accountId} agent=${executionAgentId} sender=${senderId} session=${effectiveSessionKey} sessionStartedAt=${Math.round(projectionState.sessionStartedAt || 0)} workspaceMtime=${Math.round(projectionState.workspaceMtimeMs || 0)} storePath=${projectionState.storePath}`,
+          );
+        }
       }
     } catch (err) {
       api.logger?.warn?.(
@@ -4038,7 +4122,7 @@ export async function processInboundMessage(
   const ownerAuthorized = String(senderId).trim() === String(selfUid).trim();
   let longTermMemoryContextText = "";
   try {
-    const recall = await recallInfiaiLongTermMemory(client, {
+    const contextResult = await fetchInfiaiLongTermMemoryContext(client, {
       ownerUserID: selfUid,
       agentID: businessAgentID,
       sourceUserID: senderId,
@@ -4050,16 +4134,16 @@ export async function processInboundMessage(
       messageID: String(msg.clientMsgID || msg.serverMsgID || ""),
       query: rawBody,
     });
-    longTermMemoryContextText = recall.contextText || "";
-    if (recall.skippedReason && recall.skippedReason !== "disabled") {
+    longTermMemoryContextText = contextResult.contextText || "";
+    if (contextResult.skippedReason && contextResult.skippedReason !== "disabled") {
       infiaiDebug(
         api,
-        `[infiai] memory gateway recall skipped: reason=${recall.skippedReason} provider=${recall.provider || "-"} accountId=${client.config.accountId} agent=${businessAgentID}`,
+        `[infiai] memory gateway context skipped: reason=${contextResult.skippedReason} provider=${contextResult.provider || "-"} accountId=${client.config.accountId} agent=${businessAgentID}`,
       );
     }
   } catch (err) {
     api.logger?.warn?.(
-      `[infiai] memory gateway recall failed open: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
+      `[infiai] memory gateway context failed open: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
     );
   }
   const bodyForAgent = appendLongTermMemoryContextToBodyForAgent(
@@ -4345,7 +4429,7 @@ export async function processInboundMessage(
                   deliveredVisibleReply = sent;
                   if (
                     !memoryExtractSubmitted &&
-                    shouldSubmitInfiaiMemoryExtract({
+                    shouldSubmitInfiaiMemoryIngest({
                       sent,
                       messageKind: isFailureReply
                         ? MESSAGE_KIND_MODEL_ERROR
@@ -4357,7 +4441,7 @@ export async function processInboundMessage(
                     })
                   ) {
                     memoryExtractSubmitted = true;
-                    void submitInfiaiLongTermMemoryExtract(client, {
+                    void submitInfiaiLongTermMemoryIngest(client, {
                       ownerUserID: selfUid,
                       agentID: businessAgentID,
                       sourceUserID: senderId,
@@ -4386,17 +4470,17 @@ export async function processInboundMessage(
                         if (accepted) {
                           infiaiDebug(
                             api,
-                            `[infiai] memory gateway extract accepted: provider=${result?.provider || "-"} jobID=${result?.jobID || "-"} accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""}`,
+                            `[infiai] memory gateway ingest accepted: provider=${result?.provider || "-"} bufferID=${result?.bufferID || "-"} blobID=${result?.providerBlobID || "-"} accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""}`,
                           );
                         } else {
                           api.logger?.warn?.(
-                            `[infiai] memory gateway extract skipped: reason=${skippedReason || "unknown"} provider=${result?.provider || "-"} accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""}`,
+                            `[infiai] memory gateway ingest skipped: reason=${skippedReason || "unknown"} provider=${result?.provider || "-"} accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""}`,
                           );
                         }
                       })
                       .catch((err) => {
                         api.logger?.warn?.(
-                          `[infiai] memory gateway extract failed open: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
+                          `[infiai] memory gateway ingest failed open: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
                         );
                       });
                   }
