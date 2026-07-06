@@ -1298,6 +1298,75 @@ function normalizeInfiaiReplyFormatting(text: string): string {
   return s.replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
+function isExplicitDetailedUserRequest(text: unknown): boolean {
+  const s = String(text ?? "").trim();
+  if (!s) return false;
+  return /(?:详细|展开|完整|方案|步骤|清单|列表|表格|代码|Markdown|md格式|报告|PRD|文档|大纲|复盘|总结|对比|分析|逐条|分点|列出|整理|教程|SOP)/i.test(
+    s,
+  );
+}
+
+function stripManagedChatLeaks(text: string): string {
+  let s = String(text ?? "");
+  const replacements: Array<[RegExp, string]> = [
+    [/作为(?:一个)?(?:AI|人工智能|语言模型)[，,:：\s]*/gi, ""],
+    [/根据(?:你提供的)?(?:上下文|知识库上下文|检索结果|RAG|memory block)[，,:：\s]*/gi, ""],
+    [/基于(?:当前)?(?:上下文|知识库|检索结果|RAG|memory block)[，,:：\s]*/gi, ""],
+    [/我是(?:你|用户)?(?:在)?(?:Infiai|灵谐)?(?:中)?托管的?数字分身[，,:：\s]*/gi, ""],
+    [/我是(?:一个)?数字分身[，,:：\s]*/gi, ""],
+    [/\b(?:infiai_context|infiai_current_conversation|owner_authorized|social_tools|denial_reason|actor_role|workspace|tool call|RAG|memory block)\b/gi, ""],
+    [/(?:我)?(?:正在|准备|先|来|马上|接下来)?(?:调用|使用).{0,16}(?:工具|tool|serper|搜索工具)[。.!！]?/gi, ""],
+    [/(?:我)?(?:先|来|正在|马上)?(?:搜索|检索|查询|查找|读取)(?:一下)?.{0,24}(?:资料|信息|内容|结果|知识库)[。.!！]?/gi, ""],
+    [/(?:知识库|文档|资料).{0,24}(?:没有|暂无|没找到|无).{0,24}(?:相关)?(?:内容|信息|结果)[，,。.!！]*/gi, ""],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    s = s.replace(pattern, replacement);
+  }
+  return s.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeManagedChatReply(
+  text: string,
+  options: { userText?: unknown } = {},
+): string {
+  if (!infiaiReplyNormalizerEnabled()) return text;
+  const raw = String(text ?? "");
+  if (raw.includes("```")) return raw.trimEnd();
+
+  let s = stripManagedChatLeaks(raw);
+  if (!s.trim()) return s;
+  if (s.includes("```")) return s;
+
+  const detailed = isExplicitDetailedUserRequest(options.userText);
+  const lines = s
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => {
+      if (detailed) return true;
+      if (/^(?:#+\s*)?(?:核心信息|总结|结论|背景|原因|建议|分析|回答|说明|注意事项)[:：]?$/.test(line)) {
+        return false;
+      }
+      if (/^(?:以下|下面)(?:是|为).{0,18}(?:内容|信息|整理|分析|建议|总结)[:：]?$/.test(line)) {
+        return false;
+      }
+      return true;
+    })
+    .map((line) => (detailed ? line : line.replace(/^\s*(?:[-*•]|\d+[.、])\s*/, "")));
+
+  if (detailed) {
+    return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  }
+
+  let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const paragraphs = compact.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length > 3) {
+    compact = `${paragraphs.slice(0, 3).join("\n\n")}\n\n要我展开的话我再继续说。`;
+  }
+  return compact.trimEnd();
+}
+
 function isNoReplyMetaReply(text: string): boolean {
   const s = String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -4354,10 +4423,13 @@ export async function processInboundMessage(
                   );
                   return;
                 }
-                const cleaned = normalizeInfiaiReplyFormatting(
-                  stripInfiaiReplyArtifacts(
-                    stripVisibleReasoningPreamble(localized),
+                const cleaned = normalizeManagedChatReply(
+                  normalizeInfiaiReplyFormatting(
+                    stripInfiaiReplyArtifacts(
+                      stripVisibleReasoningPreamble(localized),
+                    ),
                   ),
+                  { userText: rawBody },
                 );
                 if (
                   attempt === "primary" &&
