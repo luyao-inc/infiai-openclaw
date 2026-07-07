@@ -82,6 +82,29 @@ type SendTextOptions = {
   ex?: string;
 };
 
+type SendVoiceOptions = {
+  ex?: string;
+};
+
+async function sendCreatedMessageToTarget(
+  client: OpenIMClientState,
+  target: ParsedTarget,
+  message: MessageItem,
+  options?: { notOss?: boolean },
+): Promise<MessageItem> {
+  const { recvID, groupID } = getRecvAndGroupID(target);
+  const sender = options?.notOss
+    ? (client.sdk as { sendMessageNotOss?: typeof client.sdk.sendMessage })
+        .sendMessageNotOss
+    : undefined;
+  if (sender) {
+    await sender.call(client.sdk, { recvID, groupID, message });
+    return message;
+  }
+  await client.sdk.sendMessage({ recvID, groupID, message });
+  return message;
+}
+
 export async function sendTextToTarget(
   client: OpenIMClientState,
   target: ParsedTarget,
@@ -103,6 +126,40 @@ export async function sendTextToTarget(
     groupID,
     message,
   });
+}
+
+export async function sendVoiceToTarget(
+  client: OpenIMClientState,
+  target: ParsedTarget,
+  params: {
+    sourceUrl: string;
+    duration: number;
+    name?: string;
+    soundType?: string;
+    dataSize?: number;
+  },
+  options?: SendVoiceOptions,
+): Promise<MessageItem> {
+  const sourceUrl = String(params.sourceUrl || "").trim();
+  if (!sourceUrl) throw new Error("voice sourceUrl is empty");
+  const name = params.name?.trim() || inferNameFromUrl(sourceUrl, "voice.mp3");
+  const soundType =
+    params.soundType?.trim() || extname(name).replace(/^\./, "") || "mp3";
+  const duration = Math.max(1, Math.round(Number(params.duration || 1)));
+  const created = await (client.sdk as any).createSoundMessageByURL({
+    soundPath: name,
+    uuid: randomUUID(),
+    sourceUrl,
+    dataSize: Math.max(0, Number(params.dataSize || 0)),
+    duration,
+    soundType,
+  });
+  const message = created?.data;
+  if (!message) throw new Error("createSoundMessageByURL failed");
+  if (options?.ex) {
+    (message as MessageItem & { ex?: string }).ex = options.ex;
+  }
+  return sendCreatedMessageToTarget(client, target, message, { notOss: true });
 }
 
 export async function sendAtTextToGroup(
@@ -203,8 +260,9 @@ export async function sendImageToTarget(
   }
 
   if (!message) throw new Error("createImageMessage failed");
-  const { recvID, groupID } = getRecvAndGroupID(target);
-  await client.sdk.sendMessage({ recvID, groupID, message });
+  await sendCreatedMessageToTarget(client, target, message, {
+    notOss: isUrl(input),
+  });
 }
 
 export async function sendVideoToTarget(
@@ -255,6 +313,7 @@ export async function sendFileToTarget(
   }
 
   if (!message) throw new Error("createFileMessage failed");
-  const { recvID, groupID } = getRecvAndGroupID(target);
-  await client.sdk.sendMessage({ recvID, groupID, message });
+  await sendCreatedMessageToTarget(client, target, message, {
+    notOss: isUrl(input),
+  });
 }

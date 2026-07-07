@@ -21,7 +21,11 @@ import {
   normalizeRuntimeAgentIDToBusinessAgentID,
   resolveInfiaiAgentIdForAccount,
 } from "./managedManagedPredicate";
-import { sendAtTextToGroup, sendTextToTarget } from "./media";
+import {
+  sendAtTextToGroup,
+  sendTextToTarget,
+  sendVoiceToTarget,
+} from "./media";
 import { ensureInfiaiReplyReady } from "./replyHeal";
 import { withInfiaiToolContext } from "./toolContext";
 import type {
@@ -100,7 +104,9 @@ function envFlagEnabled(value: unknown): boolean {
 }
 
 export function shouldResetStaleSessionOnWorkspaceUpdate(): boolean {
-  return envFlagEnabled(process.env[RESET_STALE_SESSION_ON_WORKSPACE_UPDATE_ENV]);
+  return envFlagEnabled(
+    process.env[RESET_STALE_SESSION_ON_WORKSPACE_UPDATE_ENV],
+  );
 }
 
 async function resolveLatestGatewayConfig(fallback: any): Promise<any> {
@@ -221,6 +227,7 @@ function isHumanSelfAssistantMessage(
 function buildAssistantReplyEx(
   msg: MessageItem,
   messageKind = MESSAGE_KIND_ASSISTANT_REPLY,
+  extraInfiai?: Record<string, unknown>,
 ): string {
   const base = parseMessageEx(msg) ?? {};
   const infiai =
@@ -233,6 +240,7 @@ function buildAssistantReplyEx(
     ...base,
     infiai: {
       ...infiai,
+      ...(extraInfiai || {}),
       source: ASSISTANT_MESSAGE_SOURCE,
       messageKind,
       traceID: randomUUID(),
@@ -240,6 +248,15 @@ function buildAssistantReplyEx(
     },
   };
   return JSON.stringify(next);
+}
+
+function resolveTenantIDFromAccountID(accountId: string): string {
+  const normalized = String(accountId || "").trim();
+  if (normalized.startsWith("acc_")) {
+    const parts = normalized.slice(4).split("__");
+    if (parts[0]) return parts[0];
+  }
+  return "default";
 }
 
 function transcriptObsEnabled(): boolean {
@@ -276,11 +293,21 @@ type StagedInboundMedia = {
   paths: string[];
   workspaceDir?: string;
 };
+type ExtractedVoiceTranscription = {
+  sourceUrl: string;
+  objectName?: string;
+  text: string;
+  durationSeconds?: number;
+  provider?: string;
+  model?: string;
+  cached?: boolean;
+};
 type ExtractedMediaTextResult = {
   body: string;
   warnings: string[];
   extractedCount: number;
   extractedItems?: InboundMediaItem[];
+  voiceTranscriptions?: ExtractedVoiceTranscription[];
   visionActualCostMicros?: number;
   visionInputTokens?: number;
   visionOutputTokens?: number;
@@ -995,20 +1022,23 @@ function rewriteObjectAccessUrlToPublicBase(accessUrl: string): string {
 }
 
 function resolveOpenImObjectName(raw: string): string | null {
+  const extract = (pathname: string): string | null => {
+    if (!pathname.startsWith("/object/")) return null;
+    const name = pathname.slice("/object/".length);
+    if (!name) return null;
+    try {
+      return decodeURIComponent(name);
+    } catch {
+      return name;
+    }
+  };
+  if (raw.startsWith("/object/")) return extract(raw);
   try {
     const parsed = new URL(raw);
-    if (
-      (parsed.hostname === "127.0.0.1" ||
-        parsed.hostname === "localhost" ||
-        parsed.hostname === "::1") &&
-      parsed.pathname.startsWith("/object/")
-    ) {
-      return decodeURIComponent(parsed.pathname.slice("/object/".length));
-    }
+    return extract(parsed.pathname);
   } catch {
     return null;
   }
-  return null;
 }
 
 async function resolveOpenImObjectAccessUrl(
@@ -1123,27 +1153,29 @@ export function isAgnesFallbackTriggerText(text: unknown): boolean {
 }
 
 function getAgentPrimaryModel(cfg: any, agentId: string): string {
-	const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
-	const agent = list.find(
-		(entry: any) => entry && String(entry.id ?? "") === String(agentId || ""),
-	);
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  const agent = list.find(
+    (entry: any) => entry && String(entry.id ?? "") === String(agentId || ""),
+  );
   return String(
     agent?.model?.primary ?? cfg?.agents?.defaults?.model?.primary ?? "",
-	  ).trim();
+  ).trim();
 }
 
 function getAgentDisplayName(cfg: any, agentId: string): string {
-	const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
-	const agent = list.find(
-		(entry: any) => entry && String(entry.id ?? "") === String(agentId || ""),
-	);
-	return normalizeString(agent?.name) || normalizeString(agent?.identity?.name) || "";
+  const list = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+  const agent = list.find(
+    (entry: any) => entry && String(entry.id ?? "") === String(agentId || ""),
+  );
+  return (
+    normalizeString(agent?.name) || normalizeString(agent?.identity?.name) || ""
+  );
 }
 
 export function cloneConfigWithAgentPrimaryModel(
-	cfg: any,
-	agentId: string,
-	model: string,
+  cfg: any,
+  agentId: string,
+  model: string,
 ): any {
   const next = structuredClone(cfg);
   next.agents =
@@ -1310,19 +1342,43 @@ function stripManagedChatLeaks(text: string): string {
   let s = String(text ?? "");
   const replacements: Array<[RegExp, string]> = [
     [/作为(?:一个)?(?:AI|人工智能|语言模型)[，,:：\s]*/gi, ""],
-    [/根据(?:你提供的)?(?:上下文|知识库上下文|检索结果|RAG|memory block)[，,:：\s]*/gi, ""],
-    [/基于(?:当前)?(?:上下文|知识库|检索结果|RAG|memory block)[，,:：\s]*/gi, ""],
-    [/我是(?:你|用户)?(?:在)?(?:Infiai|灵谐)?(?:中)?托管的?数字分身[，,:：\s]*/gi, ""],
+    [
+      /根据(?:你提供的)?(?:上下文|知识库上下文|检索结果|RAG|memory block)[，,:：\s]*/gi,
+      "",
+    ],
+    [
+      /基于(?:当前)?(?:上下文|知识库|检索结果|RAG|memory block)[，,:：\s]*/gi,
+      "",
+    ],
+    [
+      /我是(?:你|用户)?(?:在)?(?:Infiai|灵谐)?(?:中)?托管的?数字分身[，,:：\s]*/gi,
+      "",
+    ],
     [/我是(?:一个)?数字分身[，,:：\s]*/gi, ""],
-    [/\b(?:infiai_context|infiai_current_conversation|owner_authorized|social_tools|denial_reason|actor_role|workspace|tool call|RAG|memory block)\b/gi, ""],
-    [/(?:我)?(?:正在|准备|先|来|马上|接下来)?(?:调用|使用).{0,16}(?:工具|tool|serper|搜索工具)[。.!！]?/gi, ""],
-    [/(?:我)?(?:先|来|正在|马上)?(?:搜索|检索|查询|查找|读取)(?:一下)?.{0,24}(?:资料|信息|内容|结果|知识库)[。.!！]?/gi, ""],
-    [/(?:知识库|文档|资料).{0,24}(?:没有|暂无|没找到|无).{0,24}(?:相关)?(?:内容|信息|结果)[，,。.!！]*/gi, ""],
+    [
+      /\b(?:infiai_context|infiai_current_conversation|owner_authorized|social_tools|denial_reason|actor_role|workspace|tool call|RAG|memory block)\b/gi,
+      "",
+    ],
+    [
+      /(?:我)?(?:正在|准备|先|来|马上|接下来)?(?:调用|使用).{0,16}(?:工具|tool|serper|搜索工具)[。.!！]?/gi,
+      "",
+    ],
+    [
+      /(?:我)?(?:先|来|正在|马上)?(?:搜索|检索|查询|查找|读取)(?:一下)?.{0,24}(?:资料|信息|内容|结果|知识库)[。.!！]?/gi,
+      "",
+    ],
+    [
+      /(?:知识库|文档|资料).{0,24}(?:没有|暂无|没找到|无).{0,24}(?:相关)?(?:内容|信息|结果)[，,。.!！]*/gi,
+      "",
+    ],
   ];
   for (const [pattern, replacement] of replacements) {
     s = s.replace(pattern, replacement);
   }
-  return s.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  return s
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function normalizeManagedChatReply(
@@ -1345,22 +1401,41 @@ function normalizeManagedChatReply(
     .filter(Boolean)
     .filter((line) => {
       if (detailed) return true;
-      if (/^(?:#+\s*)?(?:核心信息|总结|结论|背景|原因|建议|分析|回答|说明|注意事项)[:：]?$/.test(line)) {
+      if (
+        /^(?:#+\s*)?(?:核心信息|总结|结论|背景|原因|建议|分析|回答|说明|注意事项)[:：]?$/.test(
+          line,
+        )
+      ) {
         return false;
       }
-      if (/^(?:以下|下面)(?:是|为).{0,18}(?:内容|信息|整理|分析|建议|总结)[:：]?$/.test(line)) {
+      if (
+        /^(?:以下|下面)(?:是|为).{0,18}(?:内容|信息|整理|分析|建议|总结)[:：]?$/.test(
+          line,
+        )
+      ) {
         return false;
       }
       return true;
     })
-    .map((line) => (detailed ? line : line.replace(/^\s*(?:[-*•]|\d+[.、])\s*/, "")));
+    .map((line) =>
+      detailed ? line : line.replace(/^\s*(?:[-*•]|\d+[.、])\s*/, ""),
+    );
 
   if (detailed) {
-    return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+    return lines
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trimEnd();
   }
 
-  let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  const paragraphs = compact.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  let compact = lines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const paragraphs = compact
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
   if (paragraphs.length > 3) {
     compact = `${paragraphs.slice(0, 3).join("\n\n")}\n\n要我展开的话我再继续说。`;
   }
@@ -1490,12 +1565,12 @@ export function buildTextEnvelope(
   bodyText: string,
   chatType: ChatType,
   explicitlyMentionedSelf = false,
-	conversationContext?: {
-		currentUserName?: string;
-		currentAgentName?: string;
-		currentGroupID?: string;
-		currentGroupName?: string;
-	},
+  conversationContext?: {
+    currentUserName?: string;
+    currentAgentName?: string;
+    currentGroupID?: string;
+    currentGroupName?: string;
+  },
 ): string {
   const ownerAuthorized =
     String(senderId || "").trim() === String(managedUserId || "").trim();
@@ -1506,20 +1581,22 @@ export function buildTextEnvelope(
     chatType === "group" && explicitlyMentionedSelf
       ? ' group_mention="explicit" response_visibility="visible_short_reply"'
       : "";
-	const currentAgentName = normalizeString(conversationContext?.currentAgentName);
-	let currentUserName =
-		normalizeString(conversationContext?.currentUserName) ||
-		normalizeString(fromLabel) ||
-		normalizeString(senderId) ||
-		"";
-	if (
-		ownerAuthorized &&
-		currentAgentName &&
-		currentUserName &&
-		currentUserName === currentAgentName
-	) {
-		currentUserName = "owner";
-	}
+  const currentAgentName = normalizeString(
+    conversationContext?.currentAgentName,
+  );
+  let currentUserName =
+    normalizeString(conversationContext?.currentUserName) ||
+    normalizeString(fromLabel) ||
+    normalizeString(senderId) ||
+    "";
+  if (
+    ownerAuthorized &&
+    currentAgentName &&
+    currentUserName &&
+    currentUserName === currentAgentName
+  ) {
+    currentUserName = "owner";
+  }
   const currentGroupID =
     chatType === "group"
       ? normalizeString(conversationContext?.currentGroupID) || ""
@@ -1528,14 +1605,14 @@ export function buildTextEnvelope(
     chatType === "group"
       ? normalizeString(conversationContext?.currentGroupName) || currentGroupID
       : "";
-	const currentConversationAttrs = [
-		`current_chat_type="${escapeInfiaiXmlAttr(chatType)}"`,
-		`current_user_id="${escapeInfiaiXmlAttr(senderId)}"`,
-		`current_user_name="${escapeInfiaiXmlAttr(currentUserName)}"`,
-		...(currentAgentName
-			? [`current_agent_name="${escapeInfiaiXmlAttr(currentAgentName)}"`]
-			: []),
-		`actor_role="${actorRole}"`,
+  const currentConversationAttrs = [
+    `current_chat_type="${escapeInfiaiXmlAttr(chatType)}"`,
+    `current_user_id="${escapeInfiaiXmlAttr(senderId)}"`,
+    `current_user_name="${escapeInfiaiXmlAttr(currentUserName)}"`,
+    ...(currentAgentName
+      ? [`current_agent_name="${escapeInfiaiXmlAttr(currentAgentName)}"`]
+      : []),
+    `actor_role="${actorRole}"`,
     ...(chatType === "group"
       ? [
           `current_group_id="${escapeInfiaiXmlAttr(currentGroupID)}"`,
@@ -1734,15 +1811,172 @@ async function signedChatApiCall(
   return body?.data ?? body;
 }
 
+async function upsertVoiceTranscriptionCache(
+  client: OpenIMClientState,
+  payload: {
+    tenantID: string;
+    conversationID?: string;
+    clientMsgID?: string;
+    serverMsgID?: string;
+    sourceURL?: string;
+    objectName?: string;
+    text: string;
+    provider?: string;
+    model?: string;
+    durationSec?: number;
+    source: "openclaw_media" | "agent_tts";
+    createdByUserID?: string;
+  },
+): Promise<void> {
+  const text = normalizeString(payload.text);
+  if (!text) return;
+  const sourceURL = normalizeString(payload.sourceURL);
+  const objectName =
+    normalizeString(payload.objectName) ??
+    (sourceURL ? (resolveOpenImObjectName(sourceURL) ?? undefined) : undefined);
+  await signedChatApiCall(
+    client,
+    "/claw/internal/media/voice-transcription/upsert",
+    {
+      tenantID: payload.tenantID,
+      conversationID: normalizeString(payload.conversationID),
+      clientMsgID: normalizeString(payload.clientMsgID),
+      serverMsgID: normalizeString(payload.serverMsgID),
+      sourceURL,
+      objectName,
+      text,
+      provider: normalizeString(payload.provider),
+      model: normalizeString(payload.model),
+      durationSec: normalizeDurationSeconds(payload.durationSec),
+      source: payload.source,
+      createdByUserID: normalizeString(payload.createdByUserID),
+    },
+    { timeoutMs: 20000 },
+  );
+}
+
+async function lookupVoiceTranscriptionCache(
+  client: OpenIMClientState,
+  payload: {
+    tenantID: string;
+    conversationID?: string;
+    clientMsgID?: string;
+    serverMsgID?: string;
+    sourceURL?: string;
+    objectName?: string;
+  },
+): Promise<ExtractedVoiceTranscription | null> {
+  const sourceURL = normalizeString(payload.sourceURL);
+  const objectName =
+    normalizeString(payload.objectName) ??
+    (sourceURL ? (resolveOpenImObjectName(sourceURL) ?? undefined) : undefined);
+  if (
+    !payload.conversationID &&
+    !payload.clientMsgID &&
+    !payload.serverMsgID &&
+    !sourceURL &&
+    !objectName
+  ) {
+    return null;
+  }
+  try {
+    const result = await signedChatApiCall(
+      client,
+      "/claw/internal/media/voice-transcription/lookup",
+      {
+        tenantID: payload.tenantID,
+        conversationID: normalizeString(payload.conversationID),
+        clientMsgID: normalizeString(payload.clientMsgID),
+        serverMsgID: normalizeString(payload.serverMsgID),
+        sourceURL,
+        objectName,
+      },
+      { timeoutMs: 5000 },
+    );
+    const text = normalizeString(result?.text);
+    if (!result?.cached || !text) return null;
+    return {
+      sourceUrl: sourceURL || normalizeString(result?.sourceURL) || "",
+      objectName: objectName || normalizeString(result?.objectName),
+      text,
+      durationSeconds: normalizeDurationSeconds(result?.duration),
+      provider: normalizeString(result?.provider),
+      model: normalizeString(result?.model),
+      cached: true,
+    };
+  } catch (err) {
+    console.warn(
+      `[infiai] voice transcription cache lookup failed: source=${sourceURL || objectName || ""} error=${formatSdkError(err)}`,
+    );
+    return null;
+  }
+}
+
+async function upsertExtractedVoiceTranscriptionCache(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  records: ExtractedVoiceTranscription[] | undefined,
+  params: { tenantID: string; createdByUserID: string },
+): Promise<void> {
+  if (!Array.isArray(records) || records.length === 0) return;
+  const conversationID = resolveInfiaiConversationID(msg);
+  for (const record of records) {
+    try {
+      await upsertVoiceTranscriptionCache(client, {
+        tenantID: params.tenantID,
+        conversationID,
+        clientMsgID: String(msg.clientMsgID || ""),
+        serverMsgID: String((msg as any).serverMsgID || ""),
+        sourceURL: record.sourceUrl,
+        objectName: record.objectName,
+        text: record.text,
+        provider: record.provider,
+        model: record.model,
+        durationSec: record.durationSeconds,
+        source: "openclaw_media",
+        createdByUserID: params.createdByUserID,
+      });
+    } catch (err) {
+      console.warn(
+        `[infiai] voice transcription cache upsert failed: clientMsgID=${msg.clientMsgID || ""} source=${record.sourceUrl || ""} error=${formatSdkError(err)}`,
+      );
+    }
+  }
+}
+
+function soundTypeFromContentType(contentType: unknown): string | undefined {
+  const normalized = String(contentType ?? "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  switch (normalized) {
+    case "audio/wav":
+    case "audio/wave":
+    case "audio/x-wav":
+      return "wav";
+    case "audio/mpeg":
+    case "audio/mp3":
+      return "mp3";
+    case "audio/mp4":
+    case "audio/m4a":
+    case "audio/x-m4a":
+      return "m4a";
+    case "audio/ogg":
+      return "ogg";
+    default:
+      return undefined;
+  }
+}
+
 export function memoryGatewayTimeoutMs(kind: "context" | "ingest"): number {
-	const envName =
-		kind === "context"
-			? "INFIAI_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS"
-			: "INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS";
-	const fallback =
-		kind === "context"
-			? DEFAULT_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS
-			: DEFAULT_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
+  const envName =
+    kind === "context"
+      ? "INFIAI_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS"
+      : "INFIAI_MEMORY_GATEWAY_INGEST_TIMEOUT_MS";
+  const fallback =
+    kind === "context"
+      ? DEFAULT_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS
+      : DEFAULT_MEMORY_GATEWAY_INGEST_TIMEOUT_MS;
   const n = Number(process.env[envName] || "");
   return Number.isFinite(n) && n > 0
     ? Math.min(Math.floor(n), MAX_MEMORY_GATEWAY_TIMEOUT_MS)
@@ -1764,9 +1998,9 @@ export function appendLongTermMemoryContextToBodyForAgent(
 }
 
 export function shouldSubmitInfiaiMemoryIngest(params: {
-	sent: boolean;
-	messageKind: string;
-	userText: string;
+  sent: boolean;
+  messageKind: string;
+  userText: string;
   assistantText: string;
   dispatchedFailureReply?: boolean;
   sentNoVisibleFallbackReply?: boolean;
@@ -1781,8 +2015,8 @@ export function shouldSubmitInfiaiMemoryIngest(params: {
 }
 
 async function fetchInfiaiLongTermMemoryContext(
-	client: OpenIMClientState,
-	params: {
+  client: OpenIMClientState,
+  params: {
     ownerUserID: string;
     agentID: string;
     sourceUserID: string;
@@ -1795,28 +2029,28 @@ async function fetchInfiaiLongTermMemoryContext(
     query: string;
   },
 ): Promise<{ contextText: string; provider?: string; skippedReason?: string }> {
-	const data = await signedChatApiCall(
-		client,
-		"/claw/internal/memory/context",
-		{
-			ownerUserID: params.ownerUserID,
-			agentID: params.agentID,
-			sourceUserID: params.sourceUserID,
-			sourceUserName: params.sourceUserName,
-			threadID: params.conversationID,
-			conversationID: params.conversationID,
-			query: params.query,
-			messages: [
-				{
-					role: "user",
-					content: params.query,
-					alias: params.sourceUserName,
-					messageID: params.messageID || "",
-				},
-			],
-		},
-		{ timeoutMs: memoryGatewayTimeoutMs("context") },
-	);
+  const data = await signedChatApiCall(
+    client,
+    "/claw/internal/memory/context",
+    {
+      ownerUserID: params.ownerUserID,
+      agentID: params.agentID,
+      sourceUserID: params.sourceUserID,
+      sourceUserName: params.sourceUserName,
+      threadID: params.conversationID,
+      conversationID: params.conversationID,
+      query: params.query,
+      messages: [
+        {
+          role: "user",
+          content: params.query,
+          alias: params.sourceUserName,
+          messageID: params.messageID || "",
+        },
+      ],
+    },
+    { timeoutMs: memoryGatewayTimeoutMs("context") },
+  );
   return {
     contextText: String(data?.contextText || ""),
     provider: String(data?.provider || ""),
@@ -1825,7 +2059,7 @@ async function fetchInfiaiLongTermMemoryContext(
 }
 
 async function submitInfiaiLongTermMemoryIngest(
-	client: OpenIMClientState,
+  client: OpenIMClientState,
   params: {
     ownerUserID: string;
     agentID: string;
@@ -1844,39 +2078,39 @@ async function submitInfiaiLongTermMemoryIngest(
     occurredAt: number;
   },
 ): Promise<{
-	accepted?: boolean;
-	provider?: string;
-	skippedReason?: string;
-	bufferID?: string;
-	providerBlobID?: string;
+  accepted?: boolean;
+  provider?: string;
+  skippedReason?: string;
+  bufferID?: string;
+  providerBlobID?: string;
 }> {
-	return await signedChatApiCall(
-		client,
-		"/claw/internal/memory/ingest",
-		{
-			ownerUserID: params.ownerUserID,
-			agentID: params.agentID,
-			sourceUserID: params.sourceUserID,
-			sourceUserName: params.sourceUserName,
-			threadID: params.conversationID,
-			conversationID: params.conversationID,
-			messageID: params.messageID || "",
-			userMessageID: params.userMessageID || "",
-			assistantMessageID: params.replyMessageID || "",
-			messageKind: params.messageKind,
-			userText: params.userText,
-			assistantText: params.assistantText,
-			createdAt: params.occurredAt,
-			metadata: {
-				conversationType: params.conversationType,
-				groupID: params.groupID || "",
-				groupName: params.groupName || "",
-				messageKind: params.messageKind,
-				source: "infiai-openclaw-inbound",
-			},
-		},
-		{ timeoutMs: memoryGatewayTimeoutMs("ingest") },
-	);
+  return await signedChatApiCall(
+    client,
+    "/claw/internal/memory/ingest",
+    {
+      ownerUserID: params.ownerUserID,
+      agentID: params.agentID,
+      sourceUserID: params.sourceUserID,
+      sourceUserName: params.sourceUserName,
+      threadID: params.conversationID,
+      conversationID: params.conversationID,
+      messageID: params.messageID || "",
+      userMessageID: params.userMessageID || "",
+      assistantMessageID: params.replyMessageID || "",
+      messageKind: params.messageKind,
+      userText: params.userText,
+      assistantText: params.assistantText,
+      createdAt: params.occurredAt,
+      metadata: {
+        conversationType: params.conversationType,
+        groupID: params.groupID || "",
+        groupName: params.groupName || "",
+        messageKind: params.messageKind,
+        source: "infiai-openclaw-inbound",
+      },
+    },
+    { timeoutMs: memoryGatewayTimeoutMs("ingest") },
+  );
 }
 
 async function chargeInboundMediaUsage(
@@ -2208,7 +2442,9 @@ export async function inspectInfiaiSessionWorkspaceProjectionState(params: {
   );
   return {
     found: true,
-    stale: Boolean(workspaceMtimeMs && workspaceMtimeMs > sessionStartedAt + 1000),
+    stale: Boolean(
+      workspaceMtimeMs && workspaceMtimeMs > sessionStartedAt + 1000,
+    ),
     storePath: store.path,
     sessionFile: String(entry.sessionFile || "").trim() || undefined,
     sessionStartedAt,
@@ -2691,6 +2927,15 @@ function resolveInfiaiMediaTranscribeProvider(): string {
   return configured;
 }
 
+function resolveInfiaiMediaTranscribeModel(): string {
+  return (
+    normalizeString(process.env.INFIAI_MEDIA_TRANSCRIBE_MODEL) ??
+    normalizeString(process.env.KB_VIDEO_TRANSCRIBE_MODEL) ??
+    normalizeString(process.env.KB_FUNASR_MODEL) ??
+    "funasr"
+  );
+}
+
 function limitExternalText(text: string, maxChars: number): string {
   const chars = Array.from(String(text ?? ""));
   if (chars.length <= maxChars) return chars.join("");
@@ -2899,16 +3144,56 @@ async function probeTranscribableMediaDurations(
 async function extractTranscribableMediaText(
   client: OpenIMClientState,
   media: InboundMediaItem[] | undefined,
+  msg?: MessageItem,
+  tenantID?: string,
 ): Promise<ExtractedMediaTextResult> {
   const items = (media ?? []).filter(isTranscribableMediaItem);
   if (items.length === 0) return { body: "", warnings: [], extractedCount: 0 };
   const blocks: string[] = [];
   const warnings: string[] = [];
   const extractedItems: InboundMediaItem[] = [];
+  const voiceTranscriptions: ExtractedVoiceTranscription[] = [];
   for (const item of items) {
     try {
       const sourceUrl = resolveStageableMediaUrl(item);
       if (!sourceUrl) throw new Error("missing media URL");
+      const kind = transcribableMediaKind(item);
+      if (kind === "audio") {
+        const cached = await lookupVoiceTranscriptionCache(client, {
+          tenantID:
+            tenantID || resolveTenantIDFromAccountID(client.config.accountId),
+          conversationID: msg ? resolveInfiaiConversationID(msg) : undefined,
+          clientMsgID: msg ? String(msg.clientMsgID || "") : undefined,
+          serverMsgID: msg ? String((msg as any).serverMsgID || "") : undefined,
+          sourceURL: sourceUrl,
+          objectName: resolveOpenImObjectName(sourceUrl) ?? undefined,
+        });
+        if (cached?.text) {
+          const durationSeconds = normalizeDurationSeconds(
+            item.durationSeconds ?? cached.durationSeconds,
+          );
+          if (durationSeconds) item.durationSeconds = durationSeconds;
+          blocks.push(
+            buildUntrustedMediaTranscriptBlock(item, {
+              title: normalizeString(item.fileName),
+              text: cached.text,
+              mediaType: "audio",
+              metadata: { duration: durationSeconds },
+            }),
+          );
+          extractedItems.push(item);
+          voiceTranscriptions.push({
+            ...cached,
+            sourceUrl,
+            objectName:
+              cached.objectName ??
+              resolveOpenImObjectName(sourceUrl) ??
+              undefined,
+            durationSeconds,
+          });
+          continue;
+        }
+      }
       const resolvedUrl = await resolveOpenImObjectAccessUrl(client, sourceUrl);
       const extracted = await extractMediaTextViaKBExtractor(item, resolvedUrl);
       const durationSeconds = normalizeDurationSeconds(
@@ -2917,6 +3202,19 @@ async function extractTranscribableMediaText(
       if (durationSeconds) item.durationSeconds = durationSeconds;
       blocks.push(buildUntrustedMediaTranscriptBlock(item, extracted));
       extractedItems.push(item);
+      if (kind === "audio") {
+        const text = normalizeString(extracted.text);
+        if (text) {
+          voiceTranscriptions.push({
+            sourceUrl,
+            objectName: resolveOpenImObjectName(sourceUrl) ?? undefined,
+            text,
+            durationSeconds,
+            provider: resolveInfiaiMediaTranscribeProvider(),
+            model: resolveInfiaiMediaTranscribeModel(),
+          });
+        }
+      }
     } catch (err) {
       warnings.push(`${summarizeMedia(item)} => ${formatSdkError(err)}`);
     }
@@ -2926,6 +3224,7 @@ async function extractTranscribableMediaText(
     warnings,
     extractedCount: blocks.length,
     extractedItems,
+    voiceTranscriptions,
   };
 }
 
@@ -3516,12 +3815,30 @@ async function sendReplyFromInbound(
   client: OpenIMClientState,
   msg: MessageItem,
   text: string,
-  options: { messageKind?: string } = {},
+  options: {
+    messageKind?: string;
+    voice?: {
+      sourceUrl: string;
+      duration: number;
+      transcript: string;
+      dataSize?: number;
+      contentType?: string;
+      provider?: string;
+      model?: string;
+    };
+  } = {},
 ): Promise<void> {
   const isGroup = isGroupMessage(msg);
   const replyEx = buildAssistantReplyEx(
     msg,
     options.messageKind || MESSAGE_KIND_ASSISTANT_REPLY,
+    options.voice
+      ? {
+          replyMode: "voice",
+          transcript: options.voice.transcript,
+          voiceDuration: options.voice.duration,
+        }
+      : undefined,
   );
   infiaiConsoleDebug(
     `[infiai] sendReplyFromInbound: isGroup=${isGroup}, groupID=${String(msg.groupID || "-")}, sendID=${String(msg.sendID || "-")}, textLen=${text.length}, clientMsgID=${msg.clientMsgID || "-"}`,
@@ -3555,10 +3872,327 @@ async function sendReplyFromInbound(
   infiaiConsoleDebug(
     `[infiai] sendReplyFromInbound: target kind=${target.kind}, id=${target.id}`,
   );
+  if (!isGroup && options.voice?.sourceUrl) {
+    const sentVoiceMessage = await sendVoiceToTarget(
+      client,
+      target,
+      {
+        sourceUrl: options.voice.sourceUrl,
+        duration: options.voice.duration,
+        dataSize: options.voice.dataSize,
+        soundType: soundTypeFromContentType(options.voice.contentType),
+      },
+      { ex: replyEx },
+    );
+    try {
+      await upsertVoiceTranscriptionCache(client, {
+        tenantID: resolveTenantIDFromAccountID(client.config.accountId),
+        conversationID: resolveInfiaiConversationID(msg),
+        clientMsgID: String(sentVoiceMessage.clientMsgID || ""),
+        serverMsgID: String((sentVoiceMessage as any).serverMsgID || ""),
+        sourceURL: options.voice.sourceUrl,
+        text: options.voice.transcript,
+        provider: options.voice.provider,
+        model: options.voice.model,
+        durationSec: options.voice.duration,
+        source: "agent_tts",
+        createdByUserID: String(client.config.userID || ""),
+      });
+    } catch (err) {
+      console.warn(
+        `[infiai] agent voice transcription cache upsert failed: accountId=${client.config.accountId} clientMsgID=${sentVoiceMessage.clientMsgID || ""} error=${formatSdkError(err)}`,
+      );
+    }
+    infiaiConsoleDebug(
+      `[infiai] sendReplyFromInbound: sendVoiceToTarget COMPLETED`,
+    );
+    return;
+  }
   await sendTextToTarget(client, target, text, { ex: replyEx });
   infiaiConsoleDebug(
     `[infiai] sendReplyFromInbound: sendTextToTarget COMPLETED`,
   );
+}
+
+async function synthesizeInfiaiAgentVoiceReply(
+  client: OpenIMClientState,
+  params: {
+    tenantID: string;
+    userID: string;
+    agentID: string;
+    text: string;
+    actorUserID?: string;
+    conversationID?: string;
+    sourceMsgID?: string;
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
+  },
+): Promise<
+  | {
+      enabled: true;
+      audioURL: string;
+      duration: number;
+      transcript: string;
+      dataSize?: number;
+      contentType?: string;
+      provider?: string;
+      model?: string;
+      timings?: Record<string, number>;
+    }
+  | { enabled: false; skippedReason?: string }
+> {
+  const result = await signedChatApiCall(
+    client,
+    "/claw/internal/agent-voice/synthesize",
+    {
+      tenantID: params.tenantID,
+      userID: params.userID,
+      agentID: params.agentID,
+      text: params.text,
+      actorUserID: params.actorUserID || "",
+      conversationID: params.conversationID || "",
+      sourceMsgID: params.sourceMsgID || "",
+      subscriberUserID: params.subscriberUserID || "",
+      agentSubscriptionID: params.agentSubscriptionID || "",
+    },
+    { timeoutMs: 60000 },
+  );
+  if (!result?.enabled) {
+    return {
+      enabled: false,
+      skippedReason: String(result?.skippedReason || ""),
+    };
+  }
+  const audioURL = String(result.audioURL || "").trim();
+  if (!audioURL) {
+    return { enabled: false, skippedReason: "empty_audio_url" };
+  }
+  return {
+    enabled: true,
+    audioURL,
+    duration: Math.max(1, Math.round(Number(result.duration || 1))),
+    transcript: String(result.transcript || params.text),
+    dataSize: Number(result.dataSize || 0) || undefined,
+    contentType: normalizeString(result.contentType),
+    provider: normalizeString(result.provider),
+    model: normalizeString(result.model),
+    timings:
+      result.timings && typeof result.timings === "object"
+        ? (result.timings as Record<string, number>)
+        : undefined,
+  };
+}
+
+type AgentVoiceStreamResult = {
+  enabled: true;
+  audioURL: string;
+  duration: number;
+  transcript: string;
+  dataSize?: number;
+  contentType?: string;
+  provider?: string;
+  model?: string;
+  timings?: Record<string, number>;
+};
+
+function buildSignedAgentVoiceStreamURL(
+  client: OpenIMClientState,
+  payload: {
+    tenantID: string;
+    userID: string;
+    agentID: string;
+    actorUserID?: string;
+    conversationID?: string;
+    sourceMsgID?: string;
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
+  },
+): string {
+  const base = resolveChatApiBase(client);
+  const requestPayload: Record<string, unknown> = { ...payload };
+  if (client.config.userID) requestPayload.ownerUserID = client.config.userID;
+  if (client.config.accountId)
+    requestPayload.accountId = client.config.accountId;
+  const body = JSON.stringify(requestPayload);
+  const sharedSecret = String(
+    process.env.OPENCLAW_SHARED_SECRET ||
+      process.env.INFIAI_TOOL_SHARED_SECRET ||
+      "",
+  ).trim();
+  const url = new URL(`${base}/claw/internal/agent-voice/synthesize/stream`);
+  if (url.protocol === "http:") url.protocol = "ws:";
+  if (url.protocol === "https:") url.protocol = "wss:";
+  url.searchParams.set("payload", body);
+  if (sharedSecret) {
+    url.searchParams.set(
+      "signature",
+      createHmac("sha256", sharedSecret).update(body).digest("hex"),
+    );
+  }
+  return url.toString();
+}
+
+class InfiaiVoiceReplyAccumulator {
+  private ws: any | null = null;
+  private ready: Promise<void> | null = null;
+  private finished: Promise<AgentVoiceStreamResult> | null = null;
+  private fullText = "";
+  private pendingTail = "";
+  private disabledReason = "";
+
+  constructor(
+    private readonly client: OpenIMClientState,
+    private readonly params: {
+      tenantID: string;
+      userID: string;
+      agentID: string;
+      actorUserID?: string;
+      conversationID?: string;
+      sourceMsgID?: string;
+      subscriberUserID?: string;
+      agentSubscriptionID?: string;
+    },
+  ) {}
+
+  get text(): string {
+    return this.fullText.trim();
+  }
+
+  get unavailableReason(): string {
+    return this.disabledReason;
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.disabledReason) throw new Error(this.disabledReason);
+    if (this.ready) return this.ready;
+    const WebSocketCtor = (globalThis as any).WebSocket;
+    if (!WebSocketCtor) {
+      this.disabledReason = "websocket_unavailable";
+      throw new Error(this.disabledReason);
+    }
+    const wsURL = buildSignedAgentVoiceStreamURL(this.client, this.params);
+    this.ws = new WebSocketCtor(wsURL);
+    this.ready = new Promise((resolve, reject) => {
+      const fail = (err: unknown) => {
+        const reason = formatSdkError(err) || "voice_stream_open_failed";
+        this.disabledReason = reason;
+        reject(new Error(reason));
+      };
+      this.ws.onopen = () => resolve();
+      this.ws.onerror = fail;
+      this.ws.onclose = () => {
+        if (!this.finished) fail("voice_stream_closed");
+      };
+      this.ws.onmessage = (event: any) => {
+        try {
+          const data = JSON.parse(String(event.data || "{}"));
+          if (data?.type === "error") {
+            this.disabledReason = String(data.message || "voice_stream_error");
+          }
+        } catch {
+          // Ignore progress events that are not JSON.
+        }
+      };
+    });
+    return this.ready;
+  }
+
+  private incrementalText(nextText: string): string {
+    const next = nextText.trim();
+    if (!next) return "";
+    if (!this.fullText) return next;
+    if (next.startsWith(this.fullText)) {
+      return next.slice(this.fullText.length).trim();
+    }
+    return next;
+  }
+
+  private splitReadyText(text: string, force = false): string[] {
+    this.pendingTail += text;
+    const parts: string[] = [];
+    while (this.pendingTail.length > 0) {
+      const match = this.pendingTail.match(/[。！？!?；;]\s*/);
+      if (match && typeof match.index === "number") {
+        const end = match.index + match[0].length;
+        parts.push(this.pendingTail.slice(0, end).trim());
+        this.pendingTail = this.pendingTail.slice(end);
+        continue;
+      }
+      if (this.pendingTail.length >= 48) {
+        parts.push(this.pendingTail.slice(0, 48).trim());
+        this.pendingTail = this.pendingTail.slice(48);
+        continue;
+      }
+      break;
+    }
+    if (force && this.pendingTail.trim()) {
+      parts.push(this.pendingTail.trim());
+      this.pendingTail = "";
+    }
+    return parts.filter(Boolean);
+  }
+
+  async append(modelText: string): Promise<void> {
+    const delta = this.incrementalText(modelText);
+    if (!delta) return;
+    this.fullText += delta;
+    if (this.disabledReason) return;
+    await this.ensureConnected();
+    for (const part of this.splitReadyText(delta)) {
+      this.ws?.send(JSON.stringify({ type: "append", text: part }));
+    }
+  }
+
+  async finish(): Promise<AgentVoiceStreamResult | null> {
+    if (!this.text || this.disabledReason) return null;
+    await this.ensureConnected();
+    for (const part of this.splitReadyText("", true)) {
+      this.ws?.send(JSON.stringify({ type: "append", text: part }));
+    }
+    if (this.finished) return this.finished;
+    this.finished = new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("voice_stream_finish_timeout")),
+        90000,
+      );
+      this.ws.onmessage = (event: any) => {
+        let data: any = {};
+        try {
+          data = JSON.parse(String(event.data || "{}"));
+        } catch {
+          return;
+        }
+        if (data.type === "finished" && data.enabled && data.audioURL) {
+          clearTimeout(timer);
+          resolve({
+            enabled: true,
+            audioURL: String(data.audioURL),
+            duration: Math.max(1, Math.round(Number(data.duration || 1))),
+            transcript: String(data.transcript || this.text),
+            dataSize: Number(data.dataSize || 0) || undefined,
+            contentType: normalizeString(data.contentType),
+            provider: normalizeString(data.provider),
+            model: normalizeString(data.model),
+            timings:
+              data.timings && typeof data.timings === "object"
+                ? (data.timings as Record<string, number>)
+                : undefined,
+          });
+          this.ws?.close?.();
+        } else if (data.type === "error") {
+          clearTimeout(timer);
+          this.disabledReason = String(data.message || "voice_stream_error");
+          reject(new Error(this.disabledReason));
+        }
+      };
+      this.ws.onerror = (err: unknown) => {
+        clearTimeout(timer);
+        reject(new Error(formatSdkError(err)));
+      };
+      this.ws?.send(JSON.stringify({ type: "finish" }));
+    });
+    return this.finished;
+  }
 }
 
 function shouldSuppressGeneratedReplyToManagedBot(params: {
@@ -3583,6 +4217,9 @@ async function sendClassifiedReplyFromInbound(
     senderManaged: boolean;
     fromManagedBotSession: boolean;
     reason: string;
+    tenantID?: string;
+    ownerUserID?: string;
+    agentID?: string;
   },
 ): Promise<boolean> {
   if (shouldSuppressGeneratedReplyToManagedBot(params)) {
@@ -3591,8 +4228,68 @@ async function sendClassifiedReplyFromInbound(
     );
     return false;
   }
+  let voice:
+    | {
+        sourceUrl: string;
+        duration: number;
+        transcript: string;
+        dataSize?: number;
+        contentType?: string;
+        provider?: string;
+        model?: string;
+        timings?: Record<string, number>;
+      }
+    | undefined;
+  if (
+    params.messageKind === MESSAGE_KIND_ASSISTANT_REPLY &&
+    !isGroupMessage(msg) &&
+    params.ownerUserID &&
+    params.agentID
+  ) {
+    try {
+      const synthesized = await synthesizeInfiaiAgentVoiceReply(client, {
+        tenantID:
+          params.tenantID ||
+          resolveTenantIDFromAccountID(client.config.accountId),
+        userID: params.ownerUserID,
+        agentID: params.agentID,
+        text,
+        actorUserID: String(msg.sendID || ""),
+        conversationID: String(
+          msg.sessionType === 3
+            ? msg.groupID || ""
+            : msg.sendID || msg.recvID || "",
+        ),
+        sourceMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
+      });
+      if (synthesized.enabled) {
+        voice = {
+          sourceUrl: synthesized.audioURL,
+          duration: synthesized.duration,
+          transcript: synthesized.transcript,
+          dataSize: synthesized.dataSize,
+          contentType: synthesized.contentType,
+          provider: synthesized.provider,
+          model: synthesized.model,
+          timings: synthesized.timings,
+        };
+        api.logger?.info?.(
+          `[infiai] voice reply synthesized: accountId=${client.config.accountId} agent=${params.agentID} clientMsgID=${msg.clientMsgID || ""} duration=${voice.duration} timings=${JSON.stringify(voice.timings || {})}`,
+        );
+      } else if (synthesized.skippedReason) {
+        infiaiConsoleDebug(
+          `[infiai] voice reply skipped: reason=${synthesized.skippedReason} accountId=${client.config.accountId} agent=${params.agentID}`,
+        );
+      }
+    } catch (err) {
+      api.logger?.warn?.(
+        `[infiai] voice reply synthesize failed; fallback to text: accountId=${client.config.accountId} agent=${params.agentID} error=${formatSdkError(err)}`,
+      );
+    }
+  }
   await sendReplyFromInbound(client, msg, text, {
     messageKind: params.messageKind,
+    voice,
   });
   return true;
 }
@@ -3996,14 +4693,32 @@ export async function processInboundMessage(
       api.logger,
     );
   }
+  const mediaPipelineStarted = Date.now();
+  const tenantIDForInbound = resolveTenantIDFromAccountID(
+    client.config.accountId,
+  );
+  const transcriptStarted = Date.now();
   const transcriptResult = await extractTranscribableMediaText(
     client,
     inbound.media,
+    msg,
+    tenantIDForInbound,
   );
-  const fileTextResult = await extractFileTextViaKBExtractor(
-    client,
-    inbound.media,
+  api.logger?.info?.(
+    `[infiai] inbound media transcript stage completed: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} extracted=${transcriptResult.extractedCount} warnings=${transcriptResult.warnings.length} elapsedMs=${Date.now() - transcriptStarted}`,
   );
+  const hasDocumentFileMedia = (inbound.media ?? []).some(
+    isDocumentFileMediaItem,
+  );
+  const fileTextStarted = Date.now();
+  const fileTextResult: ExtractedMediaTextResult = hasDocumentFileMedia
+    ? await extractFileTextViaKBExtractor(client, inbound.media)
+    : { body: "", warnings: [], extractedCount: 0, extractedItems: [] };
+  if (hasDocumentFileMedia) {
+    api.logger?.info?.(
+      `[infiai] inbound file extract stage completed: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} extracted=${fileTextResult.extractedCount} warnings=${fileTextResult.warnings.length} elapsedMs=${Date.now() - fileTextStarted}`,
+    );
+  }
   if ((fileTextResult.visionActualCostMicros || 0) > 0) {
     try {
       const charged = await chargeActualCostUsage(client, msg, {
@@ -4077,6 +4792,22 @@ export async function processInboundMessage(
       }
     }
   }
+  void upsertExtractedVoiceTranscriptionCache(
+    client,
+    msg,
+    transcriptResult.voiceTranscriptions,
+    {
+      tenantID: tenantIDForInbound,
+      createdByUserID: senderId,
+    },
+  ).catch((err) => {
+    api.logger?.warn?.(
+      `[infiai] inbound voice transcription cache async upsert failed: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
+    );
+  });
+  api.logger?.info?.(
+    `[infiai] inbound media pipeline completed before model dispatch: accountId=${client.config.accountId} clientMsgID=${msg.clientMsgID || ""} elapsedMs=${Date.now() - mediaPipelineStarted}`,
+  );
   const imageMedia = (inbound.media ?? []).filter(isImageMediaItem);
   const imageMediaResult =
     imageMedia.length > 0
@@ -4204,7 +4935,10 @@ export async function processInboundMessage(
       query: rawBody,
     });
     longTermMemoryContextText = contextResult.contextText || "";
-    if (contextResult.skippedReason && contextResult.skippedReason !== "disabled") {
+    if (
+      contextResult.skippedReason &&
+      contextResult.skippedReason !== "disabled"
+    ) {
       infiaiDebug(
         api,
         `[infiai] memory gateway context skipped: reason=${contextResult.skippedReason} provider=${contextResult.provider || "-"} accountId=${client.config.accountId} agent=${businessAgentID}`,
@@ -4374,6 +5108,19 @@ export async function processInboundMessage(
   let suppressedNoReplyMetaReply = false;
   let memoryExtractSubmitted = false;
   let noVisibleFallbackReply: string | null = null;
+  const voiceReplyAccumulator =
+    !group && businessAgentID
+      ? new InfiaiVoiceReplyAccumulator(client, {
+          tenantID: resolveTenantIDFromAccountID(client.config.accountId),
+          userID: selfUid,
+          agentID: businessAgentID,
+          actorUserID: senderId,
+          conversationID: effectiveSessionKey,
+          sourceMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
+          subscriberUserID: agentSubscription?.subscriberUserID || senderId,
+          agentSubscriptionID: agentSubscription?.subscriptionID || "",
+        })
+      : null;
   const primaryModel = getAgentPrimaryModel(cfg, executionAgentId);
   const agnesFallbackModel = resolveAgnesFallbackModel();
   const agnesFallbackReady =
@@ -4481,6 +5228,13 @@ export async function processInboundMessage(
                     payload.text,
                     localized,
                   );
+                  if (!isFailureReply && voiceReplyAccumulator) {
+                    await voiceReplyAccumulator.append(cleaned);
+                    infiaiConsoleDebug(
+                      `[infiai] voice reply text chunk accepted: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} chunkLen=${cleaned.length}`,
+                    );
+                    return;
+                  }
                   if (isFailureReply) dispatchedFailureReply = true;
                   const sent = await sendClassifiedReplyFromInbound(
                     api,
@@ -4496,6 +5250,11 @@ export async function processInboundMessage(
                       reason: isFailureReply
                         ? "localized_model_failure_reply"
                         : "assistant_reply",
+                      tenantID: resolveTenantIDFromAccountID(
+                        client.config.accountId,
+                      ),
+                      ownerUserID: selfUid,
+                      agentID: businessAgentID,
                     },
                   );
                   deliveredVisibleReply = sent;
@@ -4578,7 +5337,7 @@ export async function processInboundMessage(
               },
             },
             replyOptions: {
-              disableBlockStreaming: true,
+              disableBlockStreaming: !voiceReplyAccumulator,
               images: [],
             },
           }),
@@ -4625,6 +5384,127 @@ export async function processInboundMessage(
 
     if (primaryDispatchError && !agnesFallbackAttempted) {
       throw primaryDispatchError;
+    }
+    if (
+      voiceReplyAccumulator &&
+      voiceReplyAccumulator.text &&
+      !deliveredVisibleReply &&
+      !dispatchedFailureReply &&
+      !suppressedNoReplyMetaReply
+    ) {
+      const assistantText = voiceReplyAccumulator.text;
+      let voice:
+        | {
+            sourceUrl: string;
+            duration: number;
+            transcript: string;
+            dataSize?: number;
+            contentType?: string;
+            provider?: string;
+            model?: string;
+            timings?: Record<string, number>;
+          }
+        | undefined;
+      try {
+        const synthesized = await voiceReplyAccumulator.finish();
+        if (synthesized?.enabled) {
+          voice = {
+            sourceUrl: synthesized.audioURL,
+            duration: synthesized.duration,
+            transcript: synthesized.transcript || assistantText,
+            dataSize: synthesized.dataSize,
+            contentType: synthesized.contentType,
+            provider: synthesized.provider,
+            model: synthesized.model,
+            timings: synthesized.timings,
+          };
+          api.logger?.info?.(
+            `[infiai] streaming voice reply synthesized: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} duration=${voice.duration} timings=${JSON.stringify(voice.timings || {})}`,
+          );
+        }
+      } catch (err) {
+        api.logger?.warn?.(
+          `[infiai] streaming voice reply failed; trying one-shot voice fallback: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
+        );
+        try {
+          const fallbackSynthesized = await synthesizeInfiaiAgentVoiceReply(
+            client,
+            {
+              tenantID: resolveTenantIDFromAccountID(client.config.accountId),
+              userID: selfUid,
+              agentID: businessAgentID,
+              text: assistantText,
+              actorUserID: senderId,
+              conversationID: effectiveSessionKey,
+              sourceMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
+              subscriberUserID: agentSubscription?.subscriberUserID || senderId,
+              agentSubscriptionID: agentSubscription?.subscriptionID || "",
+            },
+          );
+          if (fallbackSynthesized.enabled) {
+            voice = {
+              sourceUrl: fallbackSynthesized.audioURL,
+              duration: fallbackSynthesized.duration,
+              transcript: fallbackSynthesized.transcript || assistantText,
+              dataSize: fallbackSynthesized.dataSize,
+              contentType: fallbackSynthesized.contentType,
+              provider: fallbackSynthesized.provider,
+              model: fallbackSynthesized.model,
+              timings: fallbackSynthesized.timings,
+            };
+            api.logger?.info?.(
+              `[infiai] one-shot voice fallback synthesized: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} duration=${voice.duration} timings=${JSON.stringify(voice.timings || {})}`,
+            );
+          } else {
+            api.logger?.warn?.(
+              `[infiai] one-shot voice fallback skipped; fallback to text: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} reason=${fallbackSynthesized.skippedReason || ""}`,
+            );
+          }
+        } catch (fallbackErr) {
+          api.logger?.warn?.(
+            `[infiai] one-shot voice fallback failed; fallback to text: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(fallbackErr)}`,
+          );
+        }
+      }
+      await sendReplyFromInbound(client, msg, assistantText, {
+        messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+        voice,
+      });
+      deliveredVisibleReply = true;
+      if (
+        !memoryExtractSubmitted &&
+        shouldSubmitInfiaiMemoryIngest({
+          sent: true,
+          messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+          userText: rawBody,
+          assistantText,
+          dispatchedFailureReply: false,
+          sentNoVisibleFallbackReply: false,
+        })
+      ) {
+        memoryExtractSubmitted = true;
+        void submitInfiaiLongTermMemoryIngest(client, {
+          ownerUserID: selfUid,
+          agentID: businessAgentID,
+          sourceUserID: senderId,
+          sourceUserName: fromLabel,
+          conversationType: chatType,
+          conversationID: effectiveSessionKey,
+          groupID: group ? String(msg.groupID || "") : "",
+          groupName,
+          messageID: String(msg.clientMsgID || msg.serverMsgID || ""),
+          userMessageID: String(msg.clientMsgID || msg.serverMsgID || ""),
+          replyMessageID: "",
+          messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+          userText: rawBody,
+          assistantText,
+          occurredAt: timestamp,
+        }).catch((err) => {
+          api.logger?.warn?.(
+            `[infiai] memory gateway ingest failed open: accountId=${client.config.accountId} agent=${businessAgentID} clientMsgID=${msg.clientMsgID || ""} error=${formatSdkError(err)}`,
+          );
+        });
+      }
     }
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.done", {
