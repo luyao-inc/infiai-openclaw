@@ -296,6 +296,7 @@ type StagedInboundMedia = {
 type ExtractedVoiceTranscription = {
   sourceUrl: string;
   objectName?: string;
+  sourceHash?: string;
   text: string;
   durationSeconds?: number;
   provider?: string;
@@ -1820,6 +1821,7 @@ async function upsertVoiceTranscriptionCache(
     serverMsgID?: string;
     sourceURL?: string;
     objectName?: string;
+    sourceHash?: string;
     text: string;
     provider?: string;
     model?: string;
@@ -1844,6 +1846,7 @@ async function upsertVoiceTranscriptionCache(
       serverMsgID: normalizeString(payload.serverMsgID),
       sourceURL,
       objectName,
+      sourceHash: normalizeString(payload.sourceHash),
       text,
       provider: normalizeString(payload.provider),
       model: normalizeString(payload.model),
@@ -1898,6 +1901,7 @@ async function lookupVoiceTranscriptionCache(
     return {
       sourceUrl: sourceURL || normalizeString(result?.sourceURL) || "",
       objectName: objectName || normalizeString(result?.objectName),
+      sourceHash: normalizeString(result?.sourceHash),
       text,
       durationSeconds: normalizeDurationSeconds(result?.duration),
       provider: normalizeString(result?.provider),
@@ -1910,6 +1914,63 @@ async function lookupVoiceTranscriptionCache(
     );
     return null;
   }
+}
+
+function resolveAudioTranscribeMessageTimeoutMs(): number {
+  const raw = Number(
+    process.env.OPENCLAW_AUDIO_TRANSCRIBE_TIMEOUT_MS ||
+      process.env.INFIAI_MEDIA_AUDIO_TRANSCRIBE_TIMEOUT_MS ||
+      45_000,
+  );
+  if (!Number.isFinite(raw) || raw <= 0) return 45_000;
+  return Math.min(Math.max(raw, 5_000), 120_000);
+}
+
+async function transcribeAudioMessageViaChat(
+  client: OpenIMClientState,
+  payload: {
+    tenantID: string;
+    conversationID?: string;
+    clientMsgID?: string;
+    serverMsgID?: string;
+    sourceURL?: string;
+    objectName?: string;
+    durationSec?: number;
+    createdByUserID?: string;
+  },
+): Promise<ExtractedVoiceTranscription | null> {
+  const sourceURL = normalizeString(payload.sourceURL);
+  const objectName =
+    normalizeString(payload.objectName) ??
+    (sourceURL ? (resolveOpenImObjectName(sourceURL) ?? undefined) : undefined);
+  if (!objectName) return null;
+  const result = await signedChatApiCall(
+    client,
+    "/claw/internal/media/audio-transcribe/message",
+    {
+      tenantID: payload.tenantID,
+      conversationID: normalizeString(payload.conversationID),
+      clientMsgID: normalizeString(payload.clientMsgID),
+      serverMsgID: normalizeString(payload.serverMsgID),
+      sourceURL,
+      objectName,
+      durationSec: normalizeDurationSeconds(payload.durationSec),
+      createdByUserID: normalizeString(payload.createdByUserID),
+    },
+    { timeoutMs: resolveAudioTranscribeMessageTimeoutMs() },
+  );
+  const text = normalizeString(result?.text);
+  if (!text) return null;
+  return {
+    sourceUrl: sourceURL || normalizeString(result?.sourceURL) || "",
+    objectName: objectName || normalizeString(result?.objectName),
+    sourceHash: normalizeString(result?.sourceHash),
+    text,
+    durationSeconds: normalizeDurationSeconds(result?.duration),
+    provider: normalizeString(result?.provider),
+    model: normalizeString(result?.model),
+    cached: Boolean(result?.cached),
+  };
 }
 
 async function upsertExtractedVoiceTranscriptionCache(
@@ -1929,6 +1990,7 @@ async function upsertExtractedVoiceTranscriptionCache(
         serverMsgID: String((msg as any).serverMsgID || ""),
         sourceURL: record.sourceUrl,
         objectName: record.objectName,
+        sourceHash: record.sourceHash,
         text: record.text,
         provider: record.provider,
         model: record.model,
@@ -3159,14 +3221,19 @@ async function extractTranscribableMediaText(
       if (!sourceUrl) throw new Error("missing media URL");
       const kind = transcribableMediaKind(item);
       if (kind === "audio") {
+        const tenant =
+          tenantID || resolveTenantIDFromAccountID(client.config.accountId);
+        const conversationID = msg ? resolveInfiaiConversationID(msg) : undefined;
+        const clientMsgID = msg ? String(msg.clientMsgID || "") : undefined;
+        const serverMsgID = msg ? String((msg as any).serverMsgID || "") : undefined;
+        const objectName = resolveOpenImObjectName(sourceUrl) ?? undefined;
         const cached = await lookupVoiceTranscriptionCache(client, {
-          tenantID:
-            tenantID || resolveTenantIDFromAccountID(client.config.accountId),
-          conversationID: msg ? resolveInfiaiConversationID(msg) : undefined,
-          clientMsgID: msg ? String(msg.clientMsgID || "") : undefined,
-          serverMsgID: msg ? String((msg as any).serverMsgID || "") : undefined,
+          tenantID: tenant,
+          conversationID,
+          clientMsgID,
+          serverMsgID,
           sourceURL: sourceUrl,
-          objectName: resolveOpenImObjectName(sourceUrl) ?? undefined,
+          objectName,
         });
         if (cached?.text) {
           const durationSeconds = normalizeDurationSeconds(
@@ -3189,6 +3256,41 @@ async function extractTranscribableMediaText(
               cached.objectName ??
               resolveOpenImObjectName(sourceUrl) ??
               undefined,
+            durationSeconds,
+          });
+          continue;
+        }
+        if (objectName) {
+          const transcribed = await transcribeAudioMessageViaChat(client, {
+            tenantID: tenant,
+            conversationID,
+            clientMsgID,
+            serverMsgID,
+            sourceURL: sourceUrl,
+            objectName,
+            durationSec: item.durationSeconds,
+            createdByUserID: msg ? String(msg.sendID || "") : undefined,
+          });
+          if (!transcribed?.text) {
+            throw new Error("Chat audio transcription returned empty transcript");
+          }
+          const durationSeconds = normalizeDurationSeconds(
+            item.durationSeconds ?? transcribed.durationSeconds,
+          );
+          if (durationSeconds) item.durationSeconds = durationSeconds;
+          blocks.push(
+            buildUntrustedMediaTranscriptBlock(item, {
+              title: normalizeString(item.fileName),
+              text: transcribed.text,
+              mediaType: "audio",
+              metadata: { duration: durationSeconds },
+            }),
+          );
+          extractedItems.push(item);
+          voiceTranscriptions.push({
+            ...transcribed,
+            sourceUrl,
+            objectName,
             durationSeconds,
           });
           continue;
