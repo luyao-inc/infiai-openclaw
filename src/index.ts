@@ -7,10 +7,70 @@
 
 import "./polyfills";
 import { OpenIMChannelPlugin } from "./channel";
-import { startAccountClient, stopAllClients } from "./clients";
+import { getConnectedClient, startAccountClient, stopAllClients } from "./clients";
 import { listEnabledAccountConfigs } from "./config";
+import { processOpenPlatformMessage } from "./inbound";
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
+
+function resolveGatewayRequestParams(input: any): any {
+  if (
+    input &&
+    typeof input === "object" &&
+    input.params &&
+    typeof input.params === "object" &&
+    !Array.isArray(input.params)
+  ) {
+    return input.params;
+  }
+  return input;
+}
+
+function registerOpenPlatformGateway(api: any): void {
+  const handler = async (input: any) => {
+    const params = resolveGatewayRequestParams(input);
+    const accountId = String(params?.accountId || "").trim();
+    const client = getConnectedClient(accountId || undefined);
+    if (!client) {
+      throw new Error(accountId ? `Infiai account is not connected: ${accountId}` : "Infiai account is not connected");
+    }
+    return processOpenPlatformMessage(api, client, params);
+  };
+  const registrations: Array<() => boolean> = [
+    () => {
+      if (typeof api.registerGatewayMethod !== "function") return false;
+      api.registerGatewayMethod("infiai.open_platform_message", handler);
+      return true;
+    },
+    () => {
+      if (typeof api.registerRpc !== "function") return false;
+      api.registerRpc("infiai.open_platform_message", handler);
+      return true;
+    },
+    () => {
+      if (typeof api.registerMethod !== "function") return false;
+      api.registerMethod("infiai.open_platform_message", handler);
+      return true;
+    },
+    () => {
+      const gateway = api.runtime?.gateway;
+      if (!gateway || typeof gateway.registerMethod !== "function") return false;
+      gateway.registerMethod("infiai.open_platform_message", handler);
+      return true;
+    },
+  ];
+  for (const register of registrations) {
+    try {
+      if (register()) {
+        api.logger?.info?.("[infiai] open platform gateway method registered");
+        return;
+      }
+    } catch (err: any) {
+      api.logger?.warn?.(`[infiai] open platform gateway method registration failed: ${String(err?.message || err)}`);
+    }
+  }
+  api.logger?.warn?.("[infiai] open platform gateway method API unavailable; /open/v1/message will fail until the runtime exposes plugin RPC registration");
+}
 
 function registerCliMetadata(api: any): void {
   if (typeof api.registerCli !== "function") return;
@@ -33,6 +93,7 @@ function registerFull(api: any): void {
   (globalThis as any).__openimGatewayConfig = api.config;
 
   registerOpenIMTools(api);
+  registerOpenPlatformGateway(api);
 
   api.registerService({
     id: "infiai-sdk",

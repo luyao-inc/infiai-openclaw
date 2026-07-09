@@ -293,6 +293,73 @@ type StagedInboundMedia = {
   paths: string[];
   workspaceDir?: string;
 };
+
+export type OpenPlatformMessageParams = {
+  accountId?: string;
+  tenantID?: string;
+  ownerUserID: string;
+  agentID: string;
+  sourceUserID: string;
+  sourceUserName?: string;
+  sourceUserMaskedID?: string;
+  conversationID: string;
+  conversationKey?: string;
+  messageID: string;
+  messageType: "text" | "image";
+  text?: string;
+  imageURL?: string;
+  occurredAt?: number;
+};
+
+export type OpenPlatformMessageResult = {
+  replyType: "text";
+  replyText: string;
+  usage?: {
+    provider?: string;
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    actualCostMicros?: number;
+  };
+  billing?: {
+    usageEventIds?: string[];
+    chargeUnits?: number;
+    billingStatus?: string;
+    allowed?: boolean;
+  };
+  timings?: {
+    memoryContextMs?: number;
+    imageUnderstandingMs?: number;
+    llmMs?: number;
+    billingMs?: number;
+    memoryIngestMs?: number;
+  };
+  warnings?: string[];
+};
+
+function buildOpenPlatformBillingMessage(
+  params: OpenPlatformMessageParams,
+  messageID: string,
+): MessageItem {
+  const sourceMsgID = `open-platform:${messageID}`;
+  return {
+    clientMsgID: sourceMsgID,
+    serverMsgID: sourceMsgID,
+    sendID: normalizeString(params.sourceUserID),
+    recvID: normalizeString(params.ownerUserID),
+    contentType:
+      params.messageType === "image"
+        ? MessageType.PictureMessage
+        : MessageType.TextMessage,
+    ex: JSON.stringify({
+      infiai: {
+        source: "open_platform",
+        messageKind: params.messageType,
+        externalMessageID: messageID,
+      },
+    }),
+  } as unknown as MessageItem;
+}
 type ExtractedVoiceTranscription = {
   sourceUrl: string;
   objectName?: string;
@@ -323,7 +390,62 @@ type BillingChargeResult = {
   status?: string;
   requiredUnits?: number;
   availableUnits?: number;
+  usageEventID?: string;
+  chargeUnits?: number;
+  provider?: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  actualCostMicros?: number;
 };
+
+function billingChargeResultFromData(
+  data: any,
+  fallback: Partial<BillingChargeResult> = {},
+): BillingChargeResult {
+  const usage = data?.usage || {};
+  const usageEventID = String(
+    usage?.EventID || usage?.eventID || usage?.eventId || usage?.ID || "",
+  ).trim();
+  return {
+    allowed: Boolean(data?.allowed),
+    status: String(
+      data?.status || usage?.BillingStatus || usage?.billingStatus || fallback.status || "",
+    ),
+    requiredUnits: Number(
+      data?.requiredUnits ||
+        usage?.ChargeUnits ||
+        usage?.chargeUnits ||
+        fallback.requiredUnits ||
+        0,
+    ),
+    availableUnits: Number(
+      data?.availableUnits ||
+        usage?.AvailableUnits ||
+        usage?.availableUnits ||
+        fallback.availableUnits ||
+        0,
+    ),
+    usageEventID: usageEventID || fallback.usageEventID,
+    chargeUnits: Number(
+      usage?.ChargeUnits || usage?.chargeUnits || fallback.chargeUnits || 0,
+    ),
+    provider: String(usage?.Provider || usage?.provider || fallback.provider || "").trim(),
+    model: String(usage?.Model || usage?.model || fallback.model || "").trim(),
+    inputTokens: Number(
+      usage?.InputTokens || usage?.inputTokens || fallback.inputTokens || 0,
+    ),
+    outputTokens: Number(
+      usage?.OutputTokens || usage?.outputTokens || fallback.outputTokens || 0,
+    ),
+    actualCostMicros: Number(
+      usage?.ActualCostMicros ||
+        usage?.actualCostMicros ||
+        fallback.actualCostMicros ||
+        0,
+    ),
+  };
+}
 type AgentSubscriptionPreflightResult = {
   allowed: boolean;
   reason?: string;
@@ -2227,24 +2349,7 @@ async function chargeInboundMediaUsage(
       },
     },
   );
-  return {
-    allowed: Boolean(data?.allowed),
-    status: String(
-      data?.usage?.BillingStatus || data?.usage?.billingStatus || "",
-    ),
-    requiredUnits: Number(
-      data?.requiredUnits ||
-        data?.usage?.ChargeUnits ||
-        data?.usage?.chargeUnits ||
-        0,
-    ),
-    availableUnits: Number(
-      data?.availableUnits ||
-        data?.usage?.AvailableUnits ||
-        data?.usage?.availableUnits ||
-        0,
-    ),
-  };
+  return billingChargeResultFromData(data);
 }
 
 async function chargeActualCostUsage(
@@ -2304,24 +2409,13 @@ async function chargeActualCostUsage(
       },
     },
   );
-  return {
-    allowed: Boolean(data?.allowed),
-    status: String(
-      data?.usage?.BillingStatus || data?.usage?.billingStatus || "",
-    ),
-    requiredUnits: Number(
-      data?.requiredUnits ||
-        data?.usage?.ChargeUnits ||
-        data?.usage?.chargeUnits ||
-        0,
-    ),
-    availableUnits: Number(
-      data?.availableUnits ||
-        data?.usage?.AvailableUnits ||
-        data?.usage?.availableUnits ||
-        0,
-    ),
-  };
+  return billingChargeResultFromData(data, {
+    provider: params.provider,
+    model: params.model,
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    actualCostMicros: params.actualCostMicros,
+  });
 }
 
 function resolveOpenClawStateDir(): string {
@@ -2832,24 +2926,13 @@ async function chargeLanguageModelOutputUsage(
       idempotencyKey,
     },
   );
-  return {
-    allowed: Boolean(data?.allowed),
-    status: String(
-      data?.usage?.BillingStatus || data?.usage?.billingStatus || "",
-    ),
-    requiredUnits: Number(
-      data?.requiredUnits ||
-        data?.usage?.ChargeUnits ||
-        data?.usage?.chargeUnits ||
-        0,
-    ),
-    availableUnits: Number(
-      data?.availableUnits ||
-        data?.usage?.AvailableUnits ||
-        data?.usage?.availableUnits ||
-        0,
-    ),
-  };
+  return billingChargeResultFromData(data, {
+    provider: usage?.provider,
+    model: usage?.model,
+    inputTokens: usage?.inputTokens,
+    outputTokens: usage?.outputTokens,
+    actualCostMicros,
+  });
 }
 
 async function checkLanguageModelOutputPreflight(
@@ -2897,27 +2980,9 @@ async function checkLanguageModelOutputPreflight(
       },
     },
   );
-  return {
-    allowed: Boolean(data?.allowed),
-    status: String(
-      data?.status ||
-        data?.usage?.BillingStatus ||
-        data?.usage?.billingStatus ||
-        "",
-    ),
-    requiredUnits: Number(
-      data?.requiredUnits ||
-        data?.usage?.ChargeUnits ||
-        data?.usage?.chargeUnits ||
-        minimumUnits,
-    ),
-    availableUnits: Number(
-      data?.availableUnits ||
-        data?.usage?.AvailableUnits ||
-        data?.usage?.availableUnits ||
-        0,
-    ),
-  };
+  return billingChargeResultFromData(data, {
+    requiredUnits: minimumUnits,
+  });
 }
 
 async function checkAgentSubscriptionPreflight(
@@ -4394,6 +4459,456 @@ async function sendClassifiedReplyFromInbound(
     voice,
   });
   return true;
+}
+
+export async function processOpenPlatformMessage(
+  api: any,
+  client: OpenIMClientState,
+  params: OpenPlatformMessageParams,
+): Promise<OpenPlatformMessageResult> {
+  await ensureInfiaiReplyReady(api);
+  const runtime = api.runtime;
+  if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
+    throw new Error("runtime.channel.reply is not available");
+  }
+
+  const cfg = await resolveLatestGatewayConfig(
+    client.gatewayConfig ?? api.config,
+  );
+  const accountId = String(params.accountId || client.config.accountId || "")
+    .trim();
+  const accEntry = cfg?.channels?.infiai?.accounts?.[accountId];
+  if (!accEntry || accEntry.enabled === false) {
+    throw new Error(`Infiai account is disabled or missing: ${accountId}`);
+  }
+  const bindingAgentId = resolveInfiaiAgentIdForAccount(cfg, accountId);
+  if (!bindingAgentId) {
+    throw new Error(`Infiai account has no bound OpenClaw agent: ${accountId}`);
+  }
+
+  const selfUid = String(client.config.userID || params.ownerUserID || "").trim();
+  const sourceUserID = normalizeString(params.sourceUserID);
+  if (!selfUid) throw new Error("missing owner user id");
+  if (!sourceUserID) throw new Error("missing source user id");
+
+  const peerSessionKey = `infiai:open:${accountId}:${sourceUserID}:${normalizeString(params.conversationID) || "default"}`.toLowerCase();
+  const route = runtime.channel.routing?.resolveAgentRoute?.({
+    cfg,
+    sessionKey: peerSessionKey,
+    channel: "infiai",
+    accountId,
+  }) ?? {
+    agentId: bindingAgentId,
+    sessionKey: buildAgentScopedSessionKey(bindingAgentId, peerSessionKey),
+  };
+  const matchedBy =
+    route && typeof route === "object" && "matchedBy" in route
+      ? String((route as { matchedBy?: string }).matchedBy ?? "").trim()
+      : "";
+  const routeAgentId = String(route?.agentId ?? bindingAgentId);
+  const executionAgentId =
+    matchedBy === "default" && bindingAgentId ? bindingAgentId : routeAgentId;
+  const businessAgentID =
+    normalizeRuntimeAgentIDToBusinessAgentID(executionAgentId, selfUid) ||
+    normalizeString(params.agentID) ||
+    executionAgentId;
+  const sessionKey = buildAgentScopedSessionKey(
+    executionAgentId,
+    peerSessionKey,
+  );
+  const timestamp = Number(params.occurredAt || Date.now()) || Date.now();
+  const messageID = normalizeString(params.messageID) || `open-${Date.now()}`;
+  const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(
+    cfg,
+    executionAgentId,
+  );
+  const effectiveSessionKey = sessionContinuityEnabled
+    ? sessionKey
+    : `${sessionKey}:ephemeral:${messageID || timestamp}`;
+  const billingMessage = buildOpenPlatformBillingMessage(params, messageID);
+  const timings: NonNullable<OpenPlatformMessageResult["timings"]> = {};
+  const usage: NonNullable<OpenPlatformMessageResult["usage"]> = {};
+  const billingSummary: NonNullable<OpenPlatformMessageResult["billing"]> = {
+    usageEventIds: [],
+    chargeUnits: 0,
+    billingStatus: "",
+    allowed: true,
+  };
+  const warnings: string[] = [];
+  const recordBillingCharge = (charged: BillingChargeResult | null | undefined) => {
+    if (!charged) return;
+    billingSummary.allowed = billingSummary.allowed !== false && charged.allowed;
+    if (charged.status) billingSummary.billingStatus = charged.status;
+    if (charged.usageEventID) {
+      billingSummary.usageEventIds = [
+        ...(billingSummary.usageEventIds || []),
+        charged.usageEventID,
+      ];
+    }
+    if (Number.isFinite(Number(charged.chargeUnits))) {
+      billingSummary.chargeUnits =
+        Number(billingSummary.chargeUnits || 0) + Number(charged.chargeUnits || 0);
+    }
+    usage.provider = charged.provider || usage.provider;
+    usage.model = charged.model || usage.model;
+    usage.inputTokens = charged.inputTokens || usage.inputTokens || 0;
+    usage.outputTokens = charged.outputTokens || usage.outputTokens || 0;
+    usage.actualCostMicros =
+      charged.actualCostMicros || usage.actualCostMicros || 0;
+  };
+
+  let staged: StagedInboundMedia | null = null;
+  let imageUnderstanding = "";
+  let rawBody = normalizeString(params.text) || "";
+  let images: ImagePart[] = [];
+  try {
+    try {
+      const billingStartedAt = Date.now();
+      const billing = await checkLanguageModelOutputPreflight(
+        client,
+        billingMessage,
+        {
+          payerUserID: selfUid,
+          actorUserID: sourceUserID,
+          agentID: businessAgentID,
+          conversationID: effectiveSessionKey,
+        },
+      );
+      timings.billingMs = Number(timings.billingMs || 0) + (Date.now() - billingStartedAt);
+      recordBillingCharge(billing);
+      if (!billing.allowed) {
+        throw new Error(
+          `insufficient billing balance: status=${billing.status || "unknown"} required=${billing.requiredUnits || 0} available=${billing.availableUnits || 0}`,
+        );
+      }
+    } catch (err) {
+      api.logger?.warn?.(
+        `[infiai] open platform billing preflight failed: accountId=${accountId} agent=${businessAgentID} messageID=${messageID} error=${formatSdkError(err)}`,
+      );
+      throw err;
+    }
+
+    if (params.messageType === "image") {
+      const imageURL = normalizeString(params.imageURL);
+      if (!imageURL) throw new Error("imageURL is required");
+      const imageStartedAt = Date.now();
+      staged = await materializeInboundMedia(client, [
+        { kind: "image", url: imageURL },
+      ]);
+      images = staged.images;
+      const imageText = await extractImageTextViaKBExtractor(staged, [
+        { kind: "image", url: imageURL },
+      ]);
+      timings.imageUnderstandingMs = Date.now() - imageStartedAt;
+      imageUnderstanding = imageText.body;
+      rawBody =
+        imageUnderstanding ||
+        [
+          "[Image]",
+          "The user sent an image, but image understanding returned no readable text.",
+          imageURL,
+        ].join("\n");
+      for (const warning of [...staged.warnings, ...imageText.warnings]) {
+        warnings.push(warning);
+        api.logger?.warn?.(
+          `[infiai] open platform image understanding warning: ${warning}`,
+        );
+      }
+      if (imageText.extractedCount > 0) {
+        try {
+          const billingStartedAt = Date.now();
+          const charged = await chargeInboundMediaUsage(
+            client,
+            billingMessage,
+            {
+              payerUserID: selfUid,
+              actorUserID: sourceUserID,
+              agentID: businessAgentID,
+              conversationID: effectiveSessionKey,
+              chargeCode: "image_understanding",
+              module: "media_image",
+              quantity: imageText.extractedCount,
+              allowOverdraft: true,
+            },
+          );
+          timings.billingMs =
+            Number(timings.billingMs || 0) + (Date.now() - billingStartedAt);
+          recordBillingCharge(charged);
+          if (!charged.allowed) {
+            throw new Error(
+              `image usage charge denied: status=${charged.status || "unknown"} required=${charged.requiredUnits || 0} available=${charged.availableUnits || 0}`,
+            );
+          }
+        } catch (err) {
+          api.logger?.warn?.(
+            `[infiai] open platform image usage charge failed: accountId=${accountId} agent=${businessAgentID} messageID=${messageID} error=${formatSdkError(err)}`,
+          );
+          throw err;
+        }
+      }
+    }
+
+    if (!rawBody.trim()) throw new Error("message body is empty");
+    const sourceUserName =
+      normalizeString(params.sourceUserName) ||
+      normalizeString(params.sourceUserMaskedID) ||
+      "开放接入用户";
+    const currentAgentName = getAgentDisplayName(cfg, businessAgentID);
+    const body = buildTextEnvelope(
+      runtime,
+      cfg,
+      sourceUserName,
+      sourceUserID,
+      selfUid,
+      timestamp,
+      rawBody,
+      "direct",
+      false,
+      {
+        currentUserName: sourceUserName,
+        currentAgentName,
+      },
+    );
+
+    let longTermMemoryContextText = "";
+    try {
+      const memoryStartedAt = Date.now();
+      const contextResult = await fetchInfiaiLongTermMemoryContext(client, {
+        ownerUserID: selfUid,
+        agentID: businessAgentID,
+        sourceUserID,
+        sourceUserName,
+        conversationType: "direct",
+        conversationID: effectiveSessionKey,
+        messageID,
+        query: rawBody,
+      });
+      timings.memoryContextMs = Date.now() - memoryStartedAt;
+      longTermMemoryContextText = contextResult.contextText || "";
+    } catch (err) {
+      warnings.push("memory_context_failed");
+      api.logger?.warn?.(
+        `[infiai] open platform memory context failed open: accountId=${accountId} agent=${businessAgentID} messageID=${params.messageID || ""} error=${formatSdkError(err)}`,
+      );
+    }
+
+    const bodyForAgent = appendLongTermMemoryContextToBodyForAgent(
+      body,
+      longTermMemoryContextText,
+    );
+    const ctxPayload = {
+      Body: body,
+      BodyForAgent: bodyForAgent,
+      RawBody: rawBody,
+      InfiaiContext: {
+        actorRole: "visitor",
+        ownerAuthorized: false,
+        socialTools: "denied",
+        denialReason: "owner_only",
+        currentChatType: "direct",
+        currentUserID: sourceUserID,
+        currentUserName: sourceUserName,
+        currentAgentName,
+      },
+      From: `infiai:open:${accountId}:${sourceUserID}`,
+      To: `infiai:${client.config.userID}`,
+      SessionKey: effectiveSessionKey,
+      AccountId: accountId,
+      ChatType: "direct",
+      ConversationLabel: sourceUserName,
+      SenderName: sourceUserName,
+      SenderId: sourceUserID,
+      Provider: "infiai",
+      Surface: "infiai_open_platform",
+      MessageSid: messageID,
+      Timestamp: timestamp,
+      OriginatingChannel: "infiai_open_platform",
+      OriginatingTo: `open:${sourceUserID}`,
+      CommandAuthorized: false,
+      ...(staged?.paths?.length
+        ? {
+            MediaPath: staged.paths[0],
+            MediaPaths: staged.paths,
+            MediaWorkspaceDir: staged.workspaceDir,
+            MediaUrl: staged.urls[0],
+            MediaType: staged.types[0],
+            MediaUrls: staged.urls,
+            MediaTypes: staged.types,
+          }
+        : {}),
+      _infiai: {
+        accountId,
+        managedUserId: selfUid,
+        messageSid: messageID,
+        isGroup: false,
+        senderId: sourceUserID,
+        conversationId: effectiveSessionKey,
+        messageKind: params.messageType,
+        source: "open_platform",
+        mediaCount: params.messageType === "image" ? 1 : 0,
+        imageUnderstandingCount: imageUnderstanding ? 1 : 0,
+        sessionContinuityEnabled,
+      },
+    };
+
+    const storePath =
+      runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
+        agentId: executionAgentId,
+      }) ?? "";
+    if (
+      sessionContinuityEnabled &&
+      runtime.channel.session?.recordInboundSession
+    ) {
+      await runtime.channel.session.recordInboundSession({
+        storePath,
+        sessionKey: effectiveSessionKey,
+        ctx: ctxPayload,
+        updateLastRoute: {
+          sessionKey: effectiveSessionKey,
+          channel: "infiai",
+          to: sourceUserID,
+          accountId,
+        },
+        onRecordError: (err: unknown) =>
+          api.logger?.warn?.(
+            `[infiai] open platform recordInboundSession: ${String(err)}`,
+          ),
+      });
+    }
+
+    const replies: string[] = [];
+    const llmDispatchStartedAt = Date.now();
+    await withInfiaiToolContext(
+      {
+        accountId,
+        managedUserId: selfUid,
+        senderId: sourceUserID,
+        agentId: executionAgentId,
+        sessionKey: effectiveSessionKey,
+        ownerAuthorized: false,
+        source: "open_platform",
+      },
+      async () =>
+        runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx: ctxPayload,
+          cfg,
+          dispatcherOptions: {
+            deliver: async (payload: { text?: string }) => {
+              if (!payload.text) return;
+              const localized = localizeOpenClawReply(payload.text);
+              const cleaned = normalizeManagedChatReply(
+                normalizeInfiaiReplyFormatting(
+                  stripInfiaiReplyArtifacts(
+                    stripVisibleReasoningPreamble(localized),
+                  ),
+                ),
+                { userText: rawBody },
+              );
+              if (
+                isLocalizedFailureReply(payload.text, localized) ||
+                isNoReplyMetaReply(payload.text) ||
+                isNoReplyMetaReply(cleaned) ||
+                isNonConversationalSystemReply(cleaned) ||
+                isLikelyToolProgressOnlyReply(cleaned) ||
+                !cleaned.trim()
+              ) {
+                return;
+              }
+              replies.push(cleaned);
+            },
+            onError: (err: unknown, info: { kind?: string }) => {
+              api.logger?.warn?.(
+                `[infiai] open platform dispatch error: kind=${info?.kind || "reply"} error=${String(err)}`,
+              );
+            },
+          },
+          replyOptions: {
+            disableBlockStreaming: true,
+            images,
+          },
+        }),
+    );
+    timings.llmMs = Date.now() - llmDispatchStartedAt;
+
+    const replyText = replies.join("\n").trim();
+    if (!replyText) throw new Error("assistant reply is empty");
+    try {
+      const billingStartedAt = Date.now();
+      const charged = await chargeLanguageModelOutputUsage(
+        client,
+        billingMessage,
+        {
+          payerUserID: selfUid,
+          actorUserID: sourceUserID,
+          agentID: businessAgentID,
+          conversationID: effectiveSessionKey,
+          storePath,
+          dispatchStartedAtMs: llmDispatchStartedAt,
+          allowOverdraft: true,
+        },
+      );
+      timings.billingMs =
+        Number(timings.billingMs || 0) + (Date.now() - billingStartedAt);
+      recordBillingCharge(charged);
+      if (!charged.allowed) {
+        api.logger?.warn?.(
+          `[infiai] open platform language model output usage not charged: status=${charged.status || "unknown"} payer=${selfUid} required=${charged.requiredUnits || 0} available=${charged.availableUnits || 0} messageID=${messageID}`,
+        );
+      }
+    } catch (err) {
+      warnings.push("llm_usage_report_failed");
+      api.logger?.warn?.(
+        `[infiai] open platform language model output usage report failed: accountId=${accountId} agent=${businessAgentID} messageID=${messageID} error=${formatSdkError(err)}`,
+      );
+    }
+    if (
+      shouldSubmitInfiaiMemoryIngest({
+        sent: true,
+        messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+        userText: rawBody,
+        assistantText: replyText,
+        dispatchedFailureReply: false,
+        sentNoVisibleFallbackReply: false,
+      })
+    ) {
+      const memoryIngestStartedAt = Date.now();
+      await submitInfiaiLongTermMemoryIngest(client, {
+        ownerUserID: selfUid,
+        agentID: businessAgentID,
+        sourceUserID,
+        sourceUserName,
+        conversationType: "direct",
+        conversationID: effectiveSessionKey,
+        messageID,
+        userMessageID: messageID,
+        replyMessageID: "",
+        messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+        userText: rawBody,
+        assistantText: replyText,
+        occurredAt: timestamp,
+      }).catch((err) => {
+        warnings.push("memory_ingest_failed");
+        api.logger?.warn?.(
+          `[infiai] open platform memory ingest failed open: accountId=${accountId} agent=${businessAgentID} messageID=${params.messageID || ""} error=${formatSdkError(err)}`,
+        );
+        return null;
+      });
+      timings.memoryIngestMs = Date.now() - memoryIngestStartedAt;
+    }
+    return {
+      replyType: "text",
+      replyText,
+      usage,
+      billing: {
+        ...billingSummary,
+        usageEventIds: Array.from(new Set(billingSummary.usageEventIds || [])),
+      },
+      timings,
+      warnings: Array.from(new Set(warnings)),
+    };
+  } finally {
+    if (staged) await cleanupStagedInboundMedia(staged);
+  }
 }
 
 export async function processInboundMessage(
