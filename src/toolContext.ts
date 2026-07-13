@@ -7,7 +7,7 @@ export interface InfiaiToolContext {
   agentId: string;
   sessionKey: string;
   ownerAuthorized: boolean;
-  source: "inbound" | "open_platform";
+  source: "inbound" | "open_platform" | "voice_call";
 }
 
 const storage = new AsyncLocalStorage<InfiaiToolContext>();

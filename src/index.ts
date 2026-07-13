@@ -9,7 +9,12 @@ import "./polyfills";
 import { OpenIMChannelPlugin } from "./channel";
 import { getConnectedClient, startAccountClient, stopAllClients } from "./clients";
 import { listEnabledAccountConfigs } from "./config";
-import { processOpenPlatformMessage } from "./inbound";
+import {
+  cancelVoiceCallTurn,
+  processOpenPlatformMessage,
+  processVoiceCallTurn,
+  warmVoiceCallContext,
+} from "./inbound";
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
 
@@ -72,6 +77,81 @@ function registerOpenPlatformGateway(api: any): void {
   api.logger?.warn?.("[infiai] open platform gateway method API unavailable; /open/v1/message will fail until the runtime exposes plugin RPC registration");
 }
 
+function registerVoiceCallGateway(api: any): void {
+  const turnHandler = async (input: any) => {
+    const params = resolveGatewayRequestParams(input);
+    const accountId = String(params?.accountId || "").trim();
+    const client = getConnectedClient(accountId || undefined);
+    if (!client) {
+      throw new Error(accountId ? `Infiai account is not connected: ${accountId}` : "Infiai account is not connected");
+    }
+    return processVoiceCallTurn(api, client, params);
+  };
+  const cancelHandler = async (input: any) =>
+    cancelVoiceCallTurn(resolveGatewayRequestParams(input));
+  const warmupHandler = async (input: any) => {
+    const params = resolveGatewayRequestParams(input);
+    const accountId = String(params?.accountId || "").trim();
+    const client = getConnectedClient(accountId || undefined);
+    if (!client) {
+      throw new Error(
+        accountId
+          ? `Infiai account is not connected: ${accountId}`
+          : "Infiai account is not connected"
+      );
+    }
+    return warmVoiceCallContext(client, params);
+  };
+  const registerMethod = (method: string, handler: (input: any) => Promise<any>): boolean => {
+    const registrations: Array<() => boolean> = [
+      () => {
+        if (typeof api.registerGatewayMethod !== "function") return false;
+        api.registerGatewayMethod(method, handler);
+        return true;
+      },
+      () => {
+        if (typeof api.registerRpc !== "function") return false;
+        api.registerRpc(method, handler);
+        return true;
+      },
+      () => {
+        if (typeof api.registerMethod !== "function") return false;
+        api.registerMethod(method, handler);
+        return true;
+      },
+      () => {
+        const gateway = api.runtime?.gateway;
+        if (!gateway || typeof gateway.registerMethod !== "function") return false;
+        gateway.registerMethod(method, handler);
+        return true;
+      },
+    ];
+    for (const register of registrations) {
+      try {
+        if (register()) return true;
+      } catch (err: any) {
+        api.logger?.warn?.(
+          `[infiai] ${method} registration failed: ${String(err?.message || err)}`
+        );
+      }
+    }
+    return false;
+  };
+  const turnRegistered = registerMethod("infiai.voice_call_turn", turnHandler);
+  const cancelRegistered = registerMethod("infiai.voice_call_cancel", cancelHandler);
+  const warmupRegistered = registerMethod(
+    "infiai.voice_call_warmup",
+    warmupHandler
+  );
+  if (turnRegistered && cancelRegistered && warmupRegistered) {
+    api.logger?.info?.("[infiai] voice call gateway methods registered");
+    return;
+  }
+  api.logger?.warn?.(
+    "[infiai] voice call gateway method API unavailable; AI voice calls will fail until the runtime exposes plugin RPC registration"
+  );
+}
+
 function registerCliMetadata(api: any): void {
   if (typeof api.registerCli !== "function") return;
   api.registerCli(
@@ -94,6 +174,7 @@ function registerFull(api: any): void {
 
   registerOpenIMTools(api);
   registerOpenPlatformGateway(api);
+  registerVoiceCallGateway(api);
 
   api.registerService({
     id: "infiai-sdk",
