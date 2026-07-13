@@ -5,15 +5,21 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  OPEN_PLATFORM_TURN_SURFACE,
+  VoiceCallReplyStream,
   appendLongTermMemoryContextToBodyForAgent,
+  voiceCallMemoryContextForTurn,
+  buildVoiceCallTurnSurface,
   buildTextEnvelope,
   buildInfiaiOriginatingTo,
   cloneConfigWithAgentPrimaryModel,
+  detachVoiceCallTurn,
   extractAssistantTextSnapshotFromSessionLine,
   inspectInfiaiSessionWorkspaceProjectionState,
   getInfiaiMessageKind,
   isAgnesFallbackTriggerText,
   isInfiaiSessionControlCommand,
+  isCallLifecycleCustomMessage,
   isManagedBotNonConversationalMessage,
   memoryGatewayTimeoutMs,
   parseAgentSubscriptionPreflightDecision,
@@ -25,6 +31,211 @@ import {
   shouldResetStaleSessionOnWorkspaceUpdate,
   shouldSuppressNoVisibleFallbackForAssistantText,
 } from "./inbound";
+
+test("detaches voice delivery without aborting the OpenClaw model run", () => {
+  const modelController = new AbortController();
+  const deliveryController = new AbortController();
+  assert.deepEqual(
+    detachVoiceCallTurn({ modelController, deliveryController }),
+    { cancelled: false, draining: true },
+  );
+  assert.equal(deliveryController.signal.aborted, true);
+  assert.equal(modelController.signal.aborted, false);
+});
+
+test("streams cumulative voice-call text as ordered deltas and complete speech segments", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalGatewayURL = process.env.VOICE_GATEWAY_INTERNAL_URL;
+  const originalSecret = process.env.OPENCLAW_SHARED_SECRET;
+  const events: Array<{ type: string; text: string; seq: number }> = [];
+  process.env.VOICE_GATEWAY_INTERNAL_URL = "http://voice-gateway:10008";
+  process.env.OPENCLAW_SHARED_SECRET = "test-secret";
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    events.push(JSON.parse(String(init?.body || "{}")));
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const stream = new VoiceCallReplyStream({
+      accountId: "acc_default__owner__default",
+      ownerUserID: "owner",
+      agentID: "default",
+      callerUserID: "caller",
+      subscriberUserID: "caller",
+      callID: "vc_test",
+      turnID: "vct_test",
+      text: "你好",
+      streamReply: true,
+    });
+    await stream.append("这是第一句。第二");
+    await stream.append("这是第一句。第二句，继续");
+    await stream.append("这是第一句。第二句，继续完成！");
+    await stream.finish("这是第一句。第二句，继续完成！");
+    assert.equal(
+      events.filter((event) => event.type === "delta").map((event) => event.text).join(""),
+      "这是第一句。第二句，继续完成！",
+    );
+    assert.deepEqual(
+      events.filter((event) => event.type === "segment").map((event) => event.text),
+      ["这是第一句。", "第二句，继续完成！"],
+    );
+    assert.deepEqual(
+      events.map((event) => event.seq),
+      [...events.keys()].map((index) => index + 1),
+    );
+    assert.equal(events.filter((event) => event.type === "final").length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalGatewayURL === undefined) delete process.env.VOICE_GATEWAY_INTERNAL_URL;
+    else process.env.VOICE_GATEWAY_INTERNAL_URL = originalGatewayURL;
+    if (originalSecret === undefined) delete process.env.OPENCLAW_SHARED_SECRET;
+    else process.env.OPENCLAW_SHARED_SECRET = originalSecret;
+  }
+});
+
+test("does not append rewritten partial snapshots into voice history or playback", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalGatewayURL = process.env.VOICE_GATEWAY_INTERNAL_URL;
+  const originalSecret = process.env.OPENCLAW_SHARED_SECRET;
+  const originalHoldback = process.env.INFIAI_VOICE_CALL_STREAM_HOLDBACK_CHARS;
+  const events: Array<{ type: string; text: string; seq: number }> = [];
+  process.env.VOICE_GATEWAY_INTERNAL_URL = "http://voice-gateway:10008";
+  process.env.OPENCLAW_SHARED_SECRET = "test-secret";
+  process.env.INFIAI_VOICE_CALL_STREAM_HOLDBACK_CHARS = "10";
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    events.push(JSON.parse(String(init?.body || "{}")));
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const stream = new VoiceCallReplyStream({
+      accountId: "acc_default__owner__default",
+      ownerUserID: "owner",
+      agentID: "default",
+      callerUserID: "caller",
+      subscriberUserID: "caller",
+      callID: "vc_rewrite",
+      turnID: "vct_rewrite",
+      text: "王玉林是谁",
+      streamReply: true,
+    });
+    await stream.append("知识库里有王玉林的信息，我直接告诉你");
+    await stream.append("根据知识库里的信息，王玉林是一位女士");
+    await stream.append("根据知识库里的信息，王玉林是一位女士，做数控机械。");
+    await stream.finish("根据知识库里的信息，王玉林是一位女士，做数控机械。");
+
+    const final = events.find((event) => event.type === "final");
+    assert.equal(final?.text, "根据知识库里的信息，王玉林是一位女士，做数控机械。");
+    assert.equal(stream.text, final?.text);
+    assert.equal(
+      events.filter((event) => event.type === "delta").map((event) => event.text).join(""),
+      "根据知识库里的信息，王玉林是一位女士，做数控机械。",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalGatewayURL === undefined) delete process.env.VOICE_GATEWAY_INTERNAL_URL;
+    else process.env.VOICE_GATEWAY_INTERNAL_URL = originalGatewayURL;
+    if (originalSecret === undefined) delete process.env.OPENCLAW_SHARED_SECRET;
+    else process.env.OPENCLAW_SHARED_SECRET = originalSecret;
+    if (originalHoldback === undefined) delete process.env.INFIAI_VOICE_CALL_STREAM_HOLDBACK_CHARS;
+    else process.env.INFIAI_VOICE_CALL_STREAM_HOLDBACK_CHARS = originalHoldback;
+  }
+});
+
+test("does not speak punctuation from a first unstable partial snapshot", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalGatewayURL = process.env.VOICE_GATEWAY_INTERNAL_URL;
+  const originalSecret = process.env.OPENCLAW_SHARED_SECRET;
+  const events: Array<{ type: string; text: string; seq: number }> = [];
+  process.env.VOICE_GATEWAY_INTERNAL_URL = "http://voice-gateway:10008";
+  process.env.OPENCLAW_SHARED_SECRET = "test-secret";
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    events.push(JSON.parse(String(init?.body || "{}")));
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const stream = new VoiceCallReplyStream({
+      accountId: "acc_default__owner__default",
+      ownerUserID: "owner",
+      agentID: "default",
+      callerUserID: "caller",
+      subscriberUserID: "caller",
+      callID: "vc_first_partial",
+      turnID: "vct_first_partial",
+      text: "你是谁",
+      streamReply: true,
+    });
+    await stream.append("我是旧音色。这句还会被改写。");
+    assert.equal(events.length, 0);
+    await stream.append("我是你的分身。这句才是稳定答案。");
+    assert.equal(events.length, 0);
+    await stream.finish("我是你的分身。这句才是稳定答案。");
+    assert.equal(
+      events.filter((event) => event.type === "segment").map((event) => event.text).join(""),
+      "我是你的分身。这句才是稳定答案。",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalGatewayURL === undefined) delete process.env.VOICE_GATEWAY_INTERNAL_URL;
+    else process.env.VOICE_GATEWAY_INTERNAL_URL = originalGatewayURL;
+    if (originalSecret === undefined) delete process.env.OPENCLAW_SHARED_SECRET;
+    else process.env.OPENCLAW_SHARED_SECRET = originalSecret;
+  }
+});
+
+test("keeps open-platform and internal voice-call turn policies isolated", () => {
+  assert.deepEqual(OPEN_PLATFORM_TURN_SURFACE, {
+    kind: "open_platform",
+    sessionNamespace: "open",
+    surface: "infiai_open_platform",
+    originatingToPrefix: "open",
+    defaultSourceName: "开放接入用户",
+    sourceMessageIDPrefix: "open-platform",
+  });
+  assert.equal("subscriberUserID" in OPEN_PLATFORM_TURN_SURFACE, false);
+  assert.equal("agentSubscriptionID" in OPEN_PLATFORM_TURN_SURFACE, false);
+
+  assert.deepEqual(
+    buildVoiceCallTurnSurface({
+      subscriberUserID: "caller-1",
+      agentSubscriptionID: "sub-1",
+    }),
+    {
+      kind: "voice_call",
+      sessionNamespace: "voice",
+      surface: "infiai_voice_call",
+      originatingToPrefix: "voice",
+      defaultSourceName: "语音来电用户",
+      sourceMessageIDPrefix: "voice-call",
+      subscriberUserID: "caller-1",
+      agentSubscriptionID: "sub-1",
+    },
+  );
+});
+
+test("never routes call signalling or summaries into managed-agent chat", () => {
+  for (const customType of [200, 201, 202, 203, 204, 206]) {
+    assert.equal(
+      isCallLifecycleCustomMessage({
+        contentType: 110,
+        customElem: { data: JSON.stringify({ customType, data: {} }) },
+      } as any),
+      true,
+    );
+  }
+  assert.equal(
+    isCallLifecycleCustomMessage({
+      contentType: 110,
+      customElem: { data: JSON.stringify({ customType: 205, data: {} }) },
+    } as any),
+    false,
+  );
+  assert.equal(
+    isCallLifecycleCustomMessage({
+      contentType: 110,
+      customElem: { data: JSON.stringify({ customType: 260, data: {} }) },
+    } as any),
+    false,
+  );
+});
 
 test("detects Agnes provider failures eligible for DeepSeek fallback", () => {
   assert.equal(
@@ -151,6 +362,12 @@ test("appends long-term memory context to agent body only once", () => {
   assert.match(once, /^\[Infiai Long-Term Memory Context\]/);
   assert.equal(appendLongTermMemoryContextToBodyForAgent(once, context), once);
   assert.equal(appendLongTermMemoryContextToBodyForAgent(body, ""), body);
+});
+
+test("injects long-term memory only on the first turn of a voice call session", () => {
+  const context = "[Infiai Long-Term Memory Context]\n- 用户喜欢科幻电影";
+  assert.equal(voiceCallMemoryContextForTurn(context, false), context);
+  assert.equal(voiceCallMemoryContextForTurn(context, true), "");
 });
 
 test("submits memory ingest only for visible assistant replies", () => {
