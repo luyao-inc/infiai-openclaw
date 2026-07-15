@@ -5,3 +5,6 @@ dist/
 .env
 .DS_Store
 .cline
+
+# Local GitNexus code index
+.gitnexus/

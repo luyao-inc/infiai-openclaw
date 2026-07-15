@@ -12,6 +12,7 @@ import { listEnabledAccountConfigs } from "./config";
 import {
   cancelVoiceCallTurn,
   processOpenPlatformMessage,
+  processOpenPlatformOutboundMessage,
   processVoiceCallTurn,
   warmVoiceCallContext,
 } from "./inbound";
@@ -41,26 +42,39 @@ function registerOpenPlatformGateway(api: any): void {
     }
     return processOpenPlatformMessage(api, client, params);
   };
+	const outboundHandler = async (input: any) => {
+		const params = resolveGatewayRequestParams(input);
+		const accountId = String(params?.accountId || "").trim();
+		const client = getConnectedClient(accountId || undefined);
+		if (!client) {
+			throw new Error(accountId ? `Infiai account is not connected: ${accountId}` : "Infiai account is not connected");
+		}
+		return processOpenPlatformOutboundMessage(api, client, params);
+	};
   const registrations: Array<() => boolean> = [
     () => {
       if (typeof api.registerGatewayMethod !== "function") return false;
       api.registerGatewayMethod("infiai.open_platform_message", handler);
+			api.registerGatewayMethod("infiai.open_platform_outbound_message", outboundHandler);
       return true;
     },
     () => {
       if (typeof api.registerRpc !== "function") return false;
       api.registerRpc("infiai.open_platform_message", handler);
+			api.registerRpc("infiai.open_platform_outbound_message", outboundHandler);
       return true;
     },
     () => {
       if (typeof api.registerMethod !== "function") return false;
       api.registerMethod("infiai.open_platform_message", handler);
+			api.registerMethod("infiai.open_platform_outbound_message", outboundHandler);
       return true;
     },
     () => {
       const gateway = api.runtime?.gateway;
       if (!gateway || typeof gateway.registerMethod !== "function") return false;
       gateway.registerMethod("infiai.open_platform_message", handler);
+			gateway.registerMethod("infiai.open_platform_outbound_message", outboundHandler);
       return true;
     },
   ];
