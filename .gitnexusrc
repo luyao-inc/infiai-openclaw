@@ -1,0 +1,8 @@
+{
+  "name": "infiai-openclaw",
+  "defaultBranch": "dev-echo",
+  "indexOnly": true,
+  "embeddings": true,
+  "workerTimeout": 60,
+  "workers": 4
+}
