@@ -1386,44 +1386,7 @@ const TOOL_PROGRESS_ONLY_FALLBACK_REPLY =
 const GROUP_MENTION_SILENT_FALLBACK_REPLY = "我在，想聊什么？";
 const IMAGE_UNDERSTANDING_FAILED_REPLY =
   "这张图片暂时无法完成理解，请稍后重试或换一张图片。";
-const DEFAULT_AGNES_FALLBACK_MODEL = "deepseek/deepseek-v4-flash";
-
-function isAgnesRuntimeModel(model: string): boolean {
-  const s = String(model || "")
-    .trim()
-    .toLowerCase();
-  return s.startsWith("agnes/") || s.startsWith("agnes-");
-}
-
-function isDeepSeekRuntimeModel(model: string): boolean {
-  const s = String(model || "")
-    .trim()
-    .toLowerCase();
-  return s.startsWith("deepseek/") || s.startsWith("deepseek-");
-}
-
-export function resolveAgnesFallbackModel(): string {
-  return (
-    String(process.env.OPENCLAW_AGNES_FALLBACK_MODEL || "").trim() ||
-    DEFAULT_AGNES_FALLBACK_MODEL
-  );
-}
-
-export function isAgnesFallbackEnabled(): boolean {
-  const raw = String(process.env.OPENCLAW_AGNES_FALLBACK_ENABLED || "")
-    .trim()
-    .toLowerCase();
-  return raw !== "false" && raw !== "0" && raw !== "off" && raw !== "no";
-}
-
-function hasAgnesFallbackModelCredentials(model: string): boolean {
-  if (isDeepSeekRuntimeModel(model)) {
-    return Boolean(String(process.env.DEEPSEEK_API_KEY || "").trim());
-  }
-  return true;
-}
-
-export function isAgnesFallbackTriggerText(text: unknown): boolean {
+export function isProviderUnavailableText(text: unknown): boolean {
   const s = String(text ?? "");
   if (!s.trim()) return false;
   return /(?:\b429\b|rate[-\s_]?limit(?:ed)?|cooldown|temporar(?:ily|y)\s+(?:unavailable|rate[-\s_]?limited)|provider\s+(?:unavailable|cooldown)|all\s+models\s+(?:are\s+temporarily\s+rate[-\s_]?limited|failed)|ready\s+in\s+~?\d+\s*s)/i.test(
@@ -1451,34 +1414,6 @@ function getAgentDisplayName(cfg: any, agentId: string): string {
   );
 }
 
-export function cloneConfigWithAgentPrimaryModel(
-  cfg: any,
-  agentId: string,
-  model: string
-): any {
-  const next = structuredClone(cfg);
-  next.agents =
-    next.agents && typeof next.agents === "object" ? next.agents : {};
-  next.agents.list = Array.isArray(next.agents.list) ? next.agents.list : [];
-  const target = String(agentId || "");
-  let updated = false;
-  next.agents.list = next.agents.list.map((entry: any) => {
-    if (!entry || String(entry.id ?? "") !== target) return entry;
-    updated = true;
-    return {
-      ...entry,
-      model: {
-        ...(entry.model && typeof entry.model === "object" ? entry.model : {}),
-        primary: model,
-      },
-    };
-  });
-  if (!updated && target) {
-    next.agents.list.push({ id: target, model: { primary: model } });
-  }
-  return next;
-}
-
 function localizeOpenClawReply(text: string): string {
   const s = String(text ?? "");
   if (
@@ -1492,7 +1427,7 @@ function localizeOpenClawReply(text: string): string {
     /Something went wrong while processing your request|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|Message failed|midstream error|invalid params|tool result's tool id/i.test(
       s
     ) ||
-    isAgnesFallbackTriggerText(s)
+    isProviderUnavailableText(s)
   ) {
     return GENERIC_MODEL_FAILURE_REPLY;
   }
@@ -2879,12 +2814,6 @@ function estimateLanguageModelCostUSD(
       costUSD:
         (cacheRead * 0.0028 + cacheMissInput * 0.14 + output * 0.28) / 1000000,
       costSource: "deepseek_official_v4_flash_usd_2026_06",
-    };
-  }
-  if (name.includes("agnes")) {
-    return {
-      costUSD: (cacheMissInput * 0.1 + output * 0.2) / 1000000,
-      costSource: "agnes_2_flash_price_user_provided_2026_06",
     };
   }
   return { costUSD: 0, costSource: "missing_model_price" };
@@ -6925,22 +6854,9 @@ export async function processInboundMessage(
         })
       : null;
   const primaryModel = getAgentPrimaryModel(cfg, executionAgentId);
-  const agnesFallbackModel = resolveAgnesFallbackModel();
-  const agnesFallbackReady =
-    isAgnesFallbackEnabled() &&
-    isAgnesRuntimeModel(primaryModel) &&
-    agnesFallbackModel &&
-    agnesFallbackModel !== primaryModel &&
-    hasAgnesFallbackModelCredentials(agnesFallbackModel);
-  let agnesFallbackAttempted = false;
-  let primaryModelFailureText = "";
   await setInboundTypingState(client, msg, true);
   try {
-    const runDispatchAttempt = async (
-      attemptCfg: any,
-      attemptModel: string,
-      attempt: "primary" | "agnes_fallback"
-    ): Promise<void> => {
+    const runDispatch = async (): Promise<void> => {
       await withInfiaiToolContext(
         {
           accountId: client.config.accountId,
@@ -6954,13 +6870,11 @@ export async function processInboundMessage(
         async () =>
           runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
-            cfg: attemptCfg,
+            cfg,
             dispatcherOptions: {
               deliver: async (payload: { text?: string }) => {
                 infiaiConsoleDebug(
-                  `[infiai] deliver called: attempt=${attempt}, model=${
-                    attemptModel || "-"
-                  }, group=${group}, hasText=${!!payload.text}, textLen=${
+                  `[infiai] deliver called: model=${primaryModel || "-"}, group=${group}, hasText=${!!payload.text}, textLen=${
                     payload.text?.length || 0
                   }, contentLen=${
                     typeof payload.text === "string"
@@ -6994,21 +6908,6 @@ export async function processInboundMessage(
                   ),
                   { userText: rawBody }
                 );
-                if (
-                  attempt === "primary" &&
-                  agnesFallbackReady &&
-                  isLocalizedFailureReply(payload.text, localized) &&
-                  isAgnesFallbackTriggerText(payload.text)
-                ) {
-                  primaryModelFailureText = payload.text;
-                  infiaiConsoleDebug(
-                    `[infiai] Agnes model failure captured for fallback: from=${primaryModel}, to=${agnesFallbackModel}, raw="${payload.text.slice(
-                      0,
-                      200
-                    )}", clientMsgID=${msg.clientMsgID || "-"}`
-                  );
-                  return;
-                }
                 if (
                   isNoReplyMetaReply(payload.text) ||
                   isNoReplyMetaReply(cleaned)
@@ -7052,9 +6951,7 @@ export async function processInboundMessage(
                   return;
                 }
                 infiaiConsoleDebug(
-                  `[infiai] deliver cleaned: attempt=${attempt}, len=${
-                    cleaned.length
-                  }, preview="${cleaned.slice(0, 100)}"`
+                  `[infiai] deliver cleaned: len=${cleaned.length}, preview="${cleaned.slice(0, 100)}"`
                 );
                 try {
                   const isFailureReply = isLocalizedFailureReply(
@@ -7173,7 +7070,7 @@ export async function processInboundMessage(
                   infiaiConsoleDebug(
                     `[infiai] deliver ${
                       sent ? "OK" : "SUPPRESSED"
-                    }: attempt=${attempt}, group=${group}, clientMsgID=${
+                    }: group=${group}, clientMsgID=${
                       msg.clientMsgID || "-"
                     }`
                   );
@@ -7183,15 +7080,8 @@ export async function processInboundMessage(
               },
               onError: (err: unknown, info: { kind?: string }) => {
                 const errText = String(err);
-                if (
-                  attempt === "primary" &&
-                  agnesFallbackReady &&
-                  isAgnesFallbackTriggerText(errText)
-                ) {
-                  primaryModelFailureText = errText;
-                }
                 console.warn(
-                  `[infiai] dispatch onError: attempt=${attempt}, kind=${
+                  `[infiai] dispatch onError: kind=${
                     info?.kind || "reply"
                   }, err=${errText}`
                 );
@@ -7205,51 +7095,7 @@ export async function processInboundMessage(
       );
     };
 
-    let primaryDispatchError: unknown = null;
-    try {
-      await runDispatchAttempt(cfg, primaryModel, "primary");
-    } catch (err) {
-      primaryDispatchError = err;
-      const errText = formatSdkError(err);
-      if (agnesFallbackReady && isAgnesFallbackTriggerText(errText)) {
-        primaryModelFailureText = errText;
-      }
-    }
-
-    if (
-      agnesFallbackReady &&
-      primaryModelFailureText &&
-      !deliveredVisibleReply &&
-      !agnesFallbackAttempted
-    ) {
-      agnesFallbackAttempted = true;
-      suppressedNoReplyMetaReply = false;
-      suppressedProgressOnlyReply = false;
-      dispatchedFailureReply = false;
-      api.logger?.warn?.(
-        `[infiai] Agnes model failure fallback: from=${primaryModel} to=${agnesFallbackModel} accountId=${
-          client.config.accountId
-        } agentId=${executionAgentId} clientMsgID=${
-          msg.clientMsgID || ""
-        } reason=${primaryModelFailureText.slice(0, 300)}`
-      );
-      const fallbackCfg = cloneConfigWithAgentPrimaryModel(
-        cfg,
-        executionAgentId,
-        agnesFallbackModel
-      );
-      await runDispatchAttempt(
-        fallbackCfg,
-        agnesFallbackModel,
-        "agnes_fallback"
-      );
-    } else if (primaryDispatchError) {
-      throw primaryDispatchError;
-    }
-
-    if (primaryDispatchError && !agnesFallbackAttempted) {
-      throw primaryDispatchError;
-    }
+    await runDispatch();
     if (
       voiceReplyAccumulator &&
       voiceReplyAccumulator.text &&
