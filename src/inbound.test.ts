@@ -13,12 +13,11 @@ import {
   buildVoiceCallTurnSurface,
   buildTextEnvelope,
   buildInfiaiOriginatingTo,
-  cloneConfigWithAgentPrimaryModel,
   detachVoiceCallTurn,
   extractAssistantTextSnapshotFromSessionLine,
   inspectInfiaiSessionWorkspaceProjectionState,
   getInfiaiMessageKind,
-  isAgnesFallbackTriggerText,
+  isProviderUnavailableText,
   isInfiaiSessionControlCommand,
   isCallLifecycleCustomMessage,
   isManagedBotNonConversationalMessage,
@@ -26,7 +25,6 @@ import {
   parseAgentSubscriptionPreflightDecision,
   resetInfiaiSessionIfWorkspaceProjectionChanged,
   resetInfiaiSessionStoreEntry,
-  resolveAgnesFallbackModel,
   resolveNoVisibleFallbackReply,
   shouldSubmitInfiaiMemoryIngest,
   shouldResetStaleSessionOnWorkspaceUpdate,
@@ -298,50 +296,21 @@ test("never routes call signalling or summaries into managed-agent chat", () => 
   );
 });
 
-test("detects Agnes provider failures eligible for DeepSeek fallback", () => {
+test("detects provider-unavailable responses for localized failure handling", () => {
   assert.equal(
-    isAgnesFallbackTriggerText(
+    isProviderUnavailableText(
       "All models are temporarily rate-limited. Please try again in a few minutes.",
     ),
     true,
   );
   assert.equal(
-    isAgnesFallbackTriggerText(
+    isProviderUnavailableText(
       "Rate-limited — ready in ~23s. Please wait a moment.",
     ),
     true,
   );
-  assert.equal(isAgnesFallbackTriggerText("HTTP 429 provider cooldown"), true);
-  assert.equal(isAgnesFallbackTriggerText("这是一条正常回复"), false);
-});
-
-test("resolves Agnes fallback model default and env override", () => {
-  const original = process.env.OPENCLAW_AGNES_FALLBACK_MODEL;
-  delete process.env.OPENCLAW_AGNES_FALLBACK_MODEL;
-  assert.equal(resolveAgnesFallbackModel(), "deepseek/deepseek-v4-flash");
-  process.env.OPENCLAW_AGNES_FALLBACK_MODEL = "deepseek/deepseek-chat";
-  assert.equal(resolveAgnesFallbackModel(), "deepseek/deepseek-chat");
-  if (original === undefined) delete process.env.OPENCLAW_AGNES_FALLBACK_MODEL;
-  else process.env.OPENCLAW_AGNES_FALLBACK_MODEL = original;
-});
-
-test("clones config with per-agent fallback primary model only", () => {
-  const cfg = {
-    agents: {
-      list: [
-        { id: "a1", model: { primary: "agnes/agnes-2.0-flash" } },
-        { id: "a2", model: { primary: "deepseek/deepseek-v4-flash" } },
-      ],
-    },
-  };
-  const next = cloneConfigWithAgentPrimaryModel(
-    cfg,
-    "a1",
-    "deepseek/deepseek-v4-flash",
-  );
-  assert.equal(next.agents.list[0].model.primary, "deepseek/deepseek-v4-flash");
-  assert.equal(next.agents.list[1].model.primary, "deepseek/deepseek-v4-flash");
-  assert.equal(cfg.agents.list[0].model.primary, "agnes/agnes-2.0-flash");
+  assert.equal(isProviderUnavailableText("HTTP 429 provider cooldown"), true);
+  assert.equal(isProviderUnavailableText("这是一条正常回复"), false);
 });
 
 test("parses Infiai structured message kind from nested message ex", () => {
