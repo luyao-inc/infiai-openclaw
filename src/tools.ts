@@ -9,6 +9,31 @@ import { parseTarget } from "./targets";
 import { getInfiaiToolContext } from "./toolContext";
 import { formatSdkError, infiaiDebug } from "./utils";
 
+export type SocialToolAuthorizationContext = {
+  accountId: string;
+  ownerAuthorized: boolean;
+};
+
+export function authorizeInfiaiSocialTool(
+  context: SocialToolAuthorizationContext | null,
+  accountId?: string,
+  taskID?: string,
+): { ok: true } | { ok: false; reason: string } {
+  const normalizedAccountId = String(accountId || "").trim();
+  if (!context) {
+    return String(taskID || "").trim()
+      ? { ok: true }
+      : { ok: false, reason: "missing_runtime_context" };
+  }
+  if (normalizedAccountId && normalizedAccountId !== context.accountId) {
+    return { ok: false, reason: "account_context_mismatch" };
+  }
+  if (!context.ownerAuthorized) {
+    return { ok: false, reason: "current_actor_is_not_owner" };
+  }
+  return { ok: true };
+}
+
 export function registerOpenIMTools(api: any): void {
   if (typeof api.registerTool !== "function") {
     api.logger?.warn?.(
@@ -153,23 +178,12 @@ export function registerOpenIMTools(api: any): void {
     ],
   });
 
-  const authorizeSocialTool = (accountId?: string) => {
+  const authorizeSocialTool = (accountId?: string, taskID?: string) => {
     const context = getInfiaiToolContext(accountId);
-    if (!context) return { ok: true as const };
-    const normalizedAccountId = String(accountId || "").trim();
-    if (normalizedAccountId && normalizedAccountId !== context.accountId) {
-      return {
-        ok: false as const,
-        result: forbiddenToolFailure("account_context_mismatch"),
-      };
-    }
-    if (!context.ownerAuthorized) {
-      return {
-        ok: false as const,
-        result: forbiddenToolFailure("current_actor_is_not_owner"),
-      };
-    }
-    return { ok: true as const };
+    const decision = authorizeInfiaiSocialTool(context, accountId, taskID);
+    return decision.ok
+      ? { ok: true as const }
+      : { ok: false as const, result: forbiddenToolFailure(decision.reason) };
   };
 
   const resolveAccountContext = (params?: InfiaiToolParams) => {
@@ -184,7 +198,7 @@ export function registerOpenIMTools(api: any): void {
     const rawParams =
       typeof params === "string" ? { accountId: params } : params;
     const { normalizedAccountId, taskID } = resolveAccountContext(rawParams);
-    const authorized = authorizeSocialTool(normalizedAccountId || undefined);
+    const authorized = authorizeSocialTool(normalizedAccountId || undefined, taskID);
     if (!authorized.ok) return authorized;
     if (!normalizedAccountId && !taskID && connectedClientCount() > 1) {
       return {
@@ -287,7 +301,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "text"],
@@ -349,7 +363,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
     },
@@ -404,7 +418,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
     },
@@ -460,7 +474,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["query"],
@@ -528,7 +542,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["query"],
@@ -590,7 +604,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["userIDs", "message"],
@@ -640,7 +654,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["groupIDs", "message"],
@@ -698,7 +712,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["groupID"],
@@ -752,7 +766,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["userID"],
@@ -805,7 +819,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["groupID"],
@@ -857,7 +871,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
     },
@@ -905,7 +919,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "image"],
@@ -948,7 +962,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "video"],
@@ -1005,7 +1019,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID from workspace/tool instructions. Required when multiple accounts are connected.",
+            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "file"],
