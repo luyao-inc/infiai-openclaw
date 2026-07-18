@@ -90,6 +90,10 @@ openclaw infiai setup
 - `INFIAI_USER_ID`
 - `INFIAI_PLATFORM_ID`
 
+### 静默回复兼容策略
+
+OpenClaw 的精确 `NO_REPLY` 是静默成功控制信号，不是模型错误。插件会在派发完成后读取当前回合的原始 assistant 快照，再按表面分类：真人私聊、开放平台、语音和明确群聊 @ 固定使用本地化可见兜底；托管 Bot 间消息和后台静默表面保持无消息。策略使用代码默认值，不增加运行配置。真正的鉴权、限流、超时或空回复继续走 `model_error`，不会被静默规则吞掉。
+
 托管池 / 托管机器人互发轮次上限（可选；仅进程内计数，网关重启后清零）。熔断按 **`cfg.bindings` 里当前 `accountId` 对应的 agent** 与对应 `workspace-state.json` 的 `maxDialogueRounds` 计算，**不依赖** `resolveAgentRoute`（避免路由飘到别的租户 agent 时限额失效）。
 
 - `MANAGED_AGENT_MAX_DIALOGUE_ROUNDS_CAP` — 与 workspace-state 中 `maxDialogueRounds` 上限钳制（默认 `10`）。
