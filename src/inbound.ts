@@ -50,6 +50,7 @@ const MEMORY_POLICY_CACHE_TTL_MS = 500;
 const GATEWAY_CONFIG_CACHE_TTL_MS = 250;
 const RESET_STALE_SESSION_ON_WORKSPACE_UPDATE_ENV =
   "INFIAI_RESET_STALE_SESSION_ON_WORKSPACE_UPDATE";
+const OPENCLAW_RUNTIME_VERSION = "2026.7.1";
 const ASSISTANT_MESSAGE_SOURCE = "infiai_assistant";
 const HUMAN_SELF_ASSISTANT_MESSAGE_SOURCE = "infiai_human_self_assistant";
 const ASSISTANT_ONBOARDING_MESSAGE_SOURCE = "assistant_onboarding";
@@ -77,6 +78,14 @@ const INFIAI_CARD_CUSTOM_TYPE = 205;
 const INFIAI_TYPING_CUSTOM_TYPE = 260;
 const AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY =
   "当前分身订阅状态校验失败，请稍后重试。";
+const INTERACTIVE_REPLY_CONTRACT_MARKER =
+  "[Infiai Interactive Reply Contract]";
+const INTERACTIVE_REPLY_CONTRACT = [
+  INTERACTIVE_REPLY_CONTRACT_MARKER,
+  "This turn requires a visible, natural reply to the current real-user request.",
+  "Do not answer with NO_REPLY or NO_ANSWER. Do not stay silent after handling the request.",
+  "Reply in the user's language and keep the agent's established role and tone.",
+].join("\n");
 
 let latestGatewayConfigCache: {
   path: string;
@@ -1414,7 +1423,7 @@ function getAgentDisplayName(cfg: any, agentId: string): string {
   );
 }
 
-function localizeOpenClawReply(text: string): string {
+export function localizeOpenClawReply(text: string): string {
   const s = String(text ?? "");
   if (
     /Context limit exceeded|Context overflow|maximum context length|context length exceeded|reserveTokensFloor|I've reset our conversation/i.test(
@@ -1424,7 +1433,7 @@ function localizeOpenClawReply(text: string): string {
     return CONTEXT_LIMIT_REPLY;
   }
   if (
-    /Something went wrong while processing your request|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|Message failed|midstream error|invalid params|tool result's tool id/i.test(
+    /Something went wrong while processing your request|Agent couldn't generate a response(?:\. Please try again)?|use \/new to start a fresh session|incomplete terminal response|ended with an incomplete terminal response|assistantTexts:\s*\[\]|failed before reply|Processing failed:|Message failed|midstream error|invalid params|tool result's tool id/i.test(
       s
     ) ||
     isProviderUnavailableText(s)
@@ -1703,6 +1712,148 @@ export function resolveNoVisibleFallbackReply(params: {
   return params.suppressedProgressOnly
     ? TOOL_PROGRESS_ONLY_FALLBACK_REPLY
     : GENERIC_MODEL_FAILURE_REPLY;
+}
+
+export type InfiaiNoVisibleReplyOutcome =
+  | "visible_reply"
+  | "silent_success"
+  | "actual_failure";
+
+export type InfiaiNoVisibleReplyResolution = {
+  outcome: InfiaiNoVisibleReplyOutcome;
+  rawOutcome: "silent_reply" | "failure" | "progress_only" | "empty";
+  replyText: string | null;
+  messageKind: "assistant_reply" | "model_error" | "system_notice" | null;
+  fallbackUsed: boolean;
+};
+
+export function isExactInfiaiSilentReply(text: unknown): boolean {
+  const normalized = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  return /^(?:NO_REPLY|NO_ANSWER)\.?$/i.test(normalized);
+}
+
+export function isInfiaiInteractiveInboundTurn(params: {
+  isGroup: boolean;
+  explicitGroupMention: boolean;
+  fromManagedBotSession: boolean;
+}): boolean {
+  if (params.fromManagedBotSession) return false;
+  return !params.isGroup || params.explicitGroupMention;
+}
+
+export function appendInteractiveReplyContractToBodyForAgent(
+  bodyForAgent: string,
+  interactive: boolean
+): string {
+  const body = String(bodyForAgent ?? "");
+  if (
+    !interactive ||
+    body.includes(INTERACTIVE_REPLY_CONTRACT_MARKER)
+  ) {
+    return body;
+  }
+  return [body, "", INTERACTIVE_REPLY_CONTRACT]
+    .filter((part) => String(part ?? "").trim())
+    .join("\n");
+}
+
+export function resolveInteractiveNoReplyFallback(userText: unknown): string {
+  return /[\u3400-\u9fff]/u.test(String(userText ?? ""))
+    ? "收到，我在。"
+    : "Got it — I’m here.";
+}
+
+export function resolveInfiaiNoVisibleReplyOutcome(params: {
+  assistantText?: unknown;
+  failureText?: unknown;
+  interactive: boolean;
+  explicitGroupMention?: boolean;
+  suppressedProgressOnly?: boolean;
+  userText?: unknown;
+}): InfiaiNoVisibleReplyResolution {
+  if (isExactInfiaiSilentReply(params.assistantText)) {
+    if (params.explicitGroupMention) {
+      return {
+        outcome: "visible_reply",
+        rawOutcome: "silent_reply",
+        replyText: GROUP_MENTION_SILENT_FALLBACK_REPLY,
+        messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+        fallbackUsed: true,
+      };
+    }
+    if (params.interactive) {
+      return {
+        outcome: "visible_reply",
+        rawOutcome: "silent_reply",
+        replyText: resolveInteractiveNoReplyFallback(params.userText),
+        messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+        fallbackUsed: true,
+      };
+    }
+    return {
+      outcome: "silent_success",
+      rawOutcome: "silent_reply",
+      replyText: null,
+      messageKind: null,
+      fallbackUsed: false,
+    };
+  }
+
+  const failureText = String(params.failureText ?? "").trim();
+  if (failureText) {
+    return {
+      outcome: "actual_failure",
+      rawOutcome: "failure",
+      replyText: failureText,
+      messageKind: MESSAGE_KIND_MODEL_ERROR,
+      fallbackUsed: false,
+    };
+  }
+  if (params.suppressedProgressOnly) {
+    return {
+      outcome: "actual_failure",
+      rawOutcome: "progress_only",
+      replyText: TOOL_PROGRESS_ONLY_FALLBACK_REPLY,
+      messageKind: MESSAGE_KIND_SYSTEM_NOTICE,
+      fallbackUsed: true,
+    };
+  }
+  return {
+    outcome: "actual_failure",
+    rawOutcome: "empty",
+    replyText: GENERIC_MODEL_FAILURE_REPLY,
+    messageKind: MESSAGE_KIND_MODEL_ERROR,
+    fallbackUsed: true,
+  };
+}
+
+function logInfiaiNoVisibleReplyResolution(
+  api: any,
+  params: {
+    surface: string;
+    conversationType: string;
+    resolution: InfiaiNoVisibleReplyResolution;
+    accountId?: unknown;
+    agentId?: unknown;
+    messageId?: unknown;
+  }
+): void {
+  api.logger?.warn?.(
+    `[infiai] no-visible-reply ${JSON.stringify({
+      event: "infiai.no_visible_reply",
+      surface: String(params.surface || "unknown"),
+      conversationType: String(params.conversationType || "unknown"),
+      rawOutcome: params.resolution.rawOutcome,
+      resolvedOutcome: params.resolution.outcome,
+      fallbackUsed: params.resolution.fallbackUsed,
+      openclawVersion: OPENCLAW_RUNTIME_VERSION,
+      accountId: String(params.accountId || ""),
+      agentId: String(params.agentId || ""),
+      messageId: String(params.messageId || ""),
+    })}`
+  );
 }
 
 export function buildInfiaiOriginatingTo(params: {
@@ -5592,6 +5743,10 @@ async function processBufferedAgentTurn(
       body,
       memoryContextForTurn
     );
+    bodyForAgent = appendInteractiveReplyContractToBodyForAgent(
+      bodyForAgent,
+      true
+    );
     if (turnSurface.kind === "voice_call") {
       bodyForAgent = [
         bodyForAgent,
@@ -5686,6 +5841,10 @@ async function processBufferedAgentTurn(
 
     const replies: string[] = [];
     let finalReplyText = "";
+    let pendingFailureReply = "";
+    let deliveredSilentReplyText = "";
+    let suppressedProgressOnlyReply = false;
+    let usedNoReplyFallback = false;
     const llmDispatchStartedAt = Date.now();
     const cleanVisibleReplyText = (text: string): string => {
       if (!text) return "";
@@ -5696,12 +5855,22 @@ async function processBufferedAgentTurn(
         ),
         { userText: rawBody }
       );
+      if (isLocalizedFailureReply(text, localized)) {
+        pendingFailureReply ||= localized;
+        return "";
+      }
+      if (isExactInfiaiSilentReply(text)) {
+        deliveredSilentReplyText = text;
+        return "";
+      }
+      if (isLikelyToolProgressOnlyReply(cleaned)) {
+        suppressedProgressOnlyReply = true;
+        return "";
+      }
       if (
-        isLocalizedFailureReply(text, localized) ||
         isNoReplyMetaReply(text) ||
         isNoReplyMetaReply(cleaned) ||
         isNonConversationalSystemReply(cleaned) ||
-        isLikelyToolProgressOnlyReply(cleaned) ||
         !cleaned.trim()
       ) {
         return "";
@@ -5762,14 +5931,57 @@ async function processBufferedAgentTurn(
     throwIfVoiceCallAborted(turnRuntime.abortSignal);
 
     finalReplyText = finalReplyText.trim();
+    let replyText = (
+      finalReplyText ||
+      turnRuntime.voiceStream?.text ||
+      replies.join("\n")
+    ).trim();
+    if (!replyText) {
+      const latestAssistant = await readLatestAssistantText(
+        storePath,
+        effectiveSessionKey,
+        executionAgentId,
+        llmDispatchStartedAt
+      );
+      const assistantText = isExactInfiaiSilentReply(latestAssistant?.text)
+        ? latestAssistant?.text
+        : deliveredSilentReplyText;
+      const resolution = resolveInfiaiNoVisibleReplyOutcome({
+        assistantText,
+        failureText: pendingFailureReply,
+        interactive: true,
+        explicitGroupMention: false,
+        suppressedProgressOnly: suppressedProgressOnlyReply,
+        userText: rawBody,
+      });
+      logInfiaiNoVisibleReplyResolution(api, {
+        surface: turnSurface.kind,
+        conversationType: "direct",
+        resolution,
+        accountId,
+        agentId: executionAgentId,
+        messageId: messageID,
+      });
+      if (resolution.outcome === "visible_reply" && resolution.replyText) {
+        replyText = resolution.replyText;
+        finalReplyText = resolution.replyText;
+        usedNoReplyFallback = resolution.fallbackUsed;
+        warnings.push("interactive_no_reply_fallback");
+      } else if (resolution.outcome === "silent_success") {
+        warnings.push("silent_no_reply_success");
+      } else {
+        if (turnRuntime.voiceStream) {
+          await turnRuntime.voiceStream.finish("");
+        }
+        throw new Error(resolution.replyText || "assistant reply is empty");
+      }
+    }
     if (turnRuntime.voiceStream) {
-      await turnRuntime.voiceStream.finish(finalReplyText);
+      await turnRuntime.voiceStream.finish(replyText);
       if (turnRuntime.voiceStream.streamDiverged) {
         warnings.push("voice_stream_divergence");
       }
     }
-    const replyText = (finalReplyText || turnRuntime.voiceStream?.text || replies.join("\n")).trim();
-    if (!replyText) throw new Error("assistant reply is empty");
     const runtimeInfiaiContext = ctxPayload._infiai as typeof ctxPayload._infiai & {
       knowledge?: Record<string, any>;
     };
@@ -5839,7 +6051,7 @@ async function processBufferedAgentTurn(
         userText: rawBody,
         assistantText: replyText,
         dispatchedFailureReply: false,
-        sentNoVisibleFallbackReply: false,
+        sentNoVisibleFallbackReply: usedNoReplyFallback || !replyText,
       })
     ) {
       const memoryIngestStartedAt = Date.now();
@@ -6681,9 +6893,14 @@ export async function processInboundMessage(
       } error=${formatSdkError(err)}`
     );
   }
-  const bodyForAgent = appendLongTermMemoryContextToBodyForAgent(
-    body,
-    longTermMemoryContextText
+  const interactiveInboundTurn = isInfiaiInteractiveInboundTurn({
+    isGroup: group,
+    explicitGroupMention: group && mentioned,
+    fromManagedBotSession: inboundFromManagedBot,
+  });
+  const bodyForAgent = appendInteractiveReplyContractToBodyForAgent(
+    appendLongTermMemoryContextToBodyForAgent(body, longTermMemoryContextText),
+    interactiveInboundTurn
   );
 
   if (
@@ -6839,7 +7056,8 @@ export async function processInboundMessage(
   let suppressedProgressOnlyReply = false;
   let suppressedNoReplyMetaReply = false;
   let memoryExtractSubmitted = false;
-  let noVisibleFallbackReply: string | null = null;
+  let pendingFailureReply = "";
+  let deliveredSilentReplyText = "";
   const voiceReplyAccumulator =
     !group && businessAgentID
       ? new InfiaiVoiceReplyAccumulator(client, {
@@ -6912,6 +7130,9 @@ export async function processInboundMessage(
                   isNoReplyMetaReply(payload.text) ||
                   isNoReplyMetaReply(cleaned)
                 ) {
+                  if (isExactInfiaiSilentReply(payload.text)) {
+                    deliveredSilentReplyText = payload.text;
+                  }
                   suppressedNoReplyMetaReply = true;
                   infiaiConsoleDebug(
                     `[infiai] deliver skipped: NO_REPLY meta reply suppressed, raw="${payload.text.slice(
@@ -6958,7 +7179,16 @@ export async function processInboundMessage(
                     payload.text,
                     localized
                   );
-                  if (!isFailureReply && voiceReplyAccumulator) {
+                  if (isFailureReply) {
+                    pendingFailureReply ||= cleaned;
+                    infiaiConsoleDebug(
+                      `[infiai] deliver deferred: model failure pending NO_REPLY classification, clientMsgID=${
+                        msg.clientMsgID || "-"
+                      }`
+                    );
+                    return;
+                  }
+                  if (voiceReplyAccumulator) {
                     await voiceReplyAccumulator.append(cleaned);
                     infiaiConsoleDebug(
                       `[infiai] voice reply text chunk accepted: accountId=${
@@ -6969,21 +7199,16 @@ export async function processInboundMessage(
                     );
                     return;
                   }
-                  if (isFailureReply) dispatchedFailureReply = true;
                   const sent = await sendClassifiedReplyFromInbound(
                     api,
                     client,
                     msg,
                     cleaned,
                     {
-                      messageKind: isFailureReply
-                        ? MESSAGE_KIND_MODEL_ERROR
-                        : MESSAGE_KIND_ASSISTANT_REPLY,
+                      messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
                       senderManaged,
                       fromManagedBotSession: inboundFromManagedBot,
-                      reason: isFailureReply
-                        ? "localized_model_failure_reply"
-                        : "assistant_reply",
+                      reason: "assistant_reply",
                       tenantID: resolveTenantIDFromAccountID(
                         client.config.accountId
                       ),
@@ -6996,12 +7221,10 @@ export async function processInboundMessage(
                     !memoryExtractSubmitted &&
                     shouldSubmitInfiaiMemoryIngest({
                       sent,
-                      messageKind: isFailureReply
-                        ? MESSAGE_KIND_MODEL_ERROR
-                        : MESSAGE_KIND_ASSISTANT_REPLY,
+                      messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
                       userText: rawBody,
                       assistantText: cleaned,
-                      dispatchedFailureReply: isFailureReply,
+                      dispatchedFailureReply: false,
                       sentNoVisibleFallbackReply: false,
                     })
                   ) {
@@ -7257,78 +7480,68 @@ export async function processInboundMessage(
         durationMs: Date.now() - dispatchObsStart,
       });
     }
-    if (
-      !deliveredVisibleReply &&
-      !dispatchedFailureReply &&
-      !suppressedNoReplyMetaReply
-    ) {
+    if (!deliveredVisibleReply && !dispatchedFailureReply) {
       const latestAssistant = await readLatestAssistantText(
         storePath,
         effectiveSessionKey,
         executionAgentId,
         llmDispatchStartedAt
       );
+      const assistantText = isExactInfiaiSilentReply(latestAssistant?.text)
+        ? latestAssistant?.text
+        : deliveredSilentReplyText;
       if (
-        latestAssistant &&
-        shouldSuppressNoVisibleFallbackForAssistantText(latestAssistant.text)
+        assistantText ||
+        pendingFailureReply ||
+        !suppressedNoReplyMetaReply
       ) {
-        noVisibleFallbackReply = resolveNoVisibleFallbackReply({
-          silentNoReply: true,
-          explicitGroupMention: group && mentioned,
-          suppressedProgressOnly: false,
-        });
-        suppressedNoReplyMetaReply = noVisibleFallbackReply === null;
-        infiaiConsoleDebug(
-          `[infiai] dispatch completed with silent NO_REPLY assistant text; ${
-            noVisibleFallbackReply
-              ? "using group mention fallback"
-              : "fallback suppressed"
-          }, groupMentionSilent=${
-            group && mentioned ? 1 : 0
-          }, agentId=${executionAgentId}, groupId=${String(
-            msg.groupID || "-"
-          )}, timestamp=${latestAssistant.timestamp || "-"}, clientMsgID=${
-            msg.clientMsgID || "-"
-          }`
-        );
-      }
-    }
-    if (
-      !deliveredVisibleReply &&
-      !dispatchedFailureReply &&
-      !suppressedNoReplyMetaReply
-    ) {
-      const fallback =
-        noVisibleFallbackReply ??
-        resolveNoVisibleFallbackReply({
-          silentNoReply: false,
-          explicitGroupMention: group && mentioned,
+        const resolution = resolveInfiaiNoVisibleReplyOutcome({
+          assistantText,
+          failureText: pendingFailureReply,
+          interactive: interactiveInboundTurn,
+          explicitGroupMention:
+            interactiveInboundTurn && group && mentioned,
           suppressedProgressOnly: suppressedProgressOnlyReply,
-        }) ??
-        GENERIC_MODEL_FAILURE_REPLY;
-      infiaiConsoleDebug(
-        `[infiai] dispatch completed without visible reply; sending fallback, suppressedProgressOnly=${
-          suppressedProgressOnlyReply ? 1 : 0
-        }, clientMsgID=${msg.clientMsgID || "-"}`
-      );
-      const sent = await sendClassifiedReplyFromInbound(
-        api,
-        client,
-        msg,
-        fallback,
-        {
-          messageKind: suppressedProgressOnlyReply
-            ? MESSAGE_KIND_SYSTEM_NOTICE
-            : MESSAGE_KIND_MODEL_ERROR,
-          senderManaged,
-          fromManagedBotSession: inboundFromManagedBot,
-          reason: suppressedProgressOnlyReply
-            ? "progress_only_fallback"
-            : "no_visible_model_reply",
+          userText: rawBody,
+        });
+        logInfiaiNoVisibleReplyResolution(api, {
+          surface: "internal_im",
+          conversationType: chatType,
+          resolution,
+          accountId: client.config.accountId,
+          agentId: executionAgentId,
+          messageId: msg.clientMsgID || msg.serverMsgID,
+        });
+        if (resolution.outcome === "silent_success") {
+          suppressedNoReplyMetaReply = true;
+        } else if (resolution.replyText && resolution.messageKind) {
+          dispatchedFailureReply = resolution.outcome === "actual_failure";
+          const sent = await sendClassifiedReplyFromInbound(
+            api,
+            client,
+            msg,
+            resolution.replyText,
+            {
+              messageKind: resolution.messageKind,
+              senderManaged,
+              fromManagedBotSession: inboundFromManagedBot,
+              reason:
+                resolution.rawOutcome === "silent_reply"
+                  ? "interactive_silent_reply_fallback"
+                  : resolution.rawOutcome === "progress_only"
+                  ? "progress_only_fallback"
+                  : "no_visible_model_reply",
+              tenantID: resolveTenantIDFromAccountID(
+                client.config.accountId
+              ),
+              ownerUserID: selfUid,
+              agentID: businessAgentID,
+            }
+          );
+          deliveredVisibleReply = sent;
+          sentNoVisibleFallbackReply = resolution.fallbackUsed && sent;
         }
-      );
-      deliveredVisibleReply = sent;
-      sentNoVisibleFallbackReply = sent;
+      }
     }
     if (
       deliveredVisibleReply &&

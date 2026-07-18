@@ -91,6 +91,10 @@ Optional env overrides:
 - `INFIAI_USER_ID`
 - `INFIAI_PLATFORM_ID`
 
+### Silent-reply compatibility
+
+An exact OpenClaw `NO_REPLY` is a silent-success control signal, not a model failure. After dispatch, the plugin checks the current assistant snapshot and resolves it by surface: real-user DMs, open-platform calls, voice calls, and explicit group mentions use a fixed localized visible fallback; managed bot-to-bot and background surfaces remain silent. This uses code defaults and adds no runtime configuration. Authentication, rate-limit, timeout, and genuinely empty failures still use the normal `model_error` path.
+
 Managed-pool / bot-to-bot round cap (optional; in-process only, resets on gateway restart). The cap uses the **Infiai `bindings` agent for the current `accountId`**, not `resolveAgentRoute`, so limits follow each tenant’s `workspace-state.json` even when session routing points at another agent.
 
 - `MANAGED_AGENT_MAX_DIALOGUE_ROUNDS_CAP` — upper bound for `maxDialogueRounds` from workspace-state (default `10`).

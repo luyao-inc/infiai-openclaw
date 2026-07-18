@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   OPEN_PLATFORM_TURN_SURFACE,
   VoiceCallReplyStream,
+  appendInteractiveReplyContractToBodyForAgent,
   appendLongTermMemoryContextToBodyForAgent,
   buildOpenPlatformOutboundPrompt,
   voiceCallMemoryContextForTurn,
@@ -21,11 +22,16 @@ import {
   isInfiaiSessionControlCommand,
   isCallLifecycleCustomMessage,
   isManagedBotNonConversationalMessage,
+  isExactInfiaiSilentReply,
+  isInfiaiInteractiveInboundTurn,
   memoryGatewayTimeoutMs,
+  localizeOpenClawReply,
   parseAgentSubscriptionPreflightDecision,
   resetInfiaiSessionIfWorkspaceProjectionChanged,
   resetInfiaiSessionStoreEntry,
   resolveNoVisibleFallbackReply,
+  resolveInfiaiNoVisibleReplyOutcome,
+  resolveInteractiveNoReplyFallback,
   shouldSubmitInfiaiMemoryIngest,
   shouldResetStaleSessionOnWorkspaceUpdate,
   shouldSuppressNoVisibleFallbackForAssistantText,
@@ -313,6 +319,15 @@ test("detects provider-unavailable responses for localized failure handling", ()
   assert.equal(isProviderUnavailableText("这是一条正常回复"), false);
 });
 
+test("localizes the OpenClaw 7.1 incomplete-turn user-facing error", () => {
+  assert.equal(
+    localizeOpenClawReply(
+      "⚠️ Agent couldn't generate a response. Please try again.",
+    ),
+    "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+  );
+});
+
 test("parses Infiai structured message kind from nested message ex", () => {
   assert.equal(
     getInfiaiMessageKind({
@@ -522,6 +537,148 @@ test("uses a friendly fallback for silent replies to explicit group mentions onl
     }),
     null,
   );
+});
+
+test("classifies exact silent replies by interactive surface policy", () => {
+  for (const value of ["NO_REPLY", " no_reply. ", "NO_ANSWER", "no_answer."]) {
+    assert.equal(isExactInfiaiSilentReply(value), true);
+  }
+  assert.equal(isExactInfiaiSilentReply("我在。\nNO_REPLY"), false);
+  assert.equal(isExactInfiaiSilentReply(""), false);
+
+  assert.deepEqual(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "NO_REPLY",
+      interactive: true,
+      userText: "好的",
+    }),
+    {
+      outcome: "visible_reply",
+      rawOutcome: "silent_reply",
+      replyText: "收到，我在。",
+      messageKind: "assistant_reply",
+      fallbackUsed: true,
+    },
+  );
+  assert.equal(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "NO_REPLY",
+      interactive: true,
+      userText: "ok",
+    }).replyText,
+    "Got it — I’m here.",
+  );
+  assert.equal(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "NO_REPLY",
+      failureText: "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+      interactive: true,
+      userText: "ok",
+    }).outcome,
+    "visible_reply",
+    "the persisted silent assistant must override OpenClaw's synthetic incomplete-turn error",
+  );
+  assert.deepEqual(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "NO_REPLY",
+      interactive: false,
+      userText: "task result",
+    }),
+    {
+      outcome: "silent_success",
+      rawOutcome: "silent_reply",
+      replyText: null,
+      messageKind: null,
+      fallbackUsed: false,
+    },
+  );
+  assert.equal(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "NO_REPLY",
+      interactive: true,
+      explicitGroupMention: true,
+      userText: "@分身",
+    }).replyText,
+    "我在，想聊什么？",
+  );
+});
+
+test("keeps real failures distinct from silent-success outcomes", () => {
+  assert.deepEqual(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "",
+      failureText: "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+      interactive: true,
+      userText: "ok",
+    }),
+    {
+      outcome: "actual_failure",
+      rawOutcome: "failure",
+      replyText: "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+      messageKind: "model_error",
+      fallbackUsed: false,
+    },
+  );
+  assert.equal(
+    resolveInfiaiNoVisibleReplyOutcome({
+      assistantText: "",
+      interactive: true,
+      suppressedProgressOnly: true,
+    }).messageKind,
+    "system_notice",
+  );
+});
+
+test("applies the interactive contract only to real-user response surfaces", () => {
+  assert.equal(
+    isInfiaiInteractiveInboundTurn({
+      isGroup: false,
+      explicitGroupMention: false,
+      fromManagedBotSession: false,
+    }),
+    true,
+  );
+  assert.equal(
+    isInfiaiInteractiveInboundTurn({
+      isGroup: false,
+      explicitGroupMention: false,
+      fromManagedBotSession: true,
+    }),
+    false,
+  );
+  assert.equal(
+    isInfiaiInteractiveInboundTurn({
+      isGroup: true,
+      explicitGroupMention: true,
+      fromManagedBotSession: false,
+    }),
+    true,
+  );
+  assert.equal(
+    isInfiaiInteractiveInboundTurn({
+      isGroup: true,
+      explicitGroupMention: false,
+      fromManagedBotSession: false,
+    }),
+    false,
+  );
+
+  const body = appendInteractiveReplyContractToBodyForAgent("user message", true);
+  assert.match(body, /Infiai Interactive Reply Contract/);
+  assert.match(body, /Do not answer with NO_REPLY or NO_ANSWER/);
+  assert.equal(
+    appendInteractiveReplyContractToBodyForAgent(body, true),
+    body,
+  );
+  assert.equal(
+    appendInteractiveReplyContractToBodyForAgent("group context", false),
+    "group context",
+  );
+});
+
+test("resolves localized NO_REPLY fallbacks with fixed defaults", () => {
+  assert.equal(resolveInteractiveNoReplyFallback("继续"), "收到，我在。");
+  assert.equal(resolveInteractiveNoReplyFallback("continue"), "Got it — I’m here.");
 });
 
 test("builds source reply targets for OpenClaw pending delivery", () => {
