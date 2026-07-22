@@ -323,6 +323,8 @@ export type OpenPlatformMessageParams = {
   text?: string;
   imageURL?: string;
   occurredAt?: number;
+  officeConnectorPlatform?: "wecom" | "dingtalk" | "feishu";
+  officeChatType?: "single" | "group";
   turnMode?: "reply" | "outbound_generation";
 };
 
@@ -490,6 +492,12 @@ function buildBufferedAgentBillingMessage(
       infiai: {
         source: turnSurface.kind,
         messageKind: params.messageType,
+        ...(params.officeConnectorPlatform
+          ? {
+              connectorPlatform: params.officeConnectorPlatform,
+              connectorChatType: params.officeChatType || "single",
+            }
+          : {}),
         ...(turnSurface.kind === "open_platform"
           ? { externalMessageID: messageID }
           : { voiceTurnID: messageID }),
@@ -2578,6 +2586,7 @@ async function chargeInboundMediaUsage(
     subscriberUserID?: string;
     agentSubscriptionID?: string;
     usageSource?: "internal_im" | "open_platform" | "voice_call";
+    officeConnectorPlatform?: string;
   }
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -2613,6 +2622,7 @@ async function chargeInboundMediaUsage(
         contentType: msg.contentType,
         clientMsgID: msg.clientMsgID,
         serverMsgID: msg.serverMsgID,
+        officeConnectorPlatform: params.officeConnectorPlatform || "",
       },
     }
   );
@@ -3131,6 +3141,7 @@ async function chargeLanguageModelOutputUsage(
     subscriberUserID?: string;
     agentSubscriptionID?: string;
     usageSource?: "internal_im" | "open_platform" | "voice_call";
+    officeConnectorPlatform?: string;
   }
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
@@ -3163,6 +3174,7 @@ async function chargeLanguageModelOutputUsage(
     providerCostSource: usage?.costSource || "missing_openclaw_usage",
     usdToCnyRate: exchangeRate,
     openClawUsage: usage?.rawUsage,
+    officeConnectorPlatform: params.officeConnectorPlatform || "",
   };
   const data = await signedChatApiCall(
     client,
@@ -5481,6 +5493,7 @@ async function processBufferedAgentTurn(
     peerSessionKey
   );
   const timestamp = Number(params.occurredAt || Date.now()) || Date.now();
+  const bufferedConversationType = params.officeChatType === "group" ? "group" : "direct";
   const messageID =
     normalizeString(params.messageID) ||
     `${turnSurface.sessionNamespace}-${Date.now()}`;
@@ -5624,6 +5637,7 @@ async function processBufferedAgentTurn(
                 turnSurface.kind === "open_platform"
                   ? "open_platform"
                   : "voice_call",
+              officeConnectorPlatform: params.officeConnectorPlatform,
             }
           );
           timings.billingMs =
@@ -5671,8 +5685,8 @@ async function processBufferedAgentTurn(
             selfUid,
             timestamp,
             rawBody,
-            "direct",
-            false,
+            bufferedConversationType,
+            bufferedConversationType === "group",
             {
               currentUserName: sourceUserName,
               currentAgentName,
@@ -5699,7 +5713,7 @@ async function processBufferedAgentTurn(
         agentID: businessAgentID,
         sourceUserID,
         sourceUserName,
-        conversationType: "direct",
+        conversationType: bufferedConversationType,
         conversationID: effectiveSessionKey,
         messageID,
         query: rawBody,
@@ -5950,13 +5964,13 @@ async function processBufferedAgentTurn(
         assistantText,
         failureText: pendingFailureReply,
         interactive: true,
-        explicitGroupMention: false,
+        explicitGroupMention: bufferedConversationType === "group",
         suppressedProgressOnly: suppressedProgressOnlyReply,
         userText: rawBody,
       });
       logInfiaiNoVisibleReplyResolution(api, {
         surface: turnSurface.kind,
-        conversationType: "direct",
+        conversationType: bufferedConversationType,
         resolution,
         accountId,
         agentId: executionAgentId,
@@ -6013,6 +6027,7 @@ async function processBufferedAgentTurn(
             turnSurface.kind === "open_platform"
               ? "open_platform"
               : "voice_call",
+          officeConnectorPlatform: params.officeConnectorPlatform,
           storePath,
           dispatchStartedAtMs: llmDispatchStartedAt,
           allowOverdraft: true,
@@ -6060,7 +6075,7 @@ async function processBufferedAgentTurn(
         agentID: businessAgentID,
         sourceUserID,
         sourceUserName,
-        conversationType: "direct",
+        conversationType: bufferedConversationType,
         conversationID: effectiveSessionKey,
         messageID,
         userMessageID: messageID,
