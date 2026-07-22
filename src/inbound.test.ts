@@ -35,7 +35,68 @@ import {
   shouldSubmitInfiaiMemoryIngest,
   shouldResetStaleSessionOnWorkspaceUpdate,
   shouldSuppressNoVisibleFallbackForAssistantText,
+  startInboundTypingKeepalive,
 } from "./inbound";
+
+test("refreshes long-running inbound typing state and stops cleanly", async () => {
+  let refreshes = 0;
+  let resolveRepeated: (() => void) | undefined;
+  const repeated = new Promise<void>((resolve) => {
+    resolveRepeated = resolve;
+  });
+  const stop = startInboundTypingKeepalive(async () => {
+    refreshes += 1;
+    if (refreshes >= 2) resolveRepeated?.();
+  }, 10);
+  let repeatTimeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      repeated,
+      new Promise<never>((_, reject) => {
+        repeatTimeout = setTimeout(
+          () => reject(new Error("typing keepalive did not repeat")),
+          1_000
+        );
+      }),
+    ]);
+  } finally {
+    if (repeatTimeout) clearTimeout(repeatTimeout);
+  }
+  await stop();
+  const stoppedAt = refreshes;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.ok(stoppedAt >= 2, `expected repeated refreshes, got ${stoppedAt}`);
+  assert.equal(refreshes, stoppedAt);
+});
+
+test("waits for an in-flight typing refresh before stop resolves", async () => {
+  let releaseRefresh: (() => void) | undefined;
+  let refreshStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    refreshStarted = resolve;
+  });
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const stop = startInboundTypingKeepalive(async () => {
+    refreshStarted?.();
+    await refreshGate;
+  }, 10);
+  // The production interval is intentionally unref'd, so keep the test event
+  // loop alive long enough for the first refresh tick to start.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await started;
+
+  let stopped = false;
+  const stopping = stop().then(() => {
+    stopped = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(stopped, false);
+  releaseRefresh?.();
+  await stopping;
+  assert.equal(stopped, true);
+});
 
 test("builds proactive outreach prompt with protected instruction boundaries", () => {
   const prompt = buildOpenPlatformOutboundPrompt({

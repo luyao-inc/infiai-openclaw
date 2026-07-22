@@ -918,6 +918,32 @@ async function setInboundTypingState(
   }
 }
 
+export function startInboundTypingKeepalive(
+  refresh: () => Promise<void>,
+  intervalMs = 30_000
+): () => Promise<void> {
+  let stopped = false;
+  let inFlight: Promise<void> | null = null;
+  const timer = setInterval(() => {
+    if (stopped || inFlight) return;
+    const current = Promise.resolve()
+      .then(refresh)
+      .catch(() => {
+        // Typing is best-effort and must never reject the inbound turn.
+      });
+    inFlight = current;
+    void current.finally(() => {
+      if (inFlight === current) inFlight = null;
+    });
+  }, Math.max(10, intervalMs));
+  timer.unref?.();
+  return async () => {
+    stopped = true;
+    clearInterval(timer);
+    await inFlight;
+  };
+}
+
 function isInfiaiTypingCustomMessage(msg: MessageItem): boolean {
   if (Number(msg.contentType) !== Number(MessageType.CustomMessage))
     return false;
@@ -7088,6 +7114,9 @@ export async function processInboundMessage(
       : null;
   const primaryModel = getAgentPrimaryModel(cfg, executionAgentId);
   await setInboundTypingState(client, msg, true);
+  const stopTypingKeepalive = startInboundTypingKeepalive(() =>
+    setInboundTypingState(client, msg, true)
+  );
   try {
     const runDispatch = async (): Promise<void> => {
       await withInfiaiToolContext(
@@ -7627,6 +7656,9 @@ export async function processInboundMessage(
       // ignore secondary send errors
     }
   } finally {
+    // Wait for the final keepalive request before clearing typing. Otherwise a
+    // slow refresh can finish after the false update and leave typing stuck on.
+    await stopTypingKeepalive();
     await setInboundTypingState(client, msg, false);
     await cleanupStagedInboundMedia(imageMediaResult);
     await cleanupStagedInboundMedia(mediaResult);
