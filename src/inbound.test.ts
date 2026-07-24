@@ -29,6 +29,7 @@ import {
   parseAgentSubscriptionPreflightDecision,
   resetInfiaiSessionIfWorkspaceProjectionChanged,
   resetInfiaiSessionStoreEntry,
+  resolveOpenPlatformTurnMessageIDs,
   resolveNoVisibleFallbackReply,
   resolveInfiaiNoVisibleReplyOutcome,
   resolveInteractiveNoReplyFallback,
@@ -37,6 +38,28 @@ import {
   shouldSuppressNoVisibleFallbackForAssistantText,
   startInboundTypingKeepalive,
 } from "./inbound";
+
+test("separates stable open-platform message identity from runtime attempts", () => {
+  assert.deepEqual(
+    resolveOpenPlatformTurnMessageIDs({
+      messageID: "platform-message-1",
+      runtimeAttemptID: "runtime-attempt-2",
+    }),
+    {
+      messageID: "platform-message-1",
+      runtimeAttemptID: "runtime-attempt-2",
+    },
+  );
+  assert.deepEqual(
+    resolveOpenPlatformTurnMessageIDs({
+      messageID: "platform-message-1",
+    }),
+    {
+      messageID: "platform-message-1",
+      runtimeAttemptID: "platform-message-1",
+    },
+  );
+});
 
 test("refreshes long-running inbound typing state and stops cleanly", async () => {
   let refreshes = 0;
