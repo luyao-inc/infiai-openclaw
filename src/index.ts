@@ -19,6 +19,161 @@ import {
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
 
+const SCHEDULED_TASK_BLOCKED_TOOLS = new Set([
+  "bash",
+  "shell",
+  "process",
+  "write",
+  "edit",
+  "apply_patch",
+  "gateway",
+  "cron",
+  "sessions_spawn",
+  "sessions_send",
+  "subagents",
+  "computer",
+  "computer_use",
+  "infiai_send_image",
+  "infiai_send_video",
+  "infiai_send_file",
+]);
+
+function splitRestrictedCommand(command: string): string[] | null {
+  const normalized = command.trim().replace(/\s+2>\/dev\/null\s*$/, "");
+  if (
+    !normalized ||
+    /[\r\n;|`<>]/.test(normalized) ||
+    normalized.includes("$(") ||
+    /(^|[^&])&([^&]|$)/.test(normalized)
+  ) {
+    return null;
+  }
+  const tokens: string[] = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < normalized.length; index += 1) {
+    const char = normalized[index];
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = "";
+      else current += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (escaped || quote) return null;
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function scheduledTaskExecAllowed(command: string): boolean {
+  const tokens = splitRestrictedCommand(command);
+  if (!tokens) return false;
+
+  let skillDir = "";
+  let commandIndex = 0;
+  if (tokens[0] === "cd") {
+    if (tokens.length < 5 || tokens[2] !== "&&") return false;
+    skillDir = tokens[1];
+    commandIndex = 3;
+  }
+  if (!["python3", "python"].includes(tokens[commandIndex])) return false;
+
+  const script = tokens[commandIndex + 1] || "";
+  const args = tokens.slice(commandIndex + 2);
+  const skillPath = (skill: string): boolean => {
+    const roots = [
+      `~/.openclaw/skills/${skill}`,
+      `/root/.openclaw/skills/${skill}`,
+      `/home/node/.openclaw/skills/${skill}`,
+    ];
+    if (skillDir) {
+      return roots.includes(skillDir) && script === (skill === "serper" ? "scripts/search.py" : "crypto_market_snapshot.py");
+    }
+    return roots.some((root) => script === `${root}/${skill === "serper" ? "scripts/search.py" : "crypto_market_snapshot.py"}`);
+  };
+
+  if (skillPath("serper")) {
+    let hasQuery = false;
+    for (let index = 0; index < args.length; index += 2) {
+      const flag = args[index];
+      const value = args[index + 1];
+      if (!value) return false;
+      if (flag === "-q" || flag === "--query") {
+        if (hasQuery || value.length > 500) return false;
+        hasQuery = true;
+      } else if (flag === "-m" || flag === "--mode") {
+        if (!["default", "current"].includes(value)) return false;
+      } else if (flag === "--gl" || flag === "--hl") {
+        if (!/^[a-z]{2}$/i.test(value)) return false;
+      } else {
+        return false;
+      }
+    }
+    return hasQuery;
+  }
+
+  if (skillPath("crypto-market")) {
+    return (
+      args.length === 3 &&
+      /^[A-Z0-9]{3,20}$/.test(args[0]) &&
+      /^(?:[1-9]\d*[mhdwM])$/.test(args[1]) &&
+      /^(?:[1-9]\d{0,2}|1000)$/.test(args[2])
+    );
+  }
+  return false;
+}
+
+export function scheduledTaskToolBlockReason(event: any, ctx: any): string {
+  const sessionKey = String(ctx?.sessionKey || event?.sessionKey || "").trim();
+  if (!sessionKey.includes(":task:")) return "";
+  const toolName = String(event?.toolName || ctx?.toolName || "").trim().toLowerCase();
+  if (!toolName) return "scheduled task tool identity is missing";
+  if (toolName === "exec") {
+    const command = String(event?.params?.command || event?.parameters?.command || "").trim();
+    if (scheduledTaskExecAllowed(command)) return "";
+    return "tool exec is only allowed for audited read-only skill commands in a scheduled task";
+  }
+  if (SCHEDULED_TASK_BLOCKED_TOOLS.has(toolName)) {
+    return `tool ${toolName} is not allowed in a scheduled task`;
+  }
+  return "";
+}
+
+function registerScheduledTaskToolGuard(api: any): void {
+  if (typeof api.on !== "function") return;
+  api.on(
+    "before_tool_call",
+    async (event: any, ctx: any) => {
+      const blockReason = scheduledTaskToolBlockReason(event, ctx);
+      if (!blockReason) return undefined;
+      api.logger?.warn?.(`[infiai] scheduled task tool blocked: ${blockReason}`);
+      return { block: true, blockReason };
+    },
+    { priority: 1000 },
+  );
+}
+
 function resolveGatewayRequestParams(input: any): any {
   if (
     input &&
@@ -187,6 +342,7 @@ function registerFull(api: any): void {
   (globalThis as any).__openimGatewayConfig = api.config;
 
   registerOpenIMTools(api);
+  registerScheduledTaskToolGuard(api);
   registerOpenPlatformGateway(api);
   registerVoiceCallGateway(api);
 
