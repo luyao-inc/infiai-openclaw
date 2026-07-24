@@ -34,6 +34,50 @@ export function authorizeInfiaiSocialTool(
   return { ok: true };
 }
 
+export function compactPeopleSearchResult(
+  result: any,
+  page: number,
+  pageSize: number,
+) {
+  const total = Math.max(Number(result?.total || 0), 0);
+  const list = (Array.isArray(result?.list) ? result.list : []).map((item: any) => {
+    const description = String(item?.description || "").trim();
+    return {
+      userID: String(item?.userID || ""),
+      nickname: String(item?.nickname || ""),
+      faceURL: String(item?.faceURL || ""),
+      description:
+        description.length > 240
+          ? `${description.slice(0, 240).trimEnd()}…`
+          : description,
+      friendCount: Math.max(Number(item?.friendCount || 0), 0),
+      isFriend: Boolean(item?.isFriend),
+    };
+  });
+  return {
+    list,
+    total,
+    page,
+    pageSize,
+    hasMore: page * pageSize < total,
+  };
+}
+
+export function publicSocialToolError(error: unknown) {
+  const message =
+    error instanceof Error ? error.message : String(error || "Unknown error");
+  if (/NoPermissionError|no permission|permission denied/i.test(message)) {
+    return {
+      code: "permission_denied",
+      message: "当前账号没有权限查看这些内容",
+    };
+  }
+  if (/not found/i.test(message)) {
+    return { code: "not_found", message: "没有找到对应的数据" };
+  }
+  return { code: "request_failed", message: "查询暂时没有成功，请稍后再试" };
+}
+
 export function registerOpenIMTools(api: any): void {
   if (typeof api.registerTool !== "function") {
     api.logger?.warn?.(
@@ -118,19 +162,23 @@ export function registerOpenIMTools(api: any): void {
     return responseBody?.data ?? responseBody;
   };
 
-  const toolFailure = (label: string, error: unknown) => ({
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify({
-          ok: false,
-          error: `${label}: ${formatSdkError(error)}`,
-          instruction:
-            "STOP. Do not claim the action succeeded. Tell the user this Infiai tool call failed.",
-        }),
-      },
-    ],
-  });
+  const toolFailure = (label: string, error: unknown) => {
+    infiaiDebug(api, `[infiai] ${label}: ${formatSdkError(error)}`);
+    const publicError = publicSocialToolError(error);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            ok: false,
+            ...publicError,
+            instruction:
+              "STOP. Do not claim the action succeeded. Explain this result naturally without technical details.",
+          }),
+        },
+      ],
+    };
+  };
 
   const ambiguousAccountFailure = () => ({
     content: [
@@ -171,8 +219,11 @@ export function registerOpenIMTools(api: any): void {
           code: "permission_denied_owner_only",
           reason,
           capability: "infiai_social_tools",
+          retryable: reason === "missing_runtime_context",
           instruction:
-            "STOP. Do not call any other Infiai social tool for this request. Respond in the agent's own persona and explain only the capability boundary; do not use a fixed refusal sentence or a legal/compliance refusal unless the request has a separate safety issue.",
+            reason === "missing_runtime_context"
+              ? "If this is a scheduled task, retry this same tool once with taskID, runID and accountId copied exactly from the internal task context. Otherwise stop and explain the capability boundary naturally."
+              : "STOP. Do not call any other Infiai social tool for this request. Respond in the agent's own persona and explain only the capability boundary; do not use a fixed refusal sentence or a legal/compliance refusal unless the request has a separate safety issue.",
         }),
       },
     ],
@@ -198,7 +249,10 @@ export function registerOpenIMTools(api: any): void {
     const rawParams =
       typeof params === "string" ? { accountId: params } : params;
     const { normalizedAccountId, taskID } = resolveAccountContext(rawParams);
-    const authorized = authorizeSocialTool(normalizedAccountId || undefined, taskID);
+    const authorized = authorizeSocialTool(
+      normalizedAccountId || undefined,
+      taskID,
+    );
     if (!authorized.ok) return authorized;
     if (!normalizedAccountId && !taskID && connectedClientCount() > 1) {
       return {
@@ -281,6 +335,16 @@ export function registerOpenIMTools(api: any): void {
     return { ok: true as const, target, client };
   };
 
+  const validateMediaTarget = async (
+    client: NonNullable<ReturnType<typeof getConnectedClient>>,
+    target: { kind: "user" | "group"; id: string },
+    accountId?: string,
+  ) =>
+    chatToolCall(client, "/claw/internal/tools/validate_target", {
+      target: `${target.kind}:${target.id}`,
+      accountId,
+    });
+
   api.registerTool({
     name: "infiai_send_text",
     description:
@@ -292,11 +356,11 @@ export function registerOpenIMTools(api: any): void {
         text: { type: "string", description: "Text to send" },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID for trace metadata",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID for trace metadata",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -327,6 +391,7 @@ export function registerOpenIMTools(api: any): void {
             text: params.text,
             taskID: params.taskID,
             runID: params.runID,
+            actionID: _id,
             accountId: params.accountId,
           },
         );
@@ -354,11 +419,11 @@ export function registerOpenIMTools(api: any): void {
         },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -409,11 +474,11 @@ export function registerOpenIMTools(api: any): void {
         },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -463,13 +528,17 @@ export function registerOpenIMTools(api: any): void {
           type: "number",
           description: "Maximum results, default 20, max 100",
         },
+        page: {
+          type: "number",
+          description: "Result page number, default 1",
+        },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -484,6 +553,7 @@ export function registerOpenIMTools(api: any): void {
       params: {
         query: string;
         limit?: number;
+        page?: number;
         taskID?: string;
         runID?: string;
         accountId?: string;
@@ -492,24 +562,35 @@ export function registerOpenIMTools(api: any): void {
       const checked = ensureClient(params);
       if (!checked.ok) return checked.result;
       try {
+        const page = Math.max(Number(params.page || 1), 1);
+        const pageSize = Math.min(
+          Math.max(Number(params.limit || 20), 1),
+          100,
+        );
         const result = await chatToolCall(
           checked.client,
           "/claw/internal/tools/search_people",
           {
             keyword: params.query,
             pagination: {
-              pageNumber: 1,
-              showNumber: Math.min(
-                Math.max(Number(params.limit || 20), 1),
-                100,
-              ),
+              pageNumber: page,
+              showNumber: pageSize,
             },
             taskID: params.taskID,
             runID: params.runID,
             accountId: params.accountId,
           },
         );
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                compactPeopleSearchResult(result, page, pageSize),
+              ),
+            },
+          ],
+        };
       } catch (e: any) {
         return toolFailure("Search people failed", e);
       }
@@ -531,13 +612,23 @@ export function registerOpenIMTools(api: any): void {
           type: "number",
           description: "Maximum results, default 20, max 100",
         },
+        page: {
+          type: "number",
+          description: "Result page number, default 1",
+        },
+        sort: {
+          type: "string",
+          enum: ["hot", "newest"],
+          description:
+            "Sort public groups by popularity or newest, default hot",
+        },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -552,6 +643,8 @@ export function registerOpenIMTools(api: any): void {
       params: {
         query: string;
         limit?: number;
+        page?: number;
+        sort?: "hot" | "newest";
         taskID?: string;
         runID?: string;
         accountId?: string;
@@ -565,9 +658,9 @@ export function registerOpenIMTools(api: any): void {
           "/claw/internal/tools/search_groups",
           {
             keyword: params.query,
-            sort: "hot",
+            sort: params.sort || "hot",
             pagination: {
-              pageNumber: 1,
+              pageNumber: Math.max(Number(params.page || 1), 1),
               showNumber: Math.min(
                 Math.max(Number(params.limit || 20), 1),
                 100,
@@ -626,7 +719,7 @@ export function registerOpenIMTools(api: any): void {
         const result = await chatToolCall(
           checked.client,
           "/claw/internal/tools/apply_friends",
-          params as any,
+          { ...params, actionID: _id } as any,
         );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (e: any) {
@@ -676,7 +769,7 @@ export function registerOpenIMTools(api: any): void {
         const result = await chatToolCall(
           checked.client,
           "/claw/internal/tools/apply_groups",
-          params as any,
+          { ...params, actionID: _id } as any,
         );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (e: any) {
@@ -703,11 +796,11 @@ export function registerOpenIMTools(api: any): void {
         },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -755,13 +848,37 @@ export function registerOpenIMTools(api: any): void {
           type: "number",
           description: "Maximum messages, default 20, max 100",
         },
+        days: {
+          type: "number",
+          description:
+            "Only return messages from the latest N days, between 1 and 90",
+        },
+        since: {
+          type: "string",
+          description: "Optional inclusive start time in RFC3339 or YYYY-MM-DD",
+        },
+        until: {
+          type: "string",
+          description: "Optional inclusive end time in RFC3339 or YYYY-MM-DD",
+        },
+        contentTypes: {
+          type: "array",
+          items: { type: "number" },
+          description:
+            "Optional OpenIM content type filter. Use [101] for text-only summaries.",
+        },
+        includeRevoked: {
+          type: "boolean",
+          description:
+            "Whether recalled messages may be returned. Defaults to false.",
+        },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -776,6 +893,11 @@ export function registerOpenIMTools(api: any): void {
       params: {
         userID: string;
         limit?: number;
+        days?: number;
+        since?: string;
+        until?: string;
+        contentTypes?: number[];
+        includeRevoked?: boolean;
         taskID?: string;
         runID?: string;
         accountId?: string;
@@ -808,13 +930,37 @@ export function registerOpenIMTools(api: any): void {
           type: "number",
           description: "Maximum messages, default 20, max 100",
         },
+        days: {
+          type: "number",
+          description:
+            "Only return messages from the latest N days, between 1 and 90",
+        },
+        since: {
+          type: "string",
+          description: "Optional inclusive start time in RFC3339 or YYYY-MM-DD",
+        },
+        until: {
+          type: "string",
+          description: "Optional inclusive end time in RFC3339 or YYYY-MM-DD",
+        },
+        contentTypes: {
+          type: "array",
+          items: { type: "number" },
+          description:
+            "Optional OpenIM content type filter. Use [101] for text-only summaries.",
+        },
+        includeRevoked: {
+          type: "boolean",
+          description:
+            "Whether recalled messages may be returned. Defaults to false.",
+        },
         taskID: {
           type: "string",
-          description: "Optional Infiai scheduled task ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         runID: {
           type: "string",
-          description: "Optional Infiai scheduled run ID",
+          description: "Required for scheduled tasks; omit for normal conversations",
         },
         accountId: {
           type: "string",
@@ -829,6 +975,11 @@ export function registerOpenIMTools(api: any): void {
       params: {
         groupID: string;
         limit?: number;
+        days?: number;
+        since?: string;
+        until?: string;
+        contentTypes?: number[];
+        includeRevoked?: boolean;
         taskID?: string;
         runID?: string;
         accountId?: string;
@@ -931,6 +1082,11 @@ export function registerOpenIMTools(api: any): void {
       const checked = ensureTargetAndClient(params);
       if (!checked.ok) return checked.result;
       try {
+        await validateMediaTarget(
+          checked.client,
+          checked.target,
+          params.accountId,
+        );
         await sendImageToTarget(checked.client, checked.target, params.image);
         return { content: [{ type: "text", text: "Image sent successfully" }] };
       } catch (e: any) {
@@ -979,6 +1135,11 @@ export function registerOpenIMTools(api: any): void {
       const checked = ensureTargetAndClient(params);
       if (!checked.ok) return checked.result;
       try {
+        await validateMediaTarget(
+          checked.client,
+          checked.target,
+          params.accountId,
+        );
         await sendVideoToTarget(
           checked.client,
           checked.target,
@@ -1036,6 +1197,11 @@ export function registerOpenIMTools(api: any): void {
       const checked = ensureTargetAndClient(params);
       if (!checked.ok) return checked.result;
       try {
+        await validateMediaTarget(
+          checked.client,
+          checked.target,
+          params.accountId,
+        );
         await sendFileToTarget(
           checked.client,
           checked.target,
