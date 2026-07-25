@@ -319,6 +319,7 @@ export type OpenPlatformMessageParams = {
   conversationID: string;
   conversationKey?: string;
   messageID: string;
+  runtimeAttemptID?: string;
   messageType: "text" | "image";
   text?: string;
   imageURL?: string;
@@ -4819,6 +4820,14 @@ export async function processOpenPlatformMessage(
   );
 }
 
+export function resolveOpenPlatformTurnMessageIDs(
+  params: Pick<OpenPlatformMessageParams, "messageID" | "runtimeAttemptID">
+): { messageID: string; runtimeAttemptID: string } {
+  const messageID = normalizeString(params.messageID) || "";
+  const runtimeAttemptID = normalizeString(params.runtimeAttemptID) || messageID;
+  return { messageID, runtimeAttemptID };
+}
+
 const openPlatformOutboundInflight = new Map<
   string,
   Promise<OpenPlatformMessageResult>
@@ -5520,9 +5529,12 @@ async function processBufferedAgentTurn(
   );
   const timestamp = Number(params.occurredAt || Date.now()) || Date.now();
   const bufferedConversationType = params.officeChatType === "group" ? "group" : "direct";
+  const resolvedMessageIDs = resolveOpenPlatformTurnMessageIDs(params);
   const messageID =
-    normalizeString(params.messageID) ||
+    resolvedMessageIDs.messageID ||
     `${turnSurface.sessionNamespace}-${Date.now()}`;
+  const runtimeAttemptID =
+    resolvedMessageIDs.runtimeAttemptID || messageID;
   const sessionContinuityEnabled = await resolveInfiaiSessionContinuityEnabled(
     cfg,
     executionAgentId
@@ -5821,7 +5833,10 @@ async function processBufferedAgentTurn(
       SenderId: sourceUserID,
       Provider: "infiai",
       Surface: turnSurface.surface,
-      MessageSid: messageID,
+      // Runtime attempts need distinct inbound IDs so a retry is not swallowed
+      // by OpenClaw's provider-message dedupe cache. The stable business
+      // message ID remains in _infiai for tool, billing and memory idempotency.
+      MessageSid: runtimeAttemptID,
       Timestamp: timestamp,
       OriginatingChannel: turnSurface.surface,
       OriginatingTo: `${turnSurface.originatingToPrefix}:${sourceUserID}`,
@@ -5841,6 +5856,7 @@ async function processBufferedAgentTurn(
         accountId,
         managedUserId: selfUid,
         messageSid: messageID,
+        runtimeAttemptID,
         isGroup: false,
         senderId: sourceUserID,
         conversationId: effectiveSessionKey,
