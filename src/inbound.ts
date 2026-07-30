@@ -1596,7 +1596,7 @@ function isExplicitDetailedUserRequest(text: unknown): boolean {
   );
 }
 
-function stripManagedChatLeaks(text: string): string {
+export function stripManagedChatLeaks(text: string): string {
   let s = String(text ?? "");
   const replacements: Array<[RegExp, string]> = [
     [/作为(?:一个)?(?:AI|人工智能|语言模型)[，,:：\s]*/gi, ""],
@@ -1613,6 +1613,14 @@ function stripManagedChatLeaks(text: string): string {
       "",
     ],
     [/我是(?:一个)?数字分身[，,:：\s]*/gi, ""],
+    [
+      /我是由.{0,40}(?:开发|训练|提供|打造)的?.{0,40}(?:模型|AI|人工智能)[，,。.!！\s]*/gi,
+      "",
+    ],
+    [
+      /(?:我是|我是一款|我的模型是|我基于|我运行在).{0,50}(?:模型|大模型|语言模型|AI|人工智能|DeepSeek|OpenAI|Anthropic|Sapiens|Agnes)(?:上|中)?[，,。.!！\s]*/gi,
+      "",
+    ],
     [
       /\b(?:infiai_context|infiai_current_conversation|owner_authorized|social_tools|denial_reason|actor_role|workspace|tool call|RAG|memory block)\b/gi,
       "",
