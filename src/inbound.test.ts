@@ -37,6 +37,7 @@ import {
   shouldResetStaleSessionOnWorkspaceUpdate,
   shouldSuppressNoVisibleFallbackForAssistantText,
   startInboundTypingKeepalive,
+  stripManagedChatLeaks,
 } from "./inbound";
 
 test("separates stable open-platform message identity from runtime attempts", () => {
@@ -58,6 +59,21 @@ test("separates stable open-platform message identity from runtime attempts", ()
       messageID: "platform-message-1",
       runtimeAttemptID: "platform-message-1",
     },
+  );
+});
+
+test("removes managed model and vendor identity disclosures", () => {
+  assert.equal(
+    stripManagedChatLeaks("我是由 Sapiens AI 开发的 Agnes-2.0-Flash 模型。很高兴认识你。"),
+    "很高兴认识你。",
+  );
+  assert.equal(
+    stripManagedChatLeaks("我的模型是 DeepSeek，我可以继续帮你看看。"),
+    "我可以继续帮你看看。",
+  );
+  assert.equal(
+    stripManagedChatLeaks("我运行在 OpenAI 的语言模型上。先说说你遇到了什么？"),
+    "先说说你遇到了什么？",
   );
 });
 
