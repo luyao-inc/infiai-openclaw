@@ -4815,16 +4815,72 @@ async function sendClassifiedReplyFromInbound(
   return true;
 }
 
+const openPlatformSessionTails = new Map<string, Promise<void>>();
+
+export function resolveOpenPlatformSessionQueueKey(
+  params: Pick<
+    OpenPlatformMessageParams,
+    | "accountId"
+    | "tenantID"
+    | "ownerUserID"
+    | "agentID"
+    | "sourceUserID"
+    | "conversationID"
+  >
+): string {
+  return JSON.stringify(
+    [
+      params.accountId,
+      params.tenantID,
+      params.ownerUserID,
+      params.agentID,
+      params.sourceUserID,
+      normalizeString(params.conversationID) || "default",
+    ].map((value) => (normalizeString(value) || "").toLowerCase()),
+  );
+}
+
+export async function withOpenPlatformSessionLane<T>(
+  key: string,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = openPlatformSessionTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => current);
+  openPlatformSessionTails.set(key, tail);
+  try {
+    await previous.catch(() => undefined);
+    return await run();
+  } finally {
+    release();
+    void tail.finally(() => {
+      if (openPlatformSessionTails.get(key) === tail) {
+        openPlatformSessionTails.delete(key);
+      }
+    });
+  }
+}
+
 export async function processOpenPlatformMessage(
   api: any,
   client: OpenIMClientState,
   params: OpenPlatformMessageParams
 ): Promise<OpenPlatformMessageResult> {
-  return processBufferedAgentTurn(
-    api,
-    client,
-    params,
-    OPEN_PLATFORM_TURN_SURFACE
+  return withOpenPlatformSessionLane(
+    resolveOpenPlatformSessionQueueKey({
+      ...params,
+      accountId: params.accountId || client.config.accountId,
+    }),
+    () =>
+      processBufferedAgentTurn(
+        api,
+        client,
+        params,
+        OPEN_PLATFORM_TURN_SURFACE
+      )
   );
 }
 
@@ -4860,16 +4916,23 @@ export async function processOpenPlatformOutboundMessage(
   if (existing) return existing;
 
   const task = (async () => {
-    const result = await processBufferedAgentTurn(
-      api,
-      client,
-      {
+    const result = await withOpenPlatformSessionLane(
+      resolveOpenPlatformSessionQueueKey({
         ...params,
-        messageType: "text",
-        text: buildOpenPlatformOutboundPrompt(params),
-        turnMode: "outbound_generation",
-      },
-      OPEN_PLATFORM_TURN_SURFACE
+        accountId: params.accountId || client.config.accountId,
+      }),
+      () =>
+        processBufferedAgentTurn(
+          api,
+          client,
+          {
+            ...params,
+            messageType: "text",
+            text: buildOpenPlatformOutboundPrompt(params),
+            turnMode: "outbound_generation",
+          },
+          OPEN_PLATFORM_TURN_SURFACE
+        )
     );
     try {
       await writeOpenPlatformOutboundResult(cacheKey, result);
