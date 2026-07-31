@@ -29,6 +29,7 @@ import {
   parseAgentSubscriptionPreflightDecision,
   resetInfiaiSessionIfWorkspaceProjectionChanged,
   resetInfiaiSessionStoreEntry,
+  resolveOpenPlatformSessionQueueKey,
   resolveOpenPlatformTurnMessageIDs,
   resolveNoVisibleFallbackReply,
   resolveInfiaiNoVisibleReplyOutcome,
@@ -38,6 +39,7 @@ import {
   shouldSuppressNoVisibleFallbackForAssistantText,
   startInboundTypingKeepalive,
   stripManagedChatLeaks,
+  withOpenPlatformSessionLane,
 } from "./inbound";
 
 test("separates stable open-platform message identity from runtime attempts", () => {
@@ -60,6 +62,180 @@ test("separates stable open-platform message identity from runtime attempts", ()
       runtimeAttemptID: "platform-message-1",
     },
   );
+});
+
+test("builds stable and isolated open-platform session queue keys", () => {
+  const base = {
+    accountId: "ACC_DEFAULT__7600049091__DEFAULT",
+    tenantID: "default",
+    ownerUserID: "7600049091",
+    agentID: "default",
+    sourceUserID: "external-user",
+    conversationID: "conversation-1",
+  };
+  assert.equal(
+    resolveOpenPlatformSessionQueueKey(base),
+    resolveOpenPlatformSessionQueueKey({ ...base }),
+  );
+  assert.equal(
+    resolveOpenPlatformSessionQueueKey(base),
+    resolveOpenPlatformSessionQueueKey({
+      ...base,
+      accountId: base.accountId.toLowerCase(),
+      sourceUserID: base.sourceUserID.toUpperCase(),
+      conversationID: base.conversationID.toUpperCase(),
+    }),
+  );
+  assert.equal(
+    resolveOpenPlatformSessionQueueKey({ ...base, conversationID: "" }),
+    resolveOpenPlatformSessionQueueKey({
+      ...base,
+      conversationID: "default",
+    }),
+  );
+  assert.notEqual(
+    resolveOpenPlatformSessionQueueKey(base),
+    resolveOpenPlatformSessionQueueKey({
+      ...base,
+      conversationID: "conversation-2",
+    }),
+  );
+  assert.notEqual(
+    resolveOpenPlatformSessionQueueKey(base),
+    resolveOpenPlatformSessionQueueKey({
+      ...base,
+      sourceUserID: "another-external-user",
+    }),
+  );
+});
+
+test("serializes open-platform turns for the same session lane", async () => {
+  const entered: number[] = [];
+  let active = 0;
+  let maxActive = 0;
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const first = withOpenPlatformSessionLane("same-session", async () => {
+    entered.push(1);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await firstGate;
+    active -= 1;
+    return "first";
+  });
+  const second = withOpenPlatformSessionLane("same-session", async () => {
+    entered.push(2);
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    active -= 1;
+    return "second";
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(entered, [1]);
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second]), ["first", "second"]);
+  assert.deepEqual(entered, [1, 2]);
+  assert.equal(maxActive, 1);
+});
+
+test("keeps different open-platform session lanes concurrent", async () => {
+  let active = 0;
+  let maxActive = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const run = (key: string) =>
+    withOpenPlatformSessionLane(key, async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await gate;
+      active -= 1;
+    });
+  const first = run("session-a");
+  const second = run("session-b");
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(active, 2);
+  assert.equal(maxActive, 2);
+  release();
+  await Promise.all([first, second]);
+});
+
+test("releases an open-platform session lane after a failed turn", async () => {
+  let releaseFailure!: () => void;
+  const failureGate = new Promise<void>((resolve) => {
+    releaseFailure = resolve;
+  });
+  const failed = withOpenPlatformSessionLane("failed-session", async () => {
+    await failureGate;
+    throw new Error("expected failure");
+  });
+  const queuedRecovery = withOpenPlatformSessionLane(
+    "failed-session",
+    async () => "queued recovery",
+  );
+
+  releaseFailure();
+  await assert.rejects(
+    failed,
+    /expected failure/,
+  );
+  assert.equal(await queuedRecovery, "queued recovery");
+  assert.equal(
+    await withOpenPlatformSessionLane("failed-session", async () => "recovered"),
+    "recovered",
+  );
+});
+
+test("preserves per-session order under a multi-session burst", async () => {
+  const sessionCount = 8;
+  const turnsPerSession = 12;
+  const activeBySession = new Map<string, number>();
+  const maxActiveBySession = new Map<string, number>();
+  const observedBySession = new Map<string, number[]>();
+  let globalActive = 0;
+  let globalMaxActive = 0;
+
+  const tasks = Array.from({ length: sessionCount * turnsPerSession }, (_, index) => {
+    const sessionIndex = index % sessionCount;
+    const turnIndex = Math.floor(index / sessionCount);
+    const key = `burst-session-${sessionIndex}`;
+    return withOpenPlatformSessionLane(key, async () => {
+      const sessionActive = (activeBySession.get(key) ?? 0) + 1;
+      activeBySession.set(key, sessionActive);
+      maxActiveBySession.set(
+        key,
+        Math.max(maxActiveBySession.get(key) ?? 0, sessionActive),
+      );
+      globalActive += 1;
+      globalMaxActive = Math.max(globalMaxActive, globalActive);
+      observedBySession.set(key, [
+        ...(observedBySession.get(key) ?? []),
+        turnIndex,
+      ]);
+
+      await new Promise((resolve) => setTimeout(resolve, turnIndex % 3));
+
+      activeBySession.set(key, sessionActive - 1);
+      globalActive -= 1;
+    });
+  });
+
+  await Promise.all(tasks);
+
+  for (let sessionIndex = 0; sessionIndex < sessionCount; sessionIndex += 1) {
+    const key = `burst-session-${sessionIndex}`;
+    assert.equal(maxActiveBySession.get(key), 1);
+    assert.deepEqual(
+      observedBySession.get(key),
+      Array.from({ length: turnsPerSession }, (_, index) => index),
+    );
+  }
+  assert.ok(globalMaxActive > 1);
 });
 
 test("removes managed model and vendor identity disclosures", () => {
