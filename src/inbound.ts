@@ -2976,7 +2976,7 @@ function resolveLanguageModelPreflightUnits(): number {
   return 1;
 }
 
-function estimateLanguageModelCostUSD(
+export function estimateLanguageModelCostUSD(
   provider: string,
   model: string,
   usage: Record<string, unknown>
@@ -2985,12 +2985,18 @@ function estimateLanguageModelCostUSD(
     usage.cost && typeof usage.cost === "object" && !Array.isArray(usage.cost)
       ? (usage.cost as Record<string, unknown>)
       : {};
+  const name = `${provider}/${model}`.toLowerCase();
+  const isDeepSeek = name.includes("deepseek");
   const openClawCost = numberFromUsage(cost.total);
   if (openClawCost > 0) {
-    return { costUSD: openClawCost, costSource: "openclaw_usage_cost" };
+    return {
+      costUSD: isDeepSeek ? openClawCost * 2 : openClawCost,
+      costSource: isDeepSeek
+        ? "openclaw_usage_cost_deepseek_2x"
+        : "openclaw_usage_cost",
+    };
   }
 
-  const name = `${provider}/${model}`.toLowerCase();
   const input = numberFromUsage(usage.input);
   const output = numberFromUsage(usage.output);
   const cacheRead = numberFromUsage(usage.cacheRead);
@@ -3000,16 +3006,16 @@ function estimateLanguageModelCostUSD(
   if (name.includes("deepseek-v4-pro")) {
     return {
       costUSD:
-        (cacheRead * 0.003625 + cacheMissInput * 0.435 + output * 0.87) /
+        (cacheRead * 0.00725 + cacheMissInput * 0.87 + output * 1.74) /
         1000000,
-      costSource: "deepseek_official_v4_pro_usd_2026_06",
+      costSource: "deepseek_v4_pro_retail_2x_usd_2026_08",
     };
   }
   if (name.includes("deepseek")) {
     return {
       costUSD:
-        (cacheRead * 0.0028 + cacheMissInput * 0.14 + output * 0.28) / 1000000,
-      costSource: "deepseek_official_v4_flash_usd_2026_06",
+        (cacheRead * 0.0056 + cacheMissInput * 0.28 + output * 0.56) / 1000000,
+      costSource: "deepseek_v4_flash_retail_2x_usd_2026_08",
     };
   }
   return { costUSD: 0, costSource: "missing_model_price" };

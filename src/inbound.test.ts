@@ -16,6 +16,7 @@ import {
   buildInfiaiOriginatingTo,
   detachVoiceCallTurn,
   extractAssistantTextSnapshotFromSessionLine,
+  estimateLanguageModelCostUSD,
   inspectInfiaiSessionWorkspaceProjectionState,
   getInfiaiMessageKind,
   isProviderUnavailableText,
@@ -41,6 +42,46 @@ import {
   stripManagedChatLeaks,
   withOpenPlatformSessionLane,
 } from "./inbound";
+
+test("doubles DeepSeek OpenClaw-reported cost without changing other providers", () => {
+  assert.deepEqual(
+    estimateLanguageModelCostUSD("deepseek", "deepseek-v4-flash", {
+      cost: { total: 0.25 },
+    }),
+    {
+      costUSD: 0.5,
+      costSource: "openclaw_usage_cost_deepseek_2x",
+    },
+  );
+  assert.deepEqual(
+    estimateLanguageModelCostUSD("openrouter", "qwen/qwen3", {
+      cost: { total: 0.25 },
+    }),
+    { costUSD: 0.25, costSource: "openclaw_usage_cost" },
+  );
+});
+
+test("uses doubled DeepSeek Flash cache-hit, cache-miss and output prices", () => {
+  const usage = { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000, output: 1_000_000 };
+  assert.deepEqual(
+    estimateLanguageModelCostUSD("deepseek", "deepseek-v4-flash", usage),
+    {
+      costUSD: 1.1256,
+      costSource: "deepseek_v4_flash_retail_2x_usd_2026_08",
+    },
+  );
+});
+
+test("uses doubled DeepSeek Pro cache-hit, cache-miss and output prices", () => {
+  const usage = { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000, output: 1_000_000 };
+  assert.deepEqual(
+    estimateLanguageModelCostUSD("deepseek", "deepseek-v4-pro", usage),
+    {
+      costUSD: 3.48725,
+      costSource: "deepseek_v4_pro_retail_2x_usd_2026_08",
+    },
+  );
+});
 
 test("separates stable open-platform message identity from runtime attempts", () => {
   assert.deepEqual(
