@@ -20,8 +20,7 @@ export async function infiaiGatewayStartAccount(ctx: any): Promise<void> {
 
   const cfg = getOpenIMAccountConfig({ config: ctx.cfg ?? api.config }, ctx.accountId);
   if (!cfg) {
-    ctx.log?.warn?.(`[infiai] [${ctx.accountId}] missing or invalid account config`);
-    return;
+    throw new Error(`[infiai] [${ctx.accountId}] missing or invalid account config`);
   }
   if (!cfg.enabled) {
     ctx.log?.info?.(`[infiai] [${ctx.accountId}] account disabled; skipping`);
@@ -31,6 +30,7 @@ export async function infiaiGatewayStartAccount(ctx: any): Promise<void> {
   await startAccountClient(api, cfg, {
     abortSignal: ctx.abortSignal,
     gatewayConfig: ctx.cfg ?? api.config,
+    setStatus: ctx.setStatus,
   });
 }
 

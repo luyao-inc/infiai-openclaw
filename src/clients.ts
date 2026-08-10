@@ -1,4 +1,11 @@
-import { CbEvents, getSDK, LogLevel, type CallbackEvent, type MessageItem } from "@openim/client-sdk";
+import {
+  CbEvents,
+  getSDK,
+  LogLevel,
+  type ApiService,
+  type CallbackEvent,
+  type MessageItem,
+} from "@openim/client-sdk";
 import loglevel from "loglevel";
 import { processInboundMessage } from "./inbound";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
@@ -6,7 +13,7 @@ import { formatSdkError, infiaiDebug, resolveOpenIMSdkLogLevel } from "./utils";
 
 const clients = new Map<string, OpenIMClientState>();
 
-/** Serialize sdk.login() on singleton SDK; parallel logins race and break sessions. */
+/** Serialize login initialization because the browser SDK still touches shared globals during startup. */
 let loginGate = Promise.resolve();
 let sdkLoggingConfigured = false;
 let openIMConsoleFilterInstalled = false;
@@ -96,6 +103,12 @@ async function withLoginLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 function detachHandlers(state: OpenIMClientState): void {
+  state.sdk.off(CbEvents.OnConnecting, state.handlers.onConnecting);
+  state.sdk.off(CbEvents.OnConnectSuccess, state.handlers.onConnectSuccess);
+  state.sdk.off(CbEvents.OnConnectFailed, state.handlers.onConnectFailed);
+  state.sdk.off(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
+  state.sdk.off(CbEvents.OnUserTokenExpired, state.handlers.onUserTokenExpired);
+  state.sdk.off(CbEvents.OnUserTokenInvalid, state.handlers.onUserTokenInvalid);
   state.sdk.off(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
   state.sdk.off(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
   state.sdk.off(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
@@ -120,14 +133,54 @@ export async function stopAccountClient(api: any, accountId: string): Promise<vo
   if (!state) return;
   clients.delete(accountId);
   detachHandlers(state);
-  if (clients.size > 0) {
-    infiaiDebug(api, `[infiai] account ${accountId} detached (shared SDK kept alive for remaining accounts)`);
-    return;
-  }
   try {
     await state.sdk.logout();
   } catch (e: any) {
     api.logger?.warn?.(`[infiai] account ${accountId} logout failed: ${formatSdkError(e)}`);
+  }
+}
+
+const OPENIM_AUTH_ERROR_CODES = new Set([1501, 1502, 1503, 1504, 1505, 1506, 1507]);
+
+function sdkErrorCode(error: unknown): number | null {
+  const raw = (error as any)?.errCode ?? (error as any)?.code;
+  const code = Number(raw);
+  return Number.isFinite(code) && code > 0 ? code : null;
+}
+
+function safeSdkErrorSummary(error: unknown): string {
+  const err = error as any;
+  const code = sdkErrorCode(error);
+  const message = String(err?.errMsg ?? err?.message ?? err?.event ?? "OpenIM connection failed")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim()
+    .slice(0, 300);
+  return `${code ? `code=${code} ` : ""}${message}`.trim();
+}
+
+function connectionError(accountId: string, error: unknown, forceAuthInvalid = false): Error {
+  const code = sdkErrorCode(error);
+  const authInvalid = forceAuthInvalid || (code !== null && OPENIM_AUTH_ERROR_CODES.has(code));
+  const category = authInvalid ? "INFIAI_AUTH_INVALID" : "INFIAI_CONNECTION_FAILED";
+  return new Error(`${category} account=${accountId} ${safeSdkErrorSummary(error)}`.trim());
+}
+
+type AccountStatusPatch = {
+  connected?: boolean;
+  healthState?: string;
+  lastConnectedAt?: number;
+  lastError?: string | null;
+  terminalDisconnect?: boolean;
+};
+
+function setAccountStatus(
+  setStatus: ((patch: AccountStatusPatch) => unknown) | undefined,
+  patch: AccountStatusPatch,
+): void {
+  try {
+    setStatus?.(patch);
+  } catch {
+    // Status reporting must not break the OpenIM connection lifecycle.
   }
 }
 
@@ -138,20 +191,79 @@ export async function stopAccountClient(api: any, accountId: string): Promise<vo
 export async function startAccountClient(
   api: any,
   config: OpenIMAccountConfig,
-  opts?: { abortSignal?: AbortSignal; gatewayConfig?: any },
+  opts?: {
+    abortSignal?: AbortSignal;
+    gatewayConfig?: any;
+    setStatus?: (patch: AccountStatusPatch) => unknown;
+    sdk?: ApiService;
+  },
 ): Promise<void> {
-  const sdk = getConfiguredSDK();
+  const sdk = opts?.sdk ?? getConfiguredSDK();
+  let loginCompleted = false;
+  let lifecycleReject: ((error: Error) => void) | null = null;
+  let terminalError: Error | null = null;
+  const lifecycleFailure = new Promise<never>((_, reject) => {
+    lifecycleReject = reject;
+  });
+  void lifecycleFailure.catch(() => undefined);
+
+  const failLifecycle = (error: Error, healthState: string) => {
+    terminalError = error;
+    setAccountStatus(opts?.setStatus, {
+      connected: false,
+      healthState,
+      lastError: error.message,
+      terminalDisconnect: healthState === "auth_invalid",
+    });
+    lifecycleReject?.(error);
+  };
 
   const state = {
     sdk,
     config,
     gatewayConfig: opts?.gatewayConfig ?? api.config,
     handlers: {
+      onConnecting: () => undefined,
+      onConnectSuccess: () => undefined,
+      onConnectFailed: () => undefined,
+      onKickedOffline: () => undefined,
+      onUserTokenExpired: () => undefined,
+      onUserTokenInvalid: () => undefined,
       onRecvNewMessage: () => undefined,
       onRecvNewMessages: () => undefined,
       onRecvOfflineNewMessages: () => undefined,
     },
   } as OpenIMClientState;
+
+  state.handlers.onConnecting = () => {
+    setAccountStatus(opts?.setStatus, {
+      connected: false,
+      healthState: "connecting",
+      terminalDisconnect: false,
+    });
+  };
+  state.handlers.onConnectSuccess = () => {
+    if (!loginCompleted) return;
+    setAccountStatus(opts?.setStatus, {
+      connected: true,
+      healthState: "healthy",
+      lastConnectedAt: Date.now(),
+      lastError: null,
+      terminalDisconnect: false,
+    });
+  };
+  state.handlers.onConnectFailed = (event) => {
+    failLifecycle(connectionError(config.accountId, event), "disconnected");
+  };
+  state.handlers.onKickedOffline = (event) => {
+    failLifecycle(connectionError(config.accountId, { ...event, errCode: event?.errCode || 1506 }, true), "auth_invalid");
+  };
+  state.handlers.onUserTokenExpired = (event) => {
+    failLifecycle(connectionError(config.accountId, { ...event, errCode: event?.errCode || 1501 }, true), "auth_invalid");
+  };
+  state.handlers.onUserTokenInvalid = (event) => {
+    failLifecycle(connectionError(config.accountId, { ...event, errCode: event?.errCode || 1502 }, true), "auth_invalid");
+  };
 
   const consumeMessage = (msg: MessageItem) => {
     processInboundMessage(api, state, msg).catch((e: any) => {
@@ -171,40 +283,78 @@ export async function startAccountClient(
     for (const msg of list) consumeMessage(msg);
   };
 
+  sdk.on(CbEvents.OnConnecting, state.handlers.onConnecting);
+  sdk.on(CbEvents.OnConnectSuccess, state.handlers.onConnectSuccess);
+  sdk.on(CbEvents.OnConnectFailed, state.handlers.onConnectFailed);
+  sdk.on(CbEvents.OnKickedOffline, state.handlers.onKickedOffline);
+  sdk.on(CbEvents.OnUserTokenExpired, state.handlers.onUserTokenExpired);
+  sdk.on(CbEvents.OnUserTokenInvalid, state.handlers.onUserTokenInvalid);
   sdk.on(CbEvents.OnRecvNewMessage, state.handlers.onRecvNewMessage);
   sdk.on(CbEvents.OnRecvNewMessages, state.handlers.onRecvNewMessages);
   sdk.on(CbEvents.OnRecvOfflineNewMessages, state.handlers.onRecvOfflineNewMessages);
 
+  setAccountStatus(opts?.setStatus, {
+    connected: false,
+    healthState: "connecting",
+    lastError: null,
+    terminalDisconnect: false,
+  });
+
   try {
     await withLoginLock(async () => {
-      await sdk.login({
-        userID: config.userID,
-        token: config.token,
-        wsAddr: config.wsAddr,
-        apiAddr: config.apiAddr,
-        platformID: config.platformID,
-        logLevel: openIMSdkLogLevelValue(),
-      });
+      await Promise.race([
+        sdk.login({
+          userID: config.userID,
+          token: config.token,
+          wsAddr: config.wsAddr,
+          apiAddr: config.apiAddr,
+          platformID: config.platformID,
+          logLevel: openIMSdkLogLevelValue(),
+        }),
+        lifecycleFailure,
+      ]);
     });
+    if (terminalError) throw terminalError;
+    loginCompleted = true;
     clients.set(config.accountId, state);
+    setAccountStatus(opts?.setStatus, {
+      connected: true,
+      healthState: "healthy",
+      lastConnectedAt: Date.now(),
+      lastError: null,
+      terminalDisconnect: false,
+    });
     infiaiDebug(api, `[infiai] account ${config.accountId} connected`);
   } catch (e: any) {
     detachHandlers(state);
+    const error = e instanceof Error && /^INFIAI_/.test(e.message)
+      ? e
+      : connectionError(config.accountId, e);
+    setAccountStatus(opts?.setStatus, {
+      connected: false,
+      healthState: error.message.startsWith("INFIAI_AUTH_INVALID") ? "auth_invalid" : "disconnected",
+      lastError: error.message,
+      terminalDisconnect: error.message.startsWith("INFIAI_AUTH_INVALID"),
+    });
+    try {
+      await sdk.logout();
+    } catch {
+      // A failed login can leave the SDK only partially initialized.
+    }
     api.logger?.error?.(`[infiai] account ${config.accountId} login failed: ${formatSdkError(e)}`);
-    return;
+    throw error;
   }
 
   if (opts?.abortSignal) {
     try {
-      await new Promise<void>((resolve) => {
-        const sig = opts.abortSignal!;
-        if (sig.aborted) {
-          resolve();
-          return;
-        }
-        sig.addEventListener("abort", () => resolve(), { once: true });
+      const aborted = new Promise<void>((resolve) => {
+        const signal = opts.abortSignal!;
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
       });
+      await Promise.race([aborted, lifecycleFailure]);
     } finally {
+      lifecycleReject = null;
       await stopAccountClient(api, config.accountId);
     }
   }
