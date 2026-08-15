@@ -475,12 +475,20 @@ export function buildKnowledgeTrace(value: unknown): Record<string, unknown> | u
   }
   const contextProvided = source.contextProvided === true;
   const inventoryProvided = source.inventoryProvided === true;
+  const usedEvidenceIDs = Array.from(new Set(
+    (Array.isArray(source.usedEvidenceIDs) ? source.usedEvidenceIDs : [])
+      .map((item: unknown) => String(item || "").trim())
+      .filter((item: string) => /^kbe_[0-9a-f]{16}$/i.test(item)),
+  ));
   const sources = contextProvided && Array.isArray(source.sources)
       ? source.sources.slice(0, 8).flatMap((item: any) => {
         if (item?.sourceType !== "website_page") return [];
+        const evidenceID = String(item?.evidenceID || "").trim();
+        if (!/^kbe_[0-9a-f]{16}$/i.test(evidenceID)) return [];
         const sourceURL = sanitizePublicKnowledgeURL(item?.sourceURL);
         if (!sourceURL) return [];
         return [{
+          evidenceID,
           publicTitle: safePublicKnowledgeTitle(item?.publicTitle, sourceURL),
           sourceURL,
           sourceType: "website_page" as const,
@@ -499,16 +507,31 @@ export function buildKnowledgeTrace(value: unknown): Record<string, unknown> | u
     noReliableSource: source.noReliableSource === true && !contextProvided && !inventoryProvided,
     contextProvided,
     inventoryProvided,
+    attributionCompleted: source.attributionCompleted === true,
+    usedEvidenceIDs,
     hitCount,
     sources,
   };
 }
 
 export function buildKnowledgeReferences(value: unknown): Array<{ title: string; url: string }> {
-  const trace = buildKnowledgeTrace(value) as { searched?: boolean; hitCount?: number; sources?: any[] } | undefined;
-  if (!trace?.searched || Number(trace.hitCount || 0) <= 0 || !Array.isArray(trace.sources)) return [];
+  const trace = buildKnowledgeTrace(value) as {
+    searched?: boolean;
+    hitCount?: number;
+    attributionCompleted?: boolean;
+    usedEvidenceIDs?: string[];
+    sources?: any[];
+  } | undefined;
+  if (
+    !trace?.searched || Number(trace.hitCount || 0) <= 0 ||
+    trace.attributionCompleted !== true ||
+    !Array.isArray(trace.usedEvidenceIDs) || trace.usedEvidenceIDs.length === 0 ||
+    !Array.isArray(trace.sources)
+  ) return [];
+  const used = new Set(trace.usedEvidenceIDs);
   const seen = new Set<string>();
   return trace.sources.flatMap((source) => {
+    if (!used.has(String(source?.evidenceID || ""))) return [];
     const url = sanitizePublicKnowledgeURL(source?.sourceURL);
     if (!url || seen.has(url)) return [];
     seen.add(url);
