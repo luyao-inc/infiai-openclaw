@@ -453,7 +453,15 @@ function sanitizePublicKnowledgeURL(value: unknown): string {
 }
 
 function safePublicKnowledgeTitle(value: unknown, sourceURL: string): string {
-  const raw = String(value || "").replace(/[\r\n\t]+/g, " ").trim();
+  const raw = String(value || "")
+    .replace(/!?\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\*\*|__|`/g, "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[*_#\s]+|[*_#\s]+$/g, "")
+    .trim();
   if (raw && raw.length <= 160 && !/[\\/]/.test(raw) && !raw.startsWith(".")) {
     const extension = raw.match(/\.(?:md|markdown|txt|html?)$/i)?.[0];
     if (!extension) return raw;
