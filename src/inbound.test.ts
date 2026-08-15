@@ -53,14 +53,11 @@ test("builds a public-only knowledge trace without internal identifiers or priva
       searched: true,
       route: "retrieval_first",
       contextProvided: true,
-      attributionCompleted: true,
-      usedEvidenceIDs: ["kbe_1111111111111111"],
       hitCount: 2,
       documentIDs: ["doc-1", "doc-2"],
       sources: [
         {
           kbID: "kb-1",
-          evidenceID: "kbe_1111111111111111",
           docID: "doc-1",
           chunkID: "chunk-1",
           fileName: "/private/customer/api-secret.md",
@@ -80,11 +77,9 @@ test("builds a public-only knowledge trace without internal identifiers or priva
       noReliableSource: false,
       contextProvided: true,
       inventoryProvided: false,
-      attributionCompleted: true,
-      usedEvidenceIDs: ["kbe_1111111111111111"],
       hitCount: 2,
       sources: [
-        { evidenceID: "kbe_1111111111111111", publicTitle: "开放平台 API", sourceURL: "https://open.lingxie.net/api", sourceType: "website_page", visibility: "public" },
+        { publicTitle: "开放平台 API", sourceURL: "https://open.lingxie.net/api", sourceType: "website_page", visibility: "public" },
       ],
   });
   const serialized = JSON.stringify(trace);
@@ -98,10 +93,8 @@ test("assistant reply metadata carries only public website references", () => {
     searched: true,
     route: "retrieval_first",
     contextProvided: true,
-    attributionCompleted: true,
-    usedEvidenceIDs: ["kbe_2222222222222222"],
     hitCount: 1,
-    sources: [{ evidenceID: "kbe_2222222222222222", docID: "doc-1", chunkID: "chunk-1", fileName: "private-name.md", visibility: "private", sourceType: "website_page", sourceURL: "https://open.lingxie.net/api" }],
+    sources: [{ docID: "doc-1", chunkID: "chunk-1", fileName: "private-name.md", sourceType: "website_page", sourceURL: "https://open.lingxie.net/api" }],
   };
   const references = buildKnowledgeReferences(metrics);
   const ex = JSON.parse(buildAssistantReplyEx({ clientMsgID: "parent-1", ex: "" } as any, "assistant_reply", { references }));
@@ -127,8 +120,6 @@ test("knowledge trace keeps searched and no-source states distinct", () => {
       noReliableSource: true,
       contextProvided: false,
       inventoryProvided: false,
-      attributionCompleted: false,
-      usedEvidenceIDs: [],
       hitCount: 0,
       sources: [],
     },
@@ -140,21 +131,19 @@ test("knowledge trace filters localhost and private network sources", () => {
     searched: true,
     route: "retrieval_first",
     contextProvided: true,
-    attributionCompleted: true,
-    usedEvidenceIDs: ["kbe_7777777777777777"],
     hitCount: 5,
     sources: [
-      { evidenceID: "kbe_1111111111111111", visibility: "public", sourceType: "website_page", sourceURL: "http://localhost/a" },
-      { evidenceID: "kbe_2222222222222222", visibility: "public", sourceType: "website_page", sourceURL: "http://127.0.0.2/a" },
-      { evidenceID: "kbe_3333333333333333", visibility: "public", sourceType: "website_page", sourceURL: "http://10.1.2.3/a" },
-      { evidenceID: "kbe_4444444444444444", visibility: "public", sourceType: "website_page", sourceURL: "http://[::1]/a" },
-      { evidenceID: "kbe_5555555555555555", visibility: "public", sourceType: "website_page", sourceURL: "http://[::ffff:127.0.0.1]/a" },
-      { evidenceID: "kbe_6666666666666666", visibility: "public", sourceType: "upload", sourceURL: "https://files.example.com/upload.pdf" },
-      { evidenceID: "kbe_7777777777777777", visibility: "public", sourceType: "website_page", sourceURL: "https://api-docs.deepseek.com/quick_start" },
+      { sourceType: "website_page", sourceURL: "http://localhost/a" },
+      { sourceType: "website_page", sourceURL: "http://127.0.0.2/a" },
+      { sourceType: "website_page", sourceURL: "http://10.1.2.3/a" },
+      { sourceType: "website_page", sourceURL: "http://[::1]/a" },
+      { sourceType: "website_page", sourceURL: "http://[::ffff:127.0.0.1]/a" },
+      { sourceType: "upload", sourceURL: "https://files.example.com/upload.pdf" },
+      { sourceType: "website_page", sourceURL: "https://api-docs.deepseek.com/quick_start" },
     ],
   });
   assert.deepEqual(trace?.sources, [
-    { evidenceID: "kbe_7777777777777777", publicTitle: "quick_start", sourceURL: "https://api-docs.deepseek.com/quick_start", sourceType: "website_page", visibility: "public" },
+    { publicTitle: "quick_start", sourceURL: "https://api-docs.deepseek.com/quick_start", sourceType: "website_page", visibility: "public" },
   ]);
 });
 
@@ -166,8 +155,6 @@ test("inventory context is reliable even when there are zero vector hits", () =>
       noReliableSource: true,
       contextProvided: true,
       inventoryProvided: true,
-      attributionCompleted: false,
-      usedEvidenceIDs: [],
       hitCount: 0,
     }),
     {
@@ -176,8 +163,6 @@ test("inventory context is reliable even when there are zero vector hits", () =>
       noReliableSource: false,
       contextProvided: true,
       inventoryProvided: true,
-      attributionCompleted: false,
-      usedEvidenceIDs: [],
       hitCount: 0,
       sources: [],
     },
@@ -190,12 +175,9 @@ test("actual website matches remain referenceable when inventory context also pa
       searched: true,
       contextProvided: true,
       inventoryProvided: true,
-      attributionCompleted: true,
-      usedEvidenceIDs: ["kbe_8888888888888888"],
       hitCount: 1,
       sources: [
         {
-          evidenceID: "kbe_8888888888888888",
           sourceType: "website_page",
           sourceURL: "https://api-docs.deepseek.com/guides/json_mode",
           publicTitle: "JSON Output",
@@ -206,19 +188,26 @@ test("actual website matches remain referenceable when inventory context also pa
   );
 });
 
-test("references require actual answer attribution and include only the used source subset", () => {
+test("references deterministically use injected website sources, deduplicate, and cap at three", () => {
   const sources = [
-    { evidenceID: "kbe_aaaaaaaaaaaaaaaa", sourceType: "website_page", sourceURL: "https://open.lingxie.net/api", publicTitle: "开放平台" },
-    { evidenceID: "kbe_bbbbbbbbbbbbbbbb", sourceType: "website_page", sourceURL: "https://api-docs.deepseek.com/guides/json_mode", publicTitle: "JSON Output" },
+    { sourceType: "website_page", sourceURL: "https://open.lingxie.net/api", publicTitle: "开放平台" },
+    { sourceType: "website_page", sourceURL: "https://open.lingxie.net/api?duplicate=1", publicTitle: "重复页面" },
+    { sourceType: "upload", sourceURL: "https://files.example.com/private.pdf", publicTitle: "上传资料" },
+    { sourceType: "website_page", sourceURL: "https://api-docs.deepseek.com/guides/json_mode", publicTitle: "JSON Output" },
+    { sourceType: "website_page", sourceURL: "https://open.lingxie.net/office", publicTitle: "办公平台" },
+    { sourceType: "website_page", sourceURL: "https://open.lingxie.net/api/authentication", publicTitle: "API 鉴权" },
   ];
-  const base = { searched: true, contextProvided: true, hitCount: 2, sources };
-  assert.deepEqual(buildKnowledgeReferences(base), []);
-  assert.deepEqual(buildKnowledgeReferences({ ...base, attributionCompleted: true, usedEvidenceIDs: [] }), []);
-  assert.deepEqual(buildKnowledgeReferences({ ...base, attributionCompleted: true, usedEvidenceIDs: ["kbe_cccccccccccccccc"] }), []);
   assert.deepEqual(
-    buildKnowledgeReferences({ ...base, attributionCompleted: true, usedEvidenceIDs: ["kbe_bbbbbbbbbbbbbbbb"] }),
-    [{ title: "JSON Output", url: "https://api-docs.deepseek.com/guides/json_mode" }],
+    buildKnowledgeReferences({ searched: true, contextProvided: true, hitCount: 6, sources }),
+    [
+      { title: "开放平台", url: "https://open.lingxie.net/api" },
+      { title: "JSON Output", url: "https://api-docs.deepseek.com/guides/json_mode" },
+      { title: "办公平台", url: "https://open.lingxie.net/office" },
+    ],
   );
+  assert.deepEqual(buildKnowledgeReferences({ searched: false, contextProvided: true, hitCount: 6, sources }), []);
+  assert.deepEqual(buildKnowledgeReferences({ searched: true, contextProvided: false, hitCount: 6, sources }), []);
+  assert.deepEqual(buildKnowledgeReferences({ searched: true, contextProvided: true, hitCount: 0, sources }), []);
 });
 
 test("latest knowledge metrics wins over the before-prompt placeholder", () => {
