@@ -10,6 +10,11 @@ import {
   appendInteractiveReplyContractToBodyForAgent,
   appendLongTermMemoryContextToBodyForAgent,
   buildOpenPlatformOutboundPrompt,
+  buildKnowledgeReferences,
+  buildKnowledgeTrace,
+  buildAssistantReplyEx,
+  resolveRuntimeSessionIdSync,
+  selectLatestKnowledgeMetrics,
   voiceCallMemoryContextForTurn,
   buildVoiceCallTurnSurface,
   buildTextEnvelope,
@@ -42,6 +47,182 @@ import {
   stripManagedChatLeaks,
   withOpenPlatformSessionLane,
 } from "./inbound";
+
+test("builds a public-only knowledge trace without internal identifiers or private filenames", () => {
+  const trace = buildKnowledgeTrace({
+      searched: true,
+      route: "retrieval_first",
+      contextProvided: true,
+      hitCount: 2,
+      documentIDs: ["doc-1", "doc-2"],
+      sources: [
+        {
+          kbID: "kb-1",
+          docID: "doc-1",
+          chunkID: "chunk-1",
+          fileName: "/private/customer/api-secret.md",
+          publicTitle: "开放平台 API",
+          section: "internal-section",
+          visibility: "public",
+          sourceType: "website_page",
+          sourceURL: "https://user:password@open.lingxie.net/api?token=secret#auth",
+          score: 0.9,
+        },
+        { kbID: "kb-1", docID: "doc-2", chunkID: "chunk-2", fileName: "Internal", visibility: "private", sourceURL: "https://internal.invalid", score: 0.8 },
+      ],
+    });
+  assert.deepEqual(trace, {
+      searched: true,
+      route: "retrieval_first",
+      noReliableSource: false,
+      contextProvided: true,
+      inventoryProvided: false,
+      hitCount: 2,
+      sources: [
+        { publicTitle: "开放平台 API", sourceURL: "https://open.lingxie.net/api", sourceType: "website_page", visibility: "public" },
+      ],
+  });
+  const serialized = JSON.stringify(trace);
+  for (const secret of ["kb-1", "doc-1", "chunk-1", "customer", "api-secret", "internal-section", "password", "token=secret"]) {
+    assert.equal(serialized.includes(secret), false, secret);
+  }
+});
+
+test("assistant reply metadata carries only public website references", () => {
+  const metrics = {
+    searched: true,
+    route: "retrieval_first",
+    contextProvided: true,
+    hitCount: 1,
+    sources: [{ docID: "doc-1", chunkID: "chunk-1", fileName: "private-name.md", visibility: "private", sourceType: "website_page", sourceURL: "https://open.lingxie.net/api" }],
+  };
+  const references = buildKnowledgeReferences(metrics);
+  const ex = JSON.parse(buildAssistantReplyEx({ clientMsgID: "parent-1", ex: "" } as any, "assistant_reply", { references }));
+  assert.deepEqual(ex.infiai.references, [{ title: "api", url: "https://open.lingxie.net/api" }]);
+  assert.equal("knowledgeTrace" in ex.infiai, false);
+  assert.equal(ex.infiai.parentClientMsgID, "parent-1");
+  assert.deepEqual(buildKnowledgeReferences(buildKnowledgeTrace(metrics)), [
+    { title: "api", url: "https://open.lingxie.net/api" },
+  ]);
+});
+
+test("knowledge trace keeps searched and no-source states distinct", () => {
+  assert.equal(buildKnowledgeTrace({}), undefined);
+  assert.deepEqual(
+    buildKnowledgeTrace({
+      searched: false,
+      route: "retrieval_first",
+      noReliableSource: true,
+    }),
+    {
+      searched: false,
+      route: "retrieval_first",
+      noReliableSource: true,
+      contextProvided: false,
+      inventoryProvided: false,
+      hitCount: 0,
+      sources: [],
+    },
+  );
+});
+
+test("knowledge trace filters localhost and private network sources", () => {
+  const trace = buildKnowledgeTrace({
+    searched: true,
+    route: "retrieval_first",
+    contextProvided: true,
+    hitCount: 5,
+    sources: [
+      { visibility: "public", sourceType: "website_page", sourceURL: "http://localhost/a" },
+      { visibility: "public", sourceType: "website_page", sourceURL: "http://127.0.0.2/a" },
+      { visibility: "public", sourceType: "website_page", sourceURL: "http://10.1.2.3/a" },
+      { visibility: "public", sourceType: "website_page", sourceURL: "http://[::1]/a" },
+      { visibility: "public", sourceType: "website_page", sourceURL: "http://[::ffff:127.0.0.1]/a" },
+      { visibility: "public", sourceType: "upload", sourceURL: "https://files.example.com/upload.pdf" },
+      { visibility: "public", sourceType: "website_page", sourceURL: "https://api-docs.deepseek.com/quick_start" },
+    ],
+  });
+  assert.deepEqual(trace?.sources, [
+    { publicTitle: "quick_start", sourceURL: "https://api-docs.deepseek.com/quick_start", sourceType: "website_page", visibility: "public" },
+  ]);
+});
+
+test("inventory context is reliable even when there are zero vector hits", () => {
+  assert.deepEqual(
+    buildKnowledgeTrace({
+      searched: true,
+      route: "retrieval_first",
+      noReliableSource: true,
+      contextProvided: true,
+      inventoryProvided: true,
+      hitCount: 0,
+    }),
+    {
+      searched: true,
+      route: "retrieval_first",
+      noReliableSource: false,
+      contextProvided: true,
+      inventoryProvided: true,
+      hitCount: 0,
+      sources: [],
+    },
+  );
+});
+
+test("actual website matches remain referenceable when inventory context also participated", () => {
+  assert.deepEqual(
+    buildKnowledgeReferences({
+      searched: true,
+      contextProvided: true,
+      inventoryProvided: true,
+      hitCount: 1,
+      sources: [
+        {
+          sourceType: "website_page",
+          sourceURL: "https://api-docs.deepseek.com/guides/json_mode",
+          publicTitle: "JSON Output",
+        },
+      ],
+    }),
+    [{ title: "JSON Output", url: "https://api-docs.deepseek.com/guides/json_mode" }],
+  );
+});
+
+test("latest knowledge metrics wins over the before-prompt placeholder", () => {
+  assert.deepEqual(
+    selectLatestKnowledgeMetrics(
+      { updatedAt: 100, route: "retrieval_first", searched: false },
+      { updatedAt: 101, route: "second_stage_search", searched: true, hitCount: 2 },
+    ),
+    { updatedAt: 101, route: "second_stage_search", searched: true, hitCount: 2 },
+  );
+});
+
+test("resolves the runtime session id used by before-prompt evidence", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "infiai-session-store-"));
+  const storePath = path.join(dir, "sessions.json");
+  try {
+    await fs.writeFile(
+      storePath,
+      JSON.stringify({
+        "agent:test:infiai:direct:owner:visitor": {
+          sessionId: "runtime-session-1",
+        },
+      }),
+      "utf8",
+    );
+    assert.equal(
+      resolveRuntimeSessionIdSync(
+        storePath,
+        "agent:test:infiai:direct:owner:visitor",
+        "test",
+      ),
+      "runtime-session-1",
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("doubles DeepSeek OpenClaw-reported cost without changing other providers", () => {
   assert.deepEqual(

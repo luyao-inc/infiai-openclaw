@@ -4,7 +4,7 @@ import {
   SessionType,
   type MessageItem,
 } from "@openim/client-sdk";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, createHmac, randomUUID } from "node:crypto";
@@ -238,7 +238,7 @@ function isHumanSelfAssistantMessage(
   );
 }
 
-function buildAssistantReplyEx(
+export function buildAssistantReplyEx(
   msg: MessageItem,
   messageKind = MESSAGE_KIND_ASSISTANT_REPLY,
   extraInfiai?: Record<string, unknown>
@@ -397,31 +397,193 @@ export type OpenPlatformMessageResult = {
     memoryIngestMs?: number;
   };
   warnings?: string[];
-  knowledge?: {
-    intent?: string;
-    hitCount?: number;
-    documentIDs?: string[];
-    cacheHit?: boolean;
-  };
+  references?: Array<{ title: string; url: string }>;
 };
 
-const voiceKnowledgeMetricsSymbol = Symbol.for("infiai.voiceKnowledgeMetrics");
+function privateOrReservedIPv4(parts: number[]): boolean {
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  return (
+    parts[0] === 0 || parts[0] === 10 || parts[0] === 127 || parts[0] >= 224 ||
+    (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) ||
+    (parts[0] === 169 && parts[1] === 254) ||
+    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+    (parts[0] === 192 && parts[1] === 168) ||
+    (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19))
+  );
+}
 
-function takeVoiceKnowledgeMetrics(...keys: Array<string | undefined>): Record<string, any> {
-  const root = globalThis as typeof globalThis & {
-    [voiceKnowledgeMetricsSymbol]?: Map<string, Record<string, any>>;
+function mappedIPv4Parts(hostname: string): number[] {
+  const dotted = hostname.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)?.[1];
+  if (dotted) return dotted.split(".").map(Number);
+  // WHATWG URL normalizes ::ffff:127.0.0.1 to ::ffff:7f00:1.
+  const hexadecimal = hostname.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (!hexadecimal) return [];
+  const high = Number.parseInt(hexadecimal[1], 16);
+  const low = Number.parseInt(hexadecimal[2], 16);
+  return [high >> 8, high & 0xff, low >> 8, low & 0xff];
+}
+
+function sanitizePublicKnowledgeURL(value: unknown): string {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    if (!['http:', 'https:'].includes(url.protocol)) return "";
+    const host = url.hostname.toLowerCase();
+    const bareHost = host.replace(/^\[|\]$/g, "");
+    const ipv4 = host.split(".").map((part) => Number(part));
+    const mappedIPv4 = mappedIPv4Parts(bareHost);
+    if (
+      host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") ||
+      host.endsWith(".lan") || host.endsWith(".internal") || bareHost === "::1" || bareHost === "::" ||
+      privateOrReservedIPv4(ipv4) || privateOrReservedIPv4(mappedIPv4) ||
+      /^(?:fc|fd)[0-9a-f]{2}:/i.test(bareHost) || /^fe[89ab][0-9a-f]:/i.test(bareHost) ||
+      /^ff[0-9a-f]{2}:/i.test(bareHost)
+    ) return "";
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function safePublicKnowledgeTitle(value: unknown, sourceURL: string): string {
+  const raw = String(value || "").replace(/[\r\n\t]+/g, " ").trim();
+  if (raw && raw.length <= 160 && !/[\\/]/.test(raw) && !raw.startsWith(".")) return raw;
+  try {
+    const url = new URL(sourceURL);
+    const tail = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "")
+      .replace(/[\r\n\t]+/g, " ")
+      .slice(0, 160)
+      .trim();
+    return tail || url.hostname;
+  } catch {
+    return "";
+  }
+}
+
+export function buildKnowledgeTrace(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const source = value as Record<string, any>;
+  if (!["searched", "route", "hitCount", "sources", "noReliableSource"].some((key) => key in source)) {
+    return undefined;
+  }
+  const contextProvided = source.contextProvided === true;
+  const inventoryProvided = source.inventoryProvided === true;
+  const sources = contextProvided && Array.isArray(source.sources)
+      ? source.sources.slice(0, 8).flatMap((item: any) => {
+        if (item?.sourceType !== "website_page") return [];
+        const sourceURL = sanitizePublicKnowledgeURL(item?.sourceURL);
+        if (!sourceURL) return [];
+        return [{
+          publicTitle: safePublicKnowledgeTitle(item?.publicTitle, sourceURL),
+          sourceURL,
+          sourceType: "website_page" as const,
+          visibility: "public" as const,
+        }];
+      })
+    : [];
+  const rawHitCount = Number(source.hitCount || 0);
+  const hitCount = Number.isFinite(rawHitCount) ? Math.max(0, Math.floor(rawHitCount)) : 0;
+  const route = ["skip", "retrieval_first", "second_stage_search"].includes(String(source.route))
+    ? String(source.route)
+    : "";
+  return {
+    searched: source.searched === true,
+    route,
+    noReliableSource: source.noReliableSource === true && !contextProvided && !inventoryProvided,
+    contextProvided,
+    inventoryProvided,
+    hitCount,
+    sources,
   };
-  const store = root[voiceKnowledgeMetricsSymbol];
-  if (!(store instanceof Map)) return {};
-  let found: Record<string, any> | undefined;
+}
+
+export function buildKnowledgeReferences(value: unknown): Array<{ title: string; url: string }> {
+  const trace = buildKnowledgeTrace(value) as { searched?: boolean; hitCount?: number; sources?: any[] } | undefined;
+  if (!trace?.searched || Number(trace.hitCount || 0) <= 0 || !Array.isArray(trace.sources)) return [];
+  const seen = new Set<string>();
+  return trace.sources.flatMap((source) => {
+    const url = sanitizePublicKnowledgeURL(source?.sourceURL);
+    if (!url || seen.has(url)) return [];
+    seen.add(url);
+    return [{ title: safePublicKnowledgeTitle(source?.publicTitle, url), url }];
+  });
+}
+
+const knowledgeMetricsSymbol = Symbol.for("infiai.knowledgeMetrics");
+const knowledgeMetricsDir = path.join(os.tmpdir(), "infiai-knowledge-metrics-v1");
+
+function takePersistedKnowledgeMetrics(key: string): Record<string, any> | undefined {
+  const file = path.join(
+    knowledgeMetricsDir,
+    `${createHash("sha256").update(key).digest("hex")}.json`
+  );
+  try {
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    unlinkSync(file);
+    if (!value || typeof value !== "object" || Number(value.expiresAt || 0) < Date.now()) return undefined;
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+export function selectLatestKnowledgeMetrics(
+  ...values: Array<Record<string, any> | undefined>
+): Record<string, any> {
+  let latest: Record<string, any> | undefined;
+  for (const value of values) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    if (!latest || Number(value.updatedAt || 0) >= Number(latest.updatedAt || 0)) latest = value;
+  }
+  return latest || {};
+}
+
+function takeKnowledgeMetrics(...keys: Array<string | undefined>): Record<string, any> {
+  const root = process as typeof process & {
+    [knowledgeMetricsSymbol]?: Map<string, Record<string, any>>;
+  };
+  const store = root[knowledgeMetricsSymbol];
+  const found: Array<Record<string, any>> = [];
   for (const rawKey of keys) {
     const key = String(rawKey || "").trim();
     if (!key) continue;
-    const value = store.get(key);
-    store.delete(key);
-    if (!found && value && Number(value.expiresAt || 0) >= Date.now()) found = value;
+    const memoryValue = store instanceof Map ? store.get(key) : undefined;
+    if (store instanceof Map) store.delete(key);
+    const persistedValue = takePersistedKnowledgeMetrics(key);
+    for (const value of [memoryValue, persistedValue]) {
+      if (value && Number(value.expiresAt || 0) >= Date.now()) found.push(value);
+    }
   }
-  return found || {};
+  return selectLatestKnowledgeMetrics(...found);
+}
+
+export function resolveRuntimeSessionIdSync(
+  storePath: string,
+  sessionKey: string,
+  agentId: string
+): string {
+  const key = String(sessionKey || "").trim();
+  if (!key) return "";
+  const candidates = [storePath, fallbackSessionStorePath(agentId)]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, "utf8"));
+      const sessionId = String(parsed?.[key]?.sessionId || "").trim();
+      if (sessionId) return sessionId;
+    } catch {
+      // The runtime may be creating or rotating the session; try the fallback.
+    }
+  }
+  return "";
 }
 
 type BufferedAgentTurnParams = OpenPlatformMessageParams &
@@ -2038,7 +2200,7 @@ export function buildTextEnvelope(
       ownerAuthorized ? "true" : "false"
     }" social_tools="${socialCapability}" denial_reason="${denialReason}"${mentionAttrs} />`,
     `<infiai_current_conversation ${currentConversationAttrs} />`,
-    bodyText,
+    `<infiai_user_message>\n${bodyText}\n</infiai_user_message>`,
   ].join("\n");
   const envelopeOptions =
     runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
@@ -4331,17 +4493,22 @@ async function sendReplyFromInbound(
       provider?: string;
       model?: string;
     };
+    knowledgeTrace?: Record<string, unknown>;
   } = {}
 ): Promise<void> {
   const isGroup = isGroupMessage(msg);
+  const references = buildKnowledgeReferences(options.knowledgeTrace);
   const replyEx = buildAssistantReplyEx(
     msg,
     options.messageKind || MESSAGE_KIND_ASSISTANT_REPLY,
-    options.voice
+    options.voice || references.length > 0
       ? {
+          ...(references.length > 0 ? { references } : {}),
+          ...(options.voice ? {
           replyMode: "voice",
           transcript: options.voice.transcript,
           voiceDuration: options.voice.duration,
+          } : {}),
         }
       : undefined
   );
@@ -4735,6 +4902,7 @@ async function sendClassifiedReplyFromInbound(
     tenantID?: string;
     ownerUserID?: string;
     agentID?: string;
+    knowledgeTrace?: Record<string, unknown>;
   }
 ): Promise<boolean> {
   if (shouldSuppressGeneratedReplyToManagedBot(params)) {
@@ -4817,6 +4985,7 @@ async function sendClassifiedReplyFromInbound(
   await sendReplyFromInbound(client, msg, text, {
     messageKind: params.messageKind,
     voice,
+    knowledgeTrace: params.knowledgeTrace,
   });
   return true;
 }
@@ -6123,9 +6292,14 @@ async function processBufferedAgentTurn(
       typeof runtimeInfiaiContext.knowledge === "object"
         ? runtimeInfiaiContext.knowledge
         : {};
-    const knowledgeRuntime = Object.keys(knowledgeFromCtx).length > 0
-      ? knowledgeFromCtx
-      : takeVoiceKnowledgeMetrics(messageID, effectiveSessionKey);
+    const knowledgeRuntime = selectLatestKnowledgeMetrics(
+      knowledgeFromCtx,
+      takeKnowledgeMetrics(
+        messageID,
+        effectiveSessionKey,
+        resolveRuntimeSessionIdSync(storePath, effectiveSessionKey, executionAgentId),
+      ),
+    );
     timings.knowledgeRouteMs = Number(knowledgeRuntime.routeMs || 0);
     timings.knowledgeSearchMs = Number(knowledgeRuntime.searchMs || 0);
     timings.knowledgeCacheHit = knowledgeRuntime.cacheHit === true;
@@ -6229,14 +6403,7 @@ async function processBufferedAgentTurn(
       },
       timings,
       warnings: Array.from(new Set(warnings)),
-      knowledge: {
-        intent: String(knowledgeRuntime.intent || ""),
-        hitCount: Number(knowledgeRuntime.hitCount || 0),
-        documentIDs: Array.isArray(knowledgeRuntime.documentIDs)
-          ? knowledgeRuntime.documentIDs.map((value: unknown) => String(value))
-          : [],
-        cacheHit: knowledgeRuntime.cacheHit === true,
-      },
+      references: buildKnowledgeReferences(knowledgeRuntime),
     };
   } finally {
     if (staged) await cleanupStagedInboundMedia(staged);
@@ -7126,6 +7293,22 @@ export async function processInboundMessage(
       sessionContinuityEnabled,
     },
   };
+  let cachedInboundKnowledgeMetrics: Record<string, any> | undefined;
+  let cachedInboundKnowledgeTrace: Record<string, unknown> | undefined;
+  const currentInboundKnowledgeTrace = (): Record<string, unknown> | undefined => {
+    const latest = selectLatestKnowledgeMetrics(
+      (ctxPayload._infiai as Record<string, any>)?.knowledge,
+      takeKnowledgeMetrics(
+        String(msg.clientMsgID || msg.serverMsgID || ""),
+        effectiveSessionKey,
+        resolveRuntimeSessionIdSync(storePath, effectiveSessionKey, executionAgentId),
+      ),
+      cachedInboundKnowledgeMetrics,
+    );
+    cachedInboundKnowledgeMetrics = latest;
+    cachedInboundKnowledgeTrace = buildKnowledgeTrace(latest);
+    return cachedInboundKnowledgeTrace;
+  };
 
   const obsGroupOk = !group || mentioned;
   if (obsGroupOk) {
@@ -7351,6 +7534,7 @@ export async function processInboundMessage(
                       ),
                       ownerUserID: selfUid,
                       agentID: businessAgentID,
+                      knowledgeTrace: currentInboundKnowledgeTrace(),
                     }
                   );
                   deliveredVisibleReply = sent;
@@ -7564,6 +7748,7 @@ export async function processInboundMessage(
       await sendReplyFromInbound(client, msg, assistantText, {
         messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
         voice,
+        knowledgeTrace: currentInboundKnowledgeTrace(),
       });
       deliveredVisibleReply = true;
       if (
@@ -7606,6 +7791,7 @@ export async function processInboundMessage(
       }
     }
     if (dispatchObsStart && obsGroupOk) {
+      const observedKnowledgeTrace = currentInboundKnowledgeTrace();
       obsInboundLog(api, "inbound.dispatch.done", {
         accountId: client.config.accountId,
         agentId: executionAgentId,
@@ -7615,6 +7801,9 @@ export async function processInboundMessage(
         effectiveSessionKey,
         clientMsgID: msg.clientMsgID || undefined,
         durationMs: Date.now() - dispatchObsStart,
+        knowledgeSearched: observedKnowledgeTrace?.searched === true,
+        knowledgeHitCount: Number(observedKnowledgeTrace?.hitCount || 0),
+        knowledgeReferenceCount: buildKnowledgeReferences(observedKnowledgeTrace).length,
       });
     }
     if (!deliveredVisibleReply && !dispatchedFailureReply) {
@@ -7673,6 +7862,7 @@ export async function processInboundMessage(
               ),
               ownerUserID: selfUid,
               agentID: businessAgentID,
+              knowledgeTrace: currentInboundKnowledgeTrace(),
             }
           );
           deliveredVisibleReply = sent;
@@ -7743,6 +7933,7 @@ export async function processInboundMessage(
           senderManaged,
           fromManagedBotSession: inboundFromManagedBot,
           reason: "dispatch_failed",
+          knowledgeTrace: currentInboundKnowledgeTrace(),
         }
       );
     } catch {
