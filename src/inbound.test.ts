@@ -210,6 +210,24 @@ test("references deterministically use injected website sources, deduplicate, an
   assert.deepEqual(buildKnowledgeReferences({ searched: true, contextProvided: true, hitCount: 0, sources }), []);
 });
 
+test("legacy indexed website filenames are not exposed as public reference titles", () => {
+  const references = buildKnowledgeReferences({
+    searched: true,
+    hitCount: 1,
+    contextProvided: true,
+    sources: [
+      {
+        sourceType: "website_page",
+        sourceURL: "https://open.lingxie.net/start",
+        publicTitle: "开始前的准备 - 灵谐开放平台.md",
+      },
+    ],
+  });
+  assert.deepEqual(references, [
+    { title: "开始前的准备", url: "https://open.lingxie.net/start" },
+  ]);
+});
+
 test("latest knowledge metrics wins over the before-prompt placeholder", () => {
   assert.deepEqual(
     selectLatestKnowledgeMetrics(

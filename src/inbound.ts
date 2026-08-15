@@ -454,7 +454,19 @@ function sanitizePublicKnowledgeURL(value: unknown): string {
 
 function safePublicKnowledgeTitle(value: unknown, sourceURL: string): string {
   const raw = String(value || "").replace(/[\r\n\t]+/g, " ").trim();
-  if (raw && raw.length <= 160 && !/[\\/]/.test(raw) && !raw.startsWith(".")) return raw;
+  if (raw && raw.length <= 160 && !/[\\/]/.test(raw) && !raw.startsWith(".")) {
+    const extension = raw.match(/\.(?:md|markdown|txt|html?)$/i)?.[0];
+    if (!extension) return raw;
+    const withoutExtension = raw.slice(0, -extension.length).trim();
+    const separator = [" - ", " | ", " — ", " – "]
+      .map((token) => ({ token, index: withoutExtension.lastIndexOf(token) }))
+      .filter((item) => item.index > 0)
+      .sort((a, b) => b.index - a.index)[0];
+    const legacyPageTitle = separator
+      ? withoutExtension.slice(0, separator.index).trim()
+      : withoutExtension;
+    if (legacyPageTitle) return legacyPageTitle;
+  }
   try {
     const url = new URL(sourceURL);
     const tail = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "")
