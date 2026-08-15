@@ -20,6 +20,12 @@ export interface OpenIMClientState {
   config: OpenIMAccountConfig;
   gatewayConfig?: any;
   handlers: {
+    onConnecting: (event: CallbackEvent<null>) => void;
+    onConnectSuccess: (event: CallbackEvent<null>) => void;
+    onConnectFailed: (event: CallbackEvent<null>) => void;
+    onKickedOffline: (event: CallbackEvent<null>) => void;
+    onUserTokenExpired: (event: CallbackEvent<null>) => void;
+    onUserTokenInvalid: (event: CallbackEvent<null>) => void;
     onRecvNewMessage: (event: CallbackEvent<MessageItem>) => void;
     onRecvNewMessages: (event: CallbackEvent<MessageItem[]>) => void;
     onRecvOfflineNewMessages: (event: CallbackEvent<MessageItem[]>) => void;
