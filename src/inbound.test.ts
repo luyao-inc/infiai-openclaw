@@ -228,6 +228,24 @@ test("legacy indexed website filenames are not exposed as public reference title
   ]);
 });
 
+test("static-site heading anchors are removed from public reference titles", () => {
+  const references = buildKnowledgeReferences({
+    searched: true,
+    hitCount: 1,
+    contextProvided: true,
+    sources: [
+      {
+        sourceType: "website_page",
+        sourceURL: "https://open.lingxie.net/api",
+        publicTitle: "API 开发 [\u200b](https://open.lingxie.net/api/#api-%E5%BC%80%E5%8F%91)",
+      },
+    ],
+  });
+  assert.deepEqual(references, [
+    { title: "API 开发", url: "https://open.lingxie.net/api" },
+  ]);
+});
+
 test("latest knowledge metrics wins over the before-prompt placeholder", () => {
   assert.deepEqual(
     selectLatestKnowledgeMetrics(
