@@ -11,9 +11,11 @@ import { getConnectedClient, startAccountClient, stopAllClients } from "./client
 import { listEnabledAccountConfigs } from "./config";
 import {
   cancelVoiceCallTurn,
+  processIncognitoMessage,
   processOpenPlatformMessage,
   processOpenPlatformOutboundMessage,
   processVoiceCallTurn,
+  purgeIncognitoSession,
   warmVoiceCallContext,
 } from "./inbound";
 import { runOpenIMSetup } from "./setup";
@@ -206,23 +208,47 @@ function registerOpenPlatformGateway(api: any): void {
 		}
 		return processOpenPlatformOutboundMessage(api, client, params);
 	};
+  const incognitoHandler = async (input: any) => {
+    const params = resolveGatewayRequestParams(input);
+    const accountId = String(params?.accountId || "").trim();
+    const client = getConnectedClient(accountId || undefined);
+    if (!client) {
+      throw new Error(accountId ? `Infiai account is not connected: ${accountId}` : "Infiai account is not connected");
+    }
+    return processIncognitoMessage(api, client, params);
+  };
+  const incognitoPurgeHandler = async (input: any) => {
+    const params = resolveGatewayRequestParams(input);
+    const accountId = String(params?.accountId || "").trim();
+    const client = getConnectedClient(accountId || undefined);
+    if (!client) {
+      throw new Error(accountId ? `Infiai account is not connected: ${accountId}` : "Infiai account is not connected");
+    }
+    return purgeIncognitoSession(api, client, params);
+  };
   const registrations: Array<() => boolean> = [
     () => {
       if (typeof api.registerGatewayMethod !== "function") return false;
       api.registerGatewayMethod("infiai.open_platform_message", handler);
 			api.registerGatewayMethod("infiai.open_platform_outbound_message", outboundHandler);
+      api.registerGatewayMethod("infiai.incognito_message", incognitoHandler);
+      api.registerGatewayMethod("infiai.incognito_session_purge", incognitoPurgeHandler);
       return true;
     },
     () => {
       if (typeof api.registerRpc !== "function") return false;
       api.registerRpc("infiai.open_platform_message", handler);
 			api.registerRpc("infiai.open_platform_outbound_message", outboundHandler);
+      api.registerRpc("infiai.incognito_message", incognitoHandler);
+      api.registerRpc("infiai.incognito_session_purge", incognitoPurgeHandler);
       return true;
     },
     () => {
       if (typeof api.registerMethod !== "function") return false;
       api.registerMethod("infiai.open_platform_message", handler);
 			api.registerMethod("infiai.open_platform_outbound_message", outboundHandler);
+      api.registerMethod("infiai.incognito_message", incognitoHandler);
+      api.registerMethod("infiai.incognito_session_purge", incognitoPurgeHandler);
       return true;
     },
     () => {
@@ -230,13 +256,15 @@ function registerOpenPlatformGateway(api: any): void {
       if (!gateway || typeof gateway.registerMethod !== "function") return false;
       gateway.registerMethod("infiai.open_platform_message", handler);
 			gateway.registerMethod("infiai.open_platform_outbound_message", outboundHandler);
+      gateway.registerMethod("infiai.incognito_message", incognitoHandler);
+      gateway.registerMethod("infiai.incognito_session_purge", incognitoPurgeHandler);
       return true;
     },
   ];
   for (const register of registrations) {
     try {
       if (register()) {
-        api.logger?.info?.("[infiai] open platform gateway method registered");
+        api.logger?.info?.("[infiai] open platform and incognito gateway methods registered");
         return;
       }
     } catch (err: any) {

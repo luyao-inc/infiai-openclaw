@@ -627,12 +627,16 @@ type BufferedAgentTurnParams = OpenPlatformMessageParams &
   >;
 
 type BufferedAgentTurnSurface = {
-  kind: "open_platform" | "voice_call";
-  sessionNamespace: "open" | "voice";
-  surface: "infiai_open_platform" | "infiai_voice_call";
-  originatingToPrefix: "open" | "voice";
+  kind: "open_platform" | "voice_call" | "incognito_chat";
+  sessionNamespace: "open" | "voice" | "incognito";
+  surface: "infiai_open_platform" | "infiai_voice_call" | "infiai_incognito_chat";
+  originatingToPrefix: "open" | "voice" | "incognito";
   defaultSourceName: string;
   sourceMessageIDPrefix: string;
+  usageSource: "open_platform" | "voice_call" | "internal_im";
+  forceSessionContinuity?: boolean;
+  memoryReadEnabled?: boolean;
+  memoryWriteEnabled?: boolean;
   subscriberUserID?: string;
   agentSubscriptionID?: string;
 };
@@ -650,6 +654,9 @@ export const OPEN_PLATFORM_TURN_SURFACE: Readonly<BufferedAgentTurnSurface> =
     originatingToPrefix: "open",
     defaultSourceName: "开放接入用户",
     sourceMessageIDPrefix: "open-platform",
+    usageSource: "open_platform",
+    memoryReadEnabled: true,
+    memoryWriteEnabled: true,
   });
 
 export function buildVoiceCallTurnSurface(params: {
@@ -663,9 +670,39 @@ export function buildVoiceCallTurnSurface(params: {
     originatingToPrefix: "voice",
     defaultSourceName: "语音来电用户",
     sourceMessageIDPrefix: "voice-call",
+    usageSource: "voice_call",
+    forceSessionContinuity: true,
+    memoryReadEnabled: true,
+    memoryWriteEnabled: false,
     subscriberUserID: normalizeString(params.subscriberUserID),
     agentSubscriptionID: normalizeString(params.agentSubscriptionID),
   };
+}
+
+export function buildIncognitoTurnSurface(params: {
+  subscriberUserID: string;
+  agentSubscriptionID?: string;
+}): BufferedAgentTurnSurface {
+  return {
+    kind: "incognito_chat",
+    sessionNamespace: "incognito",
+    surface: "infiai_incognito_chat",
+    originatingToPrefix: "incognito",
+    defaultSourceName: "无痕聊天用户",
+    sourceMessageIDPrefix: "incognito-chat",
+    usageSource: "internal_im",
+    forceSessionContinuity: true,
+    memoryReadEnabled: true,
+    memoryWriteEnabled: false,
+    subscriberUserID: normalizeString(params.subscriberUserID),
+    agentSubscriptionID: normalizeString(params.agentSubscriptionID),
+  };
+}
+
+export function shouldWriteBufferedMemory(
+  turnSurface: Pick<BufferedAgentTurnSurface, "kind" | "memoryWriteEnabled">
+): boolean {
+  return turnSurface.memoryWriteEnabled !== false && turnSurface.kind !== "voice_call";
 }
 
 function buildBufferedAgentBillingMessage(
@@ -695,7 +732,9 @@ function buildBufferedAgentBillingMessage(
           : {}),
         ...(turnSurface.kind === "open_platform"
           ? { externalMessageID: messageID }
-          : { voiceTurnID: messageID }),
+          : turnSurface.kind === "voice_call"
+          ? { voiceTurnID: messageID }
+          : { incognitoMessageID: messageID }),
       },
     }),
   } as unknown as MessageItem;
@@ -3016,6 +3055,7 @@ export async function resetInfiaiSessionStoreEntry(
   removed: boolean;
   storePath: string;
   sessionFile?: string;
+  sessionId?: string;
   sessionStartedAt?: number;
 }> {
   const key = String(sessionKey || "").trim();
@@ -3025,6 +3065,7 @@ export async function resetInfiaiSessionStoreEntry(
   }
   const entry = store.data[key] as Record<string, unknown>;
   const sessionFile = String(entry?.sessionFile || "").trim() || undefined;
+  const sessionId = String(entry?.sessionId || "").trim() || undefined;
   const sessionStartedAt = numberOrDateMs(
     entry?.sessionStartedAt ?? entry?.createdAt ?? entry?.startedAt
   );
@@ -3034,8 +3075,46 @@ export async function resetInfiaiSessionStoreEntry(
     removed: true,
     storePath: store.path,
     sessionFile,
+    sessionId,
     sessionStartedAt: sessionStartedAt || undefined,
   };
+}
+
+export async function purgeInfiaiSessionArtifacts(
+  storePath: string,
+  sessionKey: string,
+  agentId: string
+): Promise<{ removed: boolean; deletedFiles: number }> {
+  const reset = await resetInfiaiSessionStoreEntry(storePath, sessionKey, agentId);
+  const files = new Set<string>();
+  const sessionFile = String(reset.sessionFile || "").trim();
+  if (sessionFile) {
+    files.add(sessionFile);
+    const base = sessionFile.endsWith(".jsonl")
+      ? sessionFile.slice(0, -".jsonl".length)
+      : sessionFile;
+    files.add(`${base}.trajectory.jsonl`);
+    files.add(`${base}.trajectory-path.json`);
+  }
+  if (reset.sessionId) {
+    const dir = path.dirname(reset.storePath);
+    const base = path.join(dir, reset.sessionId);
+    files.add(`${base}.jsonl`);
+    files.add(`${base}.trajectory.jsonl`);
+    files.add(`${base}.trajectory-path.json`);
+  }
+  let deletedFiles = 0;
+  await Promise.all(
+    Array.from(files).map(async (file) => {
+      try {
+        await fs.unlink(file);
+        deletedFiles += 1;
+      } catch (err: any) {
+        if (err?.code !== "ENOENT") throw err;
+      }
+    })
+  );
+  return { removed: reset.removed, deletedFiles };
 }
 
 async function latestWorkspaceProjectionMtimeMs(
@@ -5091,6 +5170,82 @@ export async function processOpenPlatformMessage(
   );
 }
 
+export async function processIncognitoMessage(
+  api: any,
+  client: OpenIMClientState,
+  params: BufferedAgentTurnParams & {
+    subscriberUserID?: string;
+    agentSubscriptionID?: string;
+  }
+): Promise<OpenPlatformMessageResult> {
+  return withOpenPlatformSessionLane(
+    resolveOpenPlatformSessionQueueKey({
+      ...params,
+      accountId: params.accountId || client.config.accountId,
+    }),
+    () =>
+      processBufferedAgentTurn(
+        api,
+        client,
+        params,
+        buildIncognitoTurnSurface({
+          subscriberUserID: normalizeString(params.subscriberUserID) || "",
+          agentSubscriptionID: normalizeString(params.agentSubscriptionID),
+        })
+      )
+  );
+}
+
+export async function purgeIncognitoSession(
+  api: any,
+  client: OpenIMClientState,
+  params: Pick<
+    OpenPlatformMessageParams,
+    "accountId" | "ownerUserID" | "agentID" | "sourceUserID" | "conversationID"
+  >
+): Promise<{ purged: boolean; deletedFiles: number }> {
+  const runtime = api.runtime;
+  const cfg = await resolveLatestGatewayConfig(client.gatewayConfig ?? api.config);
+  const accountId = normalizeString(params.accountId || client.config.accountId);
+  const sourceUserID = normalizeString(params.sourceUserID);
+  const conversationID = normalizeString(params.conversationID);
+  if (!accountId || !sourceUserID || !conversationID) {
+    throw new Error("accountId, sourceUserID and conversationID are required");
+  }
+  const bindingAgentId = resolveInfiaiAgentIdForAccount(cfg, accountId);
+  if (!bindingAgentId) {
+    throw new Error(`Infiai account has no bound OpenClaw agent: ${accountId}`);
+  }
+  const peerSessionKey = `infiai:incognito:${accountId}:${sourceUserID}:${conversationID}`.toLowerCase();
+  const route = runtime.channel.routing?.resolveAgentRoute?.({
+    cfg,
+    sessionKey: peerSessionKey,
+    channel: "infiai",
+    accountId,
+  }) ?? {
+    agentId: bindingAgentId,
+    sessionKey: buildAgentScopedSessionKey(bindingAgentId, peerSessionKey),
+  };
+  const matchedBy =
+    route && typeof route === "object" && "matchedBy" in route
+      ? String((route as { matchedBy?: string }).matchedBy ?? "").trim()
+      : "";
+  const routeAgentId = String(route?.agentId ?? bindingAgentId);
+  const executionAgentId =
+    matchedBy === "default" && bindingAgentId ? bindingAgentId : routeAgentId;
+  const sessionKey = buildAgentScopedSessionKey(executionAgentId, peerSessionKey);
+  const storePath =
+    runtime.channel.session?.resolveStorePath?.(cfg?.session?.store, {
+      agentId: executionAgentId,
+    }) ?? "";
+  const result = await purgeInfiaiSessionArtifacts(
+    storePath,
+    sessionKey,
+    executionAgentId
+  );
+  return { purged: result.removed, deletedFiles: result.deletedFiles };
+}
+
 export function resolveOpenPlatformTurnMessageIDs(
   params: Pick<OpenPlatformMessageParams, "messageID" | "runtimeAttemptID">
 ): { messageID: string; runtimeAttemptID: string } {
@@ -5820,7 +5975,7 @@ async function processBufferedAgentTurn(
   // A call is one OpenClaw session. turnID remains a per-turn idempotency and
   // cancellation key, but must never fragment dashboard history or model context.
   const effectiveSessionKey =
-    turnSurface.kind === "voice_call"
+    turnSurface.forceSessionContinuity
       ? sessionKey
       : sessionContinuityEnabled
       ? sessionKey
@@ -5949,10 +6104,7 @@ async function processBufferedAgentTurn(
               module: "media_image",
               quantity: imageText.extractedCount,
               allowOverdraft: true,
-              usageSource:
-                turnSurface.kind === "open_platform"
-                  ? "open_platform"
-                  : "voice_call",
+              usageSource: turnSurface.usageSource,
               officeConnectorPlatform: params.officeConnectorPlatform,
             }
           );
@@ -6024,6 +6176,9 @@ async function processBufferedAgentTurn(
       : "";
     const memoryStartedAt = Date.now();
     try {
+      if (turnSurface.memoryReadEnabled === false) {
+        throw new Error("memory read disabled for surface");
+      }
       const contextResult = await fetchInfiaiLongTermMemoryContext(client, {
         ownerUserID: selfUid,
         agentID: businessAgentID,
@@ -6144,7 +6299,7 @@ async function processBufferedAgentTurn(
         imageUnderstandingCount: imageUnderstanding ? 1 : 0,
         turnMode: params.turnMode || "reply",
         sessionContinuityEnabled:
-          turnSurface.kind === "voice_call" ? true : sessionContinuityEnabled,
+          turnSurface.forceSessionContinuity ? true : sessionContinuityEnabled,
       },
     };
 
@@ -6153,7 +6308,7 @@ async function processBufferedAgentTurn(
         agentId: executionAgentId,
       }) ?? "";
     if (
-      (turnSurface.kind === "voice_call" || sessionContinuityEnabled) &&
+      (turnSurface.forceSessionContinuity || sessionContinuityEnabled) &&
       runtime.channel.session?.recordInboundSession
     ) {
       await runtime.channel.session.recordInboundSession({
@@ -6348,10 +6503,7 @@ async function processBufferedAgentTurn(
           conversationID: effectiveSessionKey,
           subscriberUserID: turnSurface.subscriberUserID,
           agentSubscriptionID: turnSurface.agentSubscriptionID,
-          usageSource:
-            turnSurface.kind === "open_platform"
-              ? "open_platform"
-              : "voice_call",
+          usageSource: turnSurface.usageSource,
           officeConnectorPlatform: params.officeConnectorPlatform,
           storePath,
           dispatchStartedAtMs: llmDispatchStartedAt,
@@ -6383,7 +6535,7 @@ async function processBufferedAgentTurn(
       );
     }
     if (
-      turnSurface.kind !== "voice_call" &&
+      shouldWriteBufferedMemory(turnSurface) &&
       params.turnMode !== "outbound_generation" &&
       shouldSubmitInfiaiMemoryIngest({
         sent: true,
