@@ -17,6 +17,7 @@ import {
   selectLatestKnowledgeMetrics,
   voiceCallMemoryContextForTurn,
   buildVoiceCallTurnSurface,
+  buildIncognitoTurnSurface,
   buildTextEnvelope,
   buildInfiaiOriginatingTo,
   detachVoiceCallTurn,
@@ -35,12 +36,14 @@ import {
   parseAgentSubscriptionPreflightDecision,
   resetInfiaiSessionIfWorkspaceProjectionChanged,
   resetInfiaiSessionStoreEntry,
+  purgeInfiaiSessionArtifacts,
   resolveOpenPlatformSessionQueueKey,
   resolveOpenPlatformTurnMessageIDs,
   resolveNoVisibleFallbackReply,
   resolveInfiaiNoVisibleReplyOutcome,
   resolveInteractiveNoReplyFallback,
   shouldSubmitInfiaiMemoryIngest,
+  shouldWriteBufferedMemory,
   shouldResetStaleSessionOnWorkspaceUpdate,
   shouldSuppressNoVisibleFallbackForAssistantText,
   startInboundTypingKeepalive,
@@ -810,6 +813,9 @@ test("keeps open-platform and internal voice-call turn policies isolated", () =>
     originatingToPrefix: "open",
     defaultSourceName: "开放接入用户",
     sourceMessageIDPrefix: "open-platform",
+    usageSource: "open_platform",
+    memoryReadEnabled: true,
+    memoryWriteEnabled: true,
   });
   assert.equal("subscriberUserID" in OPEN_PLATFORM_TURN_SURFACE, false);
   assert.equal("agentSubscriptionID" in OPEN_PLATFORM_TURN_SURFACE, false);
@@ -826,9 +832,33 @@ test("keeps open-platform and internal voice-call turn policies isolated", () =>
       originatingToPrefix: "voice",
       defaultSourceName: "语音来电用户",
       sourceMessageIDPrefix: "voice-call",
+      usageSource: "voice_call",
+      forceSessionContinuity: true,
+      memoryReadEnabled: true,
+      memoryWriteEnabled: false,
       subscriberUserID: "caller-1",
       agentSubscriptionID: "sub-1",
     },
+  );
+
+  assert.deepEqual(buildIncognitoTurnSurface({ subscriberUserID: "fan-1" }), {
+    kind: "incognito_chat",
+    sessionNamespace: "incognito",
+    surface: "infiai_incognito_chat",
+    originatingToPrefix: "incognito",
+    defaultSourceName: "无痕聊天用户",
+    sourceMessageIDPrefix: "incognito-chat",
+    usageSource: "internal_im",
+    forceSessionContinuity: true,
+    memoryReadEnabled: true,
+    memoryWriteEnabled: false,
+    subscriberUserID: "fan-1",
+    agentSubscriptionID: undefined,
+  });
+  assert.equal(shouldWriteBufferedMemory(OPEN_PLATFORM_TURN_SURFACE), true);
+  assert.equal(
+    shouldWriteBufferedMemory(buildIncognitoTurnSurface({ subscriberUserID: "fan-1" })),
+    false,
   );
 });
 
@@ -1371,6 +1401,30 @@ test("resets only the current Infiai session mapping for slash new", async () =>
   const next = JSON.parse(await fs.readFile(storePath, "utf8"));
   assert.equal(next["agent:a:infiai:direct:a:u1"], undefined);
   assert.ok(next["agent:a:infiai:direct:a:u2"]);
+});
+
+test("purges the current incognito mapping, transcript, and trajectory files", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "infiai-incognito-purge-"));
+  const storePath = path.join(dir, "sessions.json");
+  const sessionId = "session-private-1";
+  const transcript = path.join(dir, `${sessionId}.jsonl`);
+  const trajectory = path.join(dir, `${sessionId}.trajectory.jsonl`);
+  const trajectoryPath = path.join(dir, `${sessionId}.trajectory-path.json`);
+  await Promise.all([
+    fs.writeFile(transcript, "private transcript\n", "utf8"),
+    fs.writeFile(trajectory, "private trajectory\n", "utf8"),
+    fs.writeFile(trajectoryPath, "{}\n", "utf8"),
+    fs.writeFile(storePath, JSON.stringify({ private: { sessionId, sessionFile: transcript } }), "utf8"),
+  ]);
+
+  const result = await purgeInfiaiSessionArtifacts(storePath, "private", "agent-1");
+  assert.equal(result.removed, true);
+  assert.equal(result.deletedFiles, 3);
+  const next = JSON.parse(await fs.readFile(storePath, "utf8"));
+  assert.equal(next.private, undefined);
+  await assert.rejects(fs.stat(transcript), /ENOENT/);
+  await assert.rejects(fs.stat(trajectory), /ENOENT/);
+  await assert.rejects(fs.stat(trajectoryPath), /ENOENT/);
 });
 
 test("stale workspace projection does not reset Infiai session by default", async () => {
