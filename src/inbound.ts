@@ -841,6 +841,7 @@ type AgentSubscriptionPreflightResult = {
   agentID?: string;
   freeRoundsUsed?: number;
   freeRoundsLimit?: number;
+  freeRoundReserved?: boolean;
   costUsedUnits?: number;
   costLimitUnits?: number;
 };
@@ -3600,6 +3601,29 @@ async function checkAgentSubscriptionPreflight(
   return parseAgentSubscriptionPreflightDecision(data, params);
 }
 
+async function finalizeAgentSubscriptionFreeRound(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  params: {
+    subscriberUserID: string;
+    ownerUserID: string;
+    agentID: string;
+    outcome: "commit" | "release";
+  }
+): Promise<void> {
+  await signedChatApiCall(
+    client,
+    "/claw/internal/agent-subscription/free-round/finalize",
+    {
+      subscriberUserID: params.subscriberUserID,
+      ownerUserID: params.ownerUserID,
+      agentID: params.agentID,
+      sourceMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
+      outcome: params.outcome,
+    }
+  );
+}
+
 export function parseAgentSubscriptionPreflightDecision(
   data: any,
   params: {
@@ -3626,9 +3650,22 @@ export function parseAgentSubscriptionPreflightDecision(
     agentID: String(read("agentID", "AgentID") || params.agentID || ""),
     freeRoundsUsed: Number(read("freeRoundsUsed", "FreeRoundsUsed") || 0),
     freeRoundsLimit: Number(read("freeRoundsLimit", "FreeRoundsLimit") || 0),
+    freeRoundReserved: Boolean(read("freeRoundReserved", "FreeRoundReserved")),
     costUsedUnits: Number(read("costUsedUnits", "CostUsedUnits") || 0),
     costLimitUnits: Number(read("costLimitUnits", "CostLimitUnits") || 0),
   };
+}
+
+export function shouldCommitAgentFreeRound(params: {
+  deliveredVisibleReply: boolean;
+  dispatchedFailureReply: boolean;
+  sentNoVisibleFallbackReply: boolean;
+}): boolean {
+  return (
+    params.deliveredVisibleReply &&
+    !params.dispatchedFailureReply &&
+    !params.sentNoVisibleFallbackReply
+  );
 }
 
 function mediaTranscriptMaxChars(): number {
@@ -4543,7 +4580,7 @@ function isMentionedInGroup(msg: MessageItem, selfUserID: string): boolean {
   return extractMentionedUserIDs(msg).some((item) => item === id);
 }
 
-function extractMentionedUserIDs(msg: MessageItem): string[] {
+export function extractMentionedUserIDs(msg: MessageItem): string[] {
   const elem = msg.atTextElem as MessageItem["atTextElem"] & {
     atUserIDList?: string[];
     atUsersInfo?: Array<{ atUserID?: string }>;
@@ -7045,33 +7082,47 @@ export async function processInboundMessage(
     );
     return;
   }
+  let freeRoundOutcome: "commit" | "release" = "release";
   try {
-    const billing = await checkLanguageModelOutputPreflight(client, msg, {
-      payerUserID: selfUid,
-      actorUserID: senderId,
-      agentID: businessAgentID,
-      conversationID: effectiveSessionKey,
-      subscriberUserID: agentSubscription?.subscriberUserID || "",
-      agentSubscriptionID: agentSubscription?.subscriptionID || "",
-    });
-    if (!billing.allowed) {
+    try {
+      const billing = await checkLanguageModelOutputPreflight(client, msg, {
+        payerUserID: selfUid,
+        actorUserID: senderId,
+        agentID: businessAgentID,
+        conversationID: effectiveSessionKey,
+        subscriberUserID: agentSubscription?.subscriberUserID || "",
+        agentSubscriptionID: agentSubscription?.subscriptionID || "",
+      });
+      if (!billing.allowed) {
+        api.logger?.warn?.(
+          `[infiai] inbound paid pipeline skipped: insufficient billing status=${
+            billing.status || "unknown"
+          } payer=${selfUid} required=${billing.requiredUnits || 0} available=${
+            billing.availableUnits || 0
+          } clientMsgID=${msg.clientMsgID || ""}`
+        );
+        await sendClassifiedReplyFromInbound(
+          api,
+          client,
+          msg,
+          "该分身当前可用额度不足，暂时无法回复，请稍后再试。",
+          {
+            messageKind: MESSAGE_KIND_BILLING_NOTICE,
+            senderManaged,
+            fromManagedBotSession: inboundFromManagedBot,
+            reason: "agent_owner_balance_insufficient",
+          }
+        );
+        return;
+      }
+    } catch (err) {
       api.logger?.warn?.(
-        `[infiai] inbound paid pipeline skipped: insufficient billing status=${
-          billing.status || "unknown"
-        } payer=${selfUid} required=${billing.requiredUnits || 0} available=${
-          billing.availableUnits || 0
-        } clientMsgID=${msg.clientMsgID || ""}`
+        `[infiai] inbound billing preflight failed; skip paid pipeline: ${formatSdkError(
+          err
+        )}`
       );
       return;
     }
-  } catch (err) {
-    api.logger?.warn?.(
-      `[infiai] inbound billing preflight failed; skip paid pipeline: ${formatSdkError(
-        err
-      )}`
-    );
-    return;
-  }
   const transcribableMedia = (inbound.media ?? []).filter(
     isTranscribableMediaItem
   );
@@ -8055,10 +8106,13 @@ export async function processInboundMessage(
       }
     }
     if (
-      deliveredVisibleReply &&
-      !dispatchedFailureReply &&
-      !sentNoVisibleFallbackReply
+      shouldCommitAgentFreeRound({
+        deliveredVisibleReply,
+        dispatchedFailureReply,
+        sentNoVisibleFallbackReply,
+      })
     ) {
+      freeRoundOutcome = "commit";
       try {
         const charged = await chargeLanguageModelOutputUsage(client, msg, {
           payerUserID: selfUid,
@@ -8130,5 +8184,23 @@ export async function processInboundMessage(
     await setInboundTypingState(client, msg, false);
     await cleanupStagedInboundMedia(imageMediaResult);
     await cleanupStagedInboundMedia(mediaResult);
+  }
+  } finally {
+    if (agentSubscription?.freeRoundReserved) {
+      try {
+        await finalizeAgentSubscriptionFreeRound(client, msg, {
+          subscriberUserID: agentSubscription.subscriberUserID || senderId,
+          ownerUserID: agentSubscription.ownerUserID || selfUid,
+          agentID: agentSubscription.agentID || businessAgentID,
+          outcome: freeRoundOutcome,
+        });
+      } catch (err) {
+        api.logger?.warn?.(
+          `[infiai] free round ${freeRoundOutcome} failed: owner=${selfUid} subscriber=${senderId} agent=${businessAgentID} sourceMsgID=${String(
+            msg.clientMsgID || msg.serverMsgID || ""
+          )} error=${formatSdkError(err)}`
+        );
+      }
+    }
   }
 }

@@ -22,6 +22,7 @@ import {
   buildInfiaiOriginatingTo,
   detachVoiceCallTurn,
   extractAssistantTextSnapshotFromSessionLine,
+  extractMentionedUserIDs,
   estimateLanguageModelCostUSD,
   inspectInfiaiSessionWorkspaceProjectionState,
   getInfiaiMessageKind,
@@ -42,6 +43,7 @@ import {
   resolveNoVisibleFallbackReply,
   resolveInfiaiNoVisibleReplyOutcome,
   resolveInteractiveNoReplyFallback,
+  shouldCommitAgentFreeRound,
   shouldSubmitInfiaiMemoryIngest,
   shouldWriteBufferedMemory,
   shouldResetStaleSessionOnWorkspaceUpdate,
@@ -1540,6 +1542,7 @@ test("parses agent subscription preflight decisions from lower and Pascal case f
       agentID: "default",
       freeRoundsUsed: 0,
       freeRoundsLimit: 0,
+      freeRoundReserved: false,
       costUsedUnits: 0,
       costLimitUnits: 0,
     },
@@ -1558,4 +1561,69 @@ test("parses agent subscription preflight decisions from lower and Pascal case f
     ).allowed,
     true,
   );
+});
+
+test("parses a reserved free round from Pascal case fields", () => {
+  assert.equal(
+    parseAgentSubscriptionPreflightDecision(
+      {
+        Allowed: true,
+        Reason: "free_round",
+        FreeRoundReserved: true,
+      },
+      {
+        subscriberUserID: "subscriber",
+        ownerUserID: "owner",
+        agentID: "default",
+      },
+    ).freeRoundReserved,
+    true,
+  );
+});
+
+test("extracts structured mentions from an at-text message that also quotes a message", () => {
+  assert.deepEqual(
+    extractMentionedUserIDs({
+      atTextElem: {
+        text: "@分身 请继续说明",
+        atUserList: ["agent-user-id"],
+        atUsersInfo: [
+          { atUserID: "agent-user-id", groupNickname: "分身" },
+        ],
+        quoteMessage: { clientMsgID: "quoted-message" },
+      },
+      attachedInfo: "",
+    } as any),
+    ["agent-user-id"],
+  );
+});
+
+test("commits a free round only after a successful visible assistant reply", () => {
+  assert.equal(
+    shouldCommitAgentFreeRound({
+      deliveredVisibleReply: true,
+      dispatchedFailureReply: false,
+      sentNoVisibleFallbackReply: false,
+    }),
+    true,
+  );
+  for (const blocked of [
+    {
+      deliveredVisibleReply: false,
+      dispatchedFailureReply: false,
+      sentNoVisibleFallbackReply: false,
+    },
+    {
+      deliveredVisibleReply: true,
+      dispatchedFailureReply: true,
+      sentNoVisibleFallbackReply: false,
+    },
+    {
+      deliveredVisibleReply: true,
+      dispatchedFailureReply: false,
+      sentNoVisibleFallbackReply: true,
+    },
+  ]) {
+    assert.equal(shouldCommitAgentFreeRound(blocked), false);
+  }
 });
