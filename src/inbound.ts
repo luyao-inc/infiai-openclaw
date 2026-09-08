@@ -1,3 +1,5 @@
+import { configureSuggestionResponse } from "./suggestionProtocol";
+import { SuggestionTurn, suggestionsEnabled, supportsNextSuggestions, withSuggestionTurn, type NextSuggestions } from "./nextSuggestions";
 import {
   MessageType,
   NotificationType,
@@ -224,6 +226,15 @@ function isAssistantEchoMessage(msg: MessageItem, selfUserID: string): boolean {
   );
 }
 
+// OpenIM also syncs a human's outgoing messages to their managed platform client.
+// Such a copy belongs to the peer's conversation, not the sender's own assistant.
+export function isOutgoingSingleChatSyncMessage(msg: MessageItem, selfUserID: string): boolean {
+  const self = String(selfUserID || "").trim();
+  const receiver = String(msg.recvID || "").trim();
+  return Boolean(self && receiver && !isGroupMessage(msg) &&
+    String(msg.sendID || "").trim() === self && receiver !== self);
+}
+
 function isHumanSelfAssistantMessage(
   msg: MessageItem,
   selfUserID: string
@@ -254,6 +265,9 @@ export function buildAssistantReplyEx(
     ...base,
     infiai: {
       ...infiai,
+      nextSuggestions: undefined,
+      nextSuggestionsVersion: undefined,
+      suggestionOrigin: undefined,
       ...(extraInfiai || {}),
       source: ASSISTANT_MESSAGE_SOURCE,
       messageKind,
@@ -3452,6 +3466,7 @@ async function chargeLanguageModelOutputUsage(
     conversationID: string;
     storePath: string;
     dispatchStartedAtMs: number;
+    suggestionTurn?: SuggestionTurn;
     allowOverdraft?: boolean;
     subscriberUserID?: string;
     agentSubscriptionID?: string;
@@ -3460,7 +3475,9 @@ async function chargeLanguageModelOutputUsage(
   }
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
-  const usage = await readLatestLanguageModelUsage(
+  const usage = (params.suggestionTurn?.options.enabled
+    ? params.suggestionTurn.usageSnapshot(estimateLanguageModelCostUSD)
+    : null) ?? await readLatestLanguageModelUsage(
     params.storePath,
     params.conversationID,
     params.agentID,
@@ -3489,6 +3506,7 @@ async function chargeLanguageModelOutputUsage(
     providerCostSource: usage?.costSource || "missing_openclaw_usage",
     usdToCnyRate: exchangeRate,
     openClawUsage: usage?.rawUsage,
+    ...(params.suggestionTurn?.options.enabled ? { turnID: params.suggestionTurn.turnID, suggestionMode: "same_turn_v2", suggestionDiagnostics: params.suggestionTurn.diagnostics() } : {}),
     officeConnectorPlatform: params.officeConnectorPlatform || "",
   };
   const data = await signedChatApiCall(
@@ -4641,6 +4659,7 @@ async function sendReplyFromInbound(
       provider?: string;
       model?: string;
     };
+    nextSuggestions?: NextSuggestions;
     knowledgeTrace?: Record<string, unknown>;
   } = {}
 ): Promise<void> {
@@ -4649,8 +4668,9 @@ async function sendReplyFromInbound(
   const replyEx = buildAssistantReplyEx(
     msg,
     options.messageKind || MESSAGE_KIND_ASSISTANT_REPLY,
-    options.voice || references.length > 0
+    options.nextSuggestions || options.voice || references.length > 0
       ? {
+          ...(options.nextSuggestions ? { nextSuggestions: options.nextSuggestions } : {}),
           ...(references.length > 0 ? { references } : {}),
           ...(options.voice ? {
           replyMode: "voice",
@@ -5050,6 +5070,7 @@ async function sendClassifiedReplyFromInbound(
     tenantID?: string;
     ownerUserID?: string;
     agentID?: string;
+    nextSuggestions?: NextSuggestions;
     knowledgeTrace?: Record<string, unknown>;
   }
 ): Promise<boolean> {
@@ -5134,6 +5155,7 @@ async function sendClassifiedReplyFromInbound(
     messageKind: params.messageKind,
     voice,
     knowledgeTrace: params.knowledgeTrace,
+    nextSuggestions: params.messageKind === MESSAGE_KIND_ASSISTANT_REPLY ? params.nextSuggestions : undefined,
   });
   return true;
 }
@@ -6647,6 +6669,7 @@ export async function processInboundMessage(
   }
 
   const selfUid = String(client.config.userID).trim();
+  if (isOutgoingSingleChatSyncMessage(msg, selfUid)) return;
   const humanSelfAssistant = isHumanSelfAssistantMessage(msg, selfUid);
   const inboundSource = getInfiaiMessageSource(msg);
   const inboundProtocolMessageKind = resolveEffectiveInfiaiMessageKind(msg);
@@ -7600,6 +7623,16 @@ export async function processInboundMessage(
     });
   }
 
+  const primaryModel = getAgentPrimaryModel(cfg, executionAgentId);
+  const suggestionEnabled = suggestionsEnabled({ api, fromManagedBot: inboundFromManagedBot, interactive: interactiveInboundTurn && !group, ownerUserID: selfUid, clientSupportsSuggestions: supportsNextSuggestions(msg.ex) });
+  const suggestionResponse = configureSuggestionResponse(cfg, executionAgentId, primaryModel || "", suggestionEnabled);
+  const suggestionTurn = new SuggestionTurn({
+    enabled: suggestionEnabled, format: suggestionResponse.format,
+    sessionKey: effectiveSessionKey, runtimeAgentID: executionAgentId,
+    sourceClientMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
+    recipientUserID: senderId, ownerUserID: selfUid, agentID: businessAgentID,
+    conversationID: resolveInfiaiConversationID(msg), userText: rawBody,
+  });
   const dispatchObsStart = transcriptObsEnabled() ? Date.now() : 0;
   const llmDispatchStartedAt = Date.now();
   let dispatchedFailureReply = false;
@@ -7611,7 +7644,7 @@ export async function processInboundMessage(
   let pendingFailureReply = "";
   let deliveredSilentReplyText = "";
   const voiceReplyAccumulator =
-    !group && businessAgentID
+    !suggestionTurn.options.enabled && !group && businessAgentID
       ? new InfiaiVoiceReplyAccumulator(client, {
           tenantID: resolveTenantIDFromAccountID(client.config.accountId),
           userID: selfUid,
@@ -7623,7 +7656,6 @@ export async function processInboundMessage(
           agentSubscriptionID: agentSubscription?.subscriptionID || "",
         })
       : null;
-  const primaryModel = getAgentPrimaryModel(cfg, executionAgentId);
   await setInboundTypingState(client, msg, true);
   const stopTypingKeepalive = startInboundTypingKeepalive(() =>
     setInboundTypingState(client, msg, true)
@@ -7643,9 +7675,9 @@ export async function processInboundMessage(
         async () =>
           runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
-            cfg,
+            cfg: suggestionResponse.cfg,
             dispatcherOptions: {
-              deliver: async (payload: { text?: string }) => {
+              deliver: async (payload: { text?: string }, info?: { kind?: string }) => {
                 infiaiConsoleDebug(
                   `[infiai] deliver called: model=${primaryModel || "-"}, group=${group}, hasText=${!!payload.text}, textLen=${
                     payload.text?.length || 0
@@ -7663,7 +7695,9 @@ export async function processInboundMessage(
                   );
                   return;
                 }
-                const localized = localizeOpenClawReply(payload.text);
+                const nextReply = suggestionTurn.parse(payload.text);
+                payload.text = nextReply.text;
+                const localized = localizeOpenClawReply(nextReply.text);
                 if (dispatchedFailureReply) {
                   infiaiConsoleDebug(
                     `[infiai] deliver skipped: prior model failure reply already sent, raw="${payload.text.slice(
@@ -7764,6 +7798,7 @@ export async function processInboundMessage(
                       senderManaged,
                       fromManagedBotSession: inboundFromManagedBot,
                       reason: "assistant_reply",
+                      nextSuggestions: info?.kind === "final" ? suggestionTurn.envelope(nextReply.items) : undefined,
                       tenantID: resolveTenantIDFromAccountID(
                         client.config.accountId
                       ),
@@ -7773,6 +7808,7 @@ export async function processInboundMessage(
                     }
                   );
                   deliveredVisibleReply = sent;
+                  if (info?.kind === "final") suggestionTurn.noteDelivery(sent);
                   if (
                     !memoryExtractSubmitted &&
                     shouldSubmitInfiaiMemoryIngest({
@@ -7874,7 +7910,11 @@ export async function processInboundMessage(
       );
     };
 
-    await runDispatch();
+    try {
+      await withSuggestionTurn(suggestionTurn, runDispatch);
+    } finally {
+      api.logger?.info?.(`[infiai-next-suggestions] ${JSON.stringify(suggestionTurn.diagnostics())}`);
+    }
     if (
       voiceReplyAccumulator &&
       voiceReplyAccumulator.text &&
@@ -8121,6 +8161,7 @@ export async function processInboundMessage(
           conversationID: effectiveSessionKey,
           storePath,
           dispatchStartedAtMs: llmDispatchStartedAt,
+          suggestionTurn,
           allowOverdraft: true,
           subscriberUserID: agentSubscription?.subscriberUserID || "",
           agentSubscriptionID: agentSubscription?.subscriptionID || "",
