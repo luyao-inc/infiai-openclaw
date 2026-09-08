@@ -224,7 +224,8 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.0.0",
-    "@openim/client-sdk": "^3.8.3"
+    "@openim/client-sdk": "^3.8.3",
+    "jsonrepair": "3.15.0"
   },
   "peerDependencies": {
     "clawdbot": "*",

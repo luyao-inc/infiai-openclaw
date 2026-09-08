@@ -6,6 +6,7 @@
  */
 
 import "./polyfills";
+import { registerSuggestionHooks } from "./nextSuggestions";
 import { OpenIMChannelPlugin } from "./channel";
 import { getConnectedClient, startAccountClient, stopAllClients } from "./clients";
 import { listEnabledAccountConfigs } from "./config";
@@ -369,6 +370,7 @@ function registerFull(api: any): void {
   (globalThis as any).__openimApi = api;
   (globalThis as any).__openimGatewayConfig = api.config;
 
+  registerSuggestionHooks(api);
   registerOpenIMTools(api);
   registerScheduledTaskToolGuard(api);
   registerOpenPlatformGateway(api);
