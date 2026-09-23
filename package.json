@@ -17,6 +17,8 @@
   "exports": "./dist/index.js",
   "files": [
     "dist",
+    "scripts/prepare-sdk.cjs",
+    "scripts/sdk-safety.cjs",
     "openclaw.plugin.json",
     "README.md",
     "README.zh-CN.md"
@@ -217,6 +219,8 @@
     }
   },
   "scripts": {
+    "postinstall": "node scripts/prepare-sdk.cjs",
+    "prebuild": "node scripts/prepare-sdk.cjs",
     "build": "tsc",
     "test": "tsx --test src/*.test.ts",
     "test:connect": "tsx scripts/test-connect.ts",
@@ -224,7 +228,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.0.0",
-    "@openim/client-sdk": "^3.8.3",
+    "@openim/client-sdk": "3.8.3-hotfix.0",
     "jsonrepair": "3.15.0"
   },
   "peerDependencies": {

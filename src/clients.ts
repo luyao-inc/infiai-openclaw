@@ -10,6 +10,7 @@ import loglevel from "loglevel";
 import { processInboundMessage } from "./inbound";
 import type { OpenIMAccountConfig, OpenIMClientState } from "./types";
 import { formatSdkError, infiaiDebug, resolveOpenIMSdkLogLevel } from "./utils";
+import { safeRuntimeError } from "./safeDiagnostics";
 
 const clients = new Map<string, OpenIMClientState>();
 
@@ -199,6 +200,12 @@ export async function startAccountClient(
   },
 ): Promise<void> {
   const sdk = opts?.sdk ?? getConfiguredSDK();
+  if (!opts?.sdk && (sdk as any).__infiaiSafety?.version !== 1) {
+    throw new Error('OpenIM Node safety adapter missing; rebuild with npm ci');
+  }
+  (sdk as any).__infiaiSafety?.observe((error: unknown, stage: string) => {
+    api.logger?.error?.(`[infiai-sdk-error] ${JSON.stringify({ accountId: config.accountId, stage, ...safeRuntimeError(error) })}`);
+  });
   let loginCompleted = false;
   let lifecycleReject: ((error: Error) => void) | null = null;
   let terminalError: Error | null = null;
