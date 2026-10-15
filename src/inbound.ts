@@ -61,6 +61,9 @@ const MESSAGE_KIND_TASK_OUTBOUND = "task_outbound";
 const MESSAGE_KIND_ASSISTANT_REPLY = "assistant_reply";
 const MESSAGE_KIND_MODEL_ERROR = "model_error";
 const MESSAGE_KIND_BILLING_NOTICE = "billing_notice";
+class HumanReceptionSuppressedError extends Error {
+  constructor() { super("human reception active"); }
+}
 const MESSAGE_KIND_LOOP_GUARD_NOTICE = "loop_guard_notice";
 const MESSAGE_KIND_SYSTEM_NOTICE = "system_notice";
 const DEFAULT_MEMORY_GATEWAY_CONTEXT_TIMEOUT_MS = 20000;
@@ -4665,6 +4668,11 @@ async function sendReplyFromInbound(
   } = {}
 ): Promise<void> {
   const isGroup = isGroupMessage(msg);
+  // A reply already running when a paid session starts must stay silent.
+  if (!isGroup) {
+    const reception = await signedChatApiCall(client, "/claw/internal/human-reception/active", { buyerUserID: msg.sendID }, { timeoutMs: 5000 });
+    if (reception?.active) throw new HumanReceptionSuppressedError();
+  }
   const references = buildKnowledgeReferences(options.knowledgeTrace);
   const replyEx = buildAssistantReplyEx(
     msg,
@@ -6754,6 +6762,7 @@ export async function processInboundMessage(
     return;
   }
 
+  if (getInfiaiMessageSource(msg) === "human_reception_service") return;
   const inbound = extractInboundBody(msg);
   if (!inbound.body) {
     infiaiDebug(
@@ -7077,6 +7086,7 @@ export async function processInboundMessage(
       ownerUserID: selfUid,
       agentID: businessAgentID,
     });
+    if (agentSubscription.reason === "human_reception") return;
     if (!agentSubscription.allowed) {
       api.logger?.warn?.(
         `[infiai] agent subscription preflight blocked: reason=${
@@ -8209,6 +8219,7 @@ export async function processInboundMessage(
       }
     }
   } catch (err: any) {
+    if (err instanceof HumanReceptionSuppressedError) return;
     if (dispatchObsStart && obsGroupOk) {
       obsInboundLog(api, "inbound.dispatch.fail", {
         accountId: client.config.accountId,
