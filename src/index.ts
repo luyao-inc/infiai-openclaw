@@ -21,6 +21,7 @@ import {
 } from "./inbound";
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
+import { createBailianSearchProvider } from "./bailianSearch";
 
 const SCHEDULED_TASK_BLOCKED_TOOLS = new Set([
   "bash",
@@ -111,30 +112,10 @@ function scheduledTaskExecAllowed(command: string): boolean {
       `/home/node/.openclaw/skills/${skill}`,
     ];
     if (skillDir) {
-      return roots.includes(skillDir) && script === (skill === "serper" ? "scripts/search.py" : "crypto_market_snapshot.py");
+      return roots.includes(skillDir) && script === "crypto_market_snapshot.py";
     }
-    return roots.some((root) => script === `${root}/${skill === "serper" ? "scripts/search.py" : "crypto_market_snapshot.py"}`);
+    return roots.some((root) => script === `${root}/crypto_market_snapshot.py`);
   };
-
-  if (skillPath("serper")) {
-    let hasQuery = false;
-    for (let index = 0; index < args.length; index += 2) {
-      const flag = args[index];
-      const value = args[index + 1];
-      if (!value) return false;
-      if (flag === "-q" || flag === "--query") {
-        if (hasQuery || value.length > 500) return false;
-        hasQuery = true;
-      } else if (flag === "-m" || flag === "--mode") {
-        if (!["default", "current"].includes(value)) return false;
-      } else if (flag === "--gl" || flag === "--hl") {
-        if (!/^[a-z]{2}$/i.test(value)) return false;
-      } else {
-        return false;
-      }
-    }
-    return hasQuery;
-  }
 
   if (skillPath("crypto-market")) {
     return (
@@ -411,6 +392,7 @@ export default {
   name: "Infiai Channel",
   description: "Infiai protocol channel for OpenClaw",
   register(api: any): void {
+    api.registerWebSearchProvider?.(createBailianSearchProvider());
     if (api.registrationMode === "cli-metadata") {
       registerCliMetadata(api);
       return;

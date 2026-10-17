@@ -31,16 +31,16 @@ test('sanitized replay preserves successful and failed diagnostics and full usag
  t.capture({role:'assistant',responseId:'r',content:pack(items,'follow_up','发票抬头错误需要重开发票。',t.nonce),usage:{input:100,output:50,totalTokens:150}});
  const r=t.parse('发票抬头错误需要重开发票。');assert.equal(r.items.length,items.length);
  assert.equal(t.diagnostics().status,items.length?'generated':'unexpected_empty');
- assert.equal(t.usageSnapshot(()=>({costUSD:1,costSource:'test'}))?.outputTokens,50);
+ assert.equal(t.usageSnapshot()?.outputTokens,50);
  }
 });
 test('response format is scoped to the request and selected compatible model',()=>{
- const cfg={agents:{defaults:{models:{'deepseek/deepseek-v4-flash':{params:{temperature:.5}},other:{params:{}}}},list:[{id:'a'},{id:'b'}]}};
- const original=JSON.stringify(cfg);const r=configureSuggestionResponse(cfg,'a','deepseek/deepseek-v4-flash',true);
+ const cfg={agents:{defaults:{models:{'aliyun-bailian/deepseek-v4.1-flash':{params:{temperature:.5}},other:{params:{}}}},list:[{id:'a'},{id:'b'}]}};
+ const original=JSON.stringify(cfg);const r=configureSuggestionResponse(cfg,'a','aliyun-bailian/deepseek-v4.1-flash',true);
  assert.equal(r.format,'json_object');assert.equal(JSON.stringify(cfg),original);
  assert.equal(r.cfg.agents.defaults.models.other,cfg.agents.defaults.models.other);
  assert.equal(configureSuggestionResponse(cfg,'b','other',true).cfg,cfg);
- assert.equal(configureSuggestionResponse(cfg,'a','deepseek/deepseek-v4-flash',false).cfg,cfg);
+ assert.equal(configureSuggestionResponse(cfg,'a','aliyun-bailian/deepseek-v4.1-flash',false).cfg,cfg);
 });
 
 test('malformed quoted answer is recovered locally without accepting auxiliary candidates',()=>{

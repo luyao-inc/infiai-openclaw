@@ -28,7 +28,6 @@ test("scheduled task guard blocks stateful runtime tools", () => {
 test("scheduled task guard allows only audited read-only skill exec commands", () => {
   const task = { sessionKey: "agent:a:task:ctr_1:attempt:1" };
   for (const command of [
-    'cd ~/.openclaw/skills/serper && python3 scripts/search.py -q "今日加密货币新闻" --mode current --gl cn --hl zh 2>/dev/null',
     'python3 "/root/.openclaw/skills/crypto-market/crypto_market_snapshot.py" BTCUSDT 1d 200',
   ]) {
     assert.equal(
@@ -39,6 +38,8 @@ test("scheduled task guard allows only audited read-only skill exec commands", (
   }
   for (const command of [
     "rm -rf /tmp/example",
+    'cd ~/.openclaw/skills/serper && python3 scripts/search.py -q "今日加密货币新闻" --mode current --gl cn --hl zh 2>/dev/null',
+
     'cd ~/.openclaw/skills/serper && python3 scripts/search.py -q "news"; id',
     'cd ~/.openclaw/skills/serper && python3 scripts/search.py -q "$(id)"',
     'python3 "/root/.openclaw/skills/crypto-market/crypto_market_snapshot.py" BTCUSDT 1d 200 > /tmp/result',

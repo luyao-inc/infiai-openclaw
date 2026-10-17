@@ -1,3 +1,4 @@
+import { aggregateModelUsage } from "./modelUsage";
 import { analyzeSuggestionReply, type SuggestionResult, type SuggestionFormat } from "./suggestionProtocol";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
@@ -146,42 +147,8 @@ export class SuggestionTurn {
       rawCount: this.result?.rawCount || 0, acceptedCount: this.result?.items.length || 0,
       rejected: this.result?.rejected || {}, parseCounts: this.parseCounts, delivery: this.delivery, modelResponses: this.usage.size };
   }
-  usageSnapshot(
-    estimate: (
-      provider: string,
-      model: string,
-      usage: Record<string, unknown>
-    ) => { costUSD: number; costSource: string }
-  ) {
-    const rows = [...this.usage.values()];
-    if (!rows.length) return null;
-    const number = (value: unknown) =>
-      typeof value === "number" && Number.isFinite(value) && value > 0
-        ? value
-        : 0;
-    const sum = (key: string) =>
-      rows.reduce((n, row) => n + number(row.usage[key]), 0);
-    return {
-      provider: rows.every((r) => r.provider === rows[0].provider)
-        ? rows[0].provider
-        : "mixed",
-      model: rows.every((r) => r.model === rows[0].model)
-        ? rows[0].model
-        : "mixed",
-      inputTokens: sum("input"),
-      outputTokens: sum("output"),
-      cacheReadTokens: sum("cacheRead"),
-      cacheWriteTokens: sum("cacheWrite"),
-      totalTokens: sum("totalTokens"),
-      costUSD: rows.reduce(
-        (n, r) => n + estimate(r.provider, r.model, r.usage).costUSD,
-        0
-      ),
-      costSource: "turn_message_usage",
-      responseId: this.turnID,
-      timestamp: undefined,
-      rawUsage: { responses: rows },
-    };
+  usageSnapshot() {
+    return aggregateModelUsage([...this.usage.values()], this.turnID);
   }
   constructor(
     readonly options: {
