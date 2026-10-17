@@ -46,6 +46,9 @@
         "infiai_send_image",
         "infiai_send_video",
         "infiai_send_file"
+      ],
+      "webSearchProviders": [
+        "aliyun-bailian"
       ]
     },
     "channels": [

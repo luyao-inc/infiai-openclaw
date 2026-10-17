@@ -132,12 +132,9 @@ test("synchronous runtime hooks isolate concurrent turns and preserve full outpu
         assert.equal(result.message.content[0].text, "正文");
         assert.deepEqual(result.message.usage, msg.usage);
         hooks.before_message_write({ message: msg }, ctx);
-        const snapshot = turn.usageSnapshot(() => ({
-          costUSD: 0.2,
-          costSource: "test",
-        }));
+        const snapshot = turn.usageSnapshot();
         assert.equal(snapshot?.outputTokens, 45);
-        assert.equal(snapshot?.costUSD, 0.2);
+        assert.equal(snapshot?.rawUsage.input, 100);
         assert.equal(turn.usage.size, 1);
       })
     )

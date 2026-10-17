@@ -121,7 +121,7 @@ export function analyzeSuggestionReply(text: string, nonce: string, user = '', f
 /** Copy only this model's request configuration; no shared runtime mutation. */
 export function configureSuggestionResponse(cfg: any, agentId: string, primaryModel: string, enabled: boolean) {
   const agent=cfg?.agents?.list?.find((a:any)=>a.id===agentId);
-  if(!enabled || !/^deepseek\/deepseek-v4-(?:flash|pro)$/.test(primaryModel) || agent?.params?.response_format || agent?.params?.responseFormat) return {cfg,format:'tagged' as SuggestionFormat};
+  if(!enabled || primaryModel !== 'aliyun-bailian/deepseek-v4.1-flash' || agent?.params?.response_format || agent?.params?.responseFormat) return {cfg,format:'tagged' as SuggestionFormat};
   const defaults=cfg.agents?.defaults||{}, models=defaults.models||{}, model=models[primaryModel]||{};
   return {format:'json_object' as SuggestionFormat,cfg:{...cfg,agents:{...cfg.agents,defaults:{...defaults,models:{...models,[primaryModel]:{...model,params:{...model.params,response_format:{type:'json_object'}}}}}}}};
 }

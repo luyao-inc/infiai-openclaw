@@ -1,3 +1,5 @@
+import { aggregateModelUsage } from "./modelUsage";
+import { buildInboundMediaContext, promptMediaReference } from "./inboundMediaContext";
 import { configureSuggestionResponse } from "./suggestionProtocol";
 import { SuggestionTurn, suggestionsEnabled, supportsNextSuggestions, withSuggestionTurn, type NextSuggestions } from "./nextSuggestions";
 import {
@@ -871,8 +873,6 @@ type LanguageModelUsageSnapshot = {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   totalTokens: number;
-  costUSD: number;
-  costSource: string;
   responseId?: string;
   timestamp?: string;
   rawUsage: Record<string, unknown>;
@@ -3255,62 +3255,11 @@ function numberFromUsage(value: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-function resolveUsdToCnyRate(): number {
-  const configured = Number(process.env.INFIAI_LLM_USD_TO_CNY_RATE || "");
-  if (Number.isFinite(configured) && configured > 0) return configured;
-  return 7.2;
-}
-
 function resolveLanguageModelPreflightUnits(): number {
   const configured = Number(process.env.INFIAI_LLM_PREFLIGHT_MIN_UNITS || "");
   if (Number.isFinite(configured) && configured > 0)
     return Math.ceil(configured);
   return 1;
-}
-
-export function estimateLanguageModelCostUSD(
-  provider: string,
-  model: string,
-  usage: Record<string, unknown>
-): { costUSD: number; costSource: string } {
-  const cost =
-    usage.cost && typeof usage.cost === "object" && !Array.isArray(usage.cost)
-      ? (usage.cost as Record<string, unknown>)
-      : {};
-  const name = `${provider}/${model}`.toLowerCase();
-  const isDeepSeek = name.includes("deepseek");
-  const openClawCost = numberFromUsage(cost.total);
-  if (openClawCost > 0) {
-    return {
-      costUSD: isDeepSeek ? openClawCost * 2 : openClawCost,
-      costSource: isDeepSeek
-        ? "openclaw_usage_cost_deepseek_2x"
-        : "openclaw_usage_cost",
-    };
-  }
-
-  const input = numberFromUsage(usage.input);
-  const output = numberFromUsage(usage.output);
-  const cacheRead = numberFromUsage(usage.cacheRead);
-  const cacheWrite = numberFromUsage(usage.cacheWrite);
-  const cacheMissInput = input + cacheWrite;
-
-  if (name.includes("deepseek-v4-pro")) {
-    return {
-      costUSD:
-        (cacheRead * 0.00725 + cacheMissInput * 0.87 + output * 1.74) /
-        1000000,
-      costSource: "deepseek_v4_pro_retail_2x_usd_2026_08",
-    };
-  }
-  if (name.includes("deepseek")) {
-    return {
-      costUSD:
-        (cacheRead * 0.0056 + cacheMissInput * 0.28 + output * 0.56) / 1000000,
-      costSource: "deepseek_v4_flash_retail_2x_usd_2026_08",
-    };
-  }
-  return { costUSD: 0, costSource: "missing_model_price" };
 }
 
 async function resolveSessionFileFromStore(
@@ -3402,7 +3351,7 @@ async function readLatestAssistantText(
   return latest;
 }
 
-async function readLatestLanguageModelUsage(
+export async function readTurnLanguageModelUsage(
   storePath: string,
   sessionKey: string,
   agentId: string,
@@ -3421,43 +3370,26 @@ async function readLatestLanguageModelUsage(
     return null;
   }
 
-  const lowerBound = startedAtMs > 0 ? startedAtMs - 5000 : 0;
-  let latest: LanguageModelUsageSnapshot | null = null;
+  const lowerBound = startedAtMs > 0 ? startedAtMs : 0;
+  const rows = new Map<string, { provider: string; model: string; responseId: string; usage: Record<string, unknown> }>();
+  const auxiliary = new Map<string, Record<string, unknown>>();
   for (const line of content.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let parsed: any;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const message = parsed?.message;
-    if (parsed?.type !== "message" || message?.role !== "assistant") continue;
-    const usage = message?.usage;
-    if (!usage || typeof usage !== "object" || Array.isArray(usage)) continue;
+    try { parsed = JSON.parse(line); } catch { continue; }
     const ts = Date.parse(String(parsed.timestamp || ""));
     if (lowerBound > 0 && Number.isFinite(ts) && ts < lowerBound) continue;
-
-    const provider = String(message.provider || "").trim();
-    const model = String(message.model || "").trim();
-    const rawUsage = usage as Record<string, unknown>;
-    const estimated = estimateLanguageModelCostUSD(provider, model, rawUsage);
-    latest = {
-      provider,
-      model,
-      inputTokens: numberFromUsage(rawUsage.input),
-      outputTokens: numberFromUsage(rawUsage.output),
-      cacheReadTokens: numberFromUsage(rawUsage.cacheRead),
-      cacheWriteTokens: numberFromUsage(rawUsage.cacheWrite),
-      totalTokens: numberFromUsage(rawUsage.totalTokens),
-      costUSD: estimated.costUSD,
-      costSource: estimated.costSource,
-      responseId: String(message.responseId || "").trim() || undefined,
-      timestamp: String(parsed.timestamp || "").trim() || undefined,
-      rawUsage,
-    };
+    const message = parsed?.message;
+    const details = message?.details;
+    if (message?.role === "toolResult" && message.toolName === "web_search" && !details?.cached && details?.auxiliaryUsage?.requestId) {
+      auxiliary.set(String(details.auxiliaryUsage.requestId), details.auxiliaryUsage);
+    }
+    if (parsed?.type !== "message" || message?.role !== "assistant" || !message.usage || typeof message.usage !== "object") continue;
+    const responseId = String(message.responseId || JSON.stringify([message.timestamp, message.provider, message.model, message.usage]));
+    rows.set(responseId, { provider: String(message.provider || "").trim(), model: String(message.model || "").trim(), responseId, usage: message.usage });
   }
-  return latest;
+  const result = aggregateModelUsage([...rows.values()], [...rows.keys()].at(-1) || "");
+  return result ? { ...result, rawUsage: { ...result.rawUsage, auxiliaryUsages: [...auxiliary.values()] } } : null;
 }
 
 async function chargeLanguageModelOutputUsage(
@@ -3479,19 +3411,9 @@ async function chargeLanguageModelOutputUsage(
   }
 ): Promise<BillingChargeResult> {
   const sourceMsgID = String(msg.clientMsgID || msg.serverMsgID || "");
-  const usage = (params.suggestionTurn?.options.enabled
-    ? params.suggestionTurn.usageSnapshot(estimateLanguageModelCostUSD)
-    : null) ?? await readLatestLanguageModelUsage(
-    params.storePath,
-    params.conversationID,
-    params.agentID,
-    params.dispatchStartedAtMs
-  );
-  const exchangeRate = resolveUsdToCnyRate();
-  const actualCostMicros =
-    usage?.costUSD && usage.costUSD > 0
-      ? Math.ceil(usage.costUSD * exchangeRate * 1000000)
-      : 0;
+  const observed = await readTurnLanguageModelUsage(params.storePath, params.conversationID, params.agentID, params.dispatchStartedAtMs);
+  const usage = (params.suggestionTurn?.options.enabled ? params.suggestionTurn.usageSnapshot() : null) ?? observed;
+  const auxiliaryUsages = (observed?.rawUsage.auxiliaryUsages as unknown[]) || [];
   const idempotencyKey = [
     "inbound",
     "language_model_output",
@@ -3506,9 +3428,8 @@ async function chargeLanguageModelOutputUsage(
     sessionKey: params.conversationID,
     responseId: usage?.responseId,
     usageTimestamp: usage?.timestamp,
-    providerCostUSD: usage?.costUSD || 0,
-    providerCostSource: usage?.costSource || "missing_openclaw_usage",
-    usdToCnyRate: exchangeRate,
+    costBasis: "server_priced_model_tokens",
+    auxiliaryUsages,
     openClawUsage: usage?.rawUsage,
     ...(params.suggestionTurn?.options.enabled ? { turnID: params.suggestionTurn.turnID, suggestionMode: "same_turn_v2", suggestionDiagnostics: params.suggestionTurn.diagnostics() } : {}),
     officeConnectorPlatform: params.officeConnectorPlatform || "",
@@ -3533,7 +3454,6 @@ async function chargeLanguageModelOutputUsage(
       usageSource: params.usageSource || "internal_im",
       inputTokens: usage?.inputTokens || 0,
       outputTokens: usage?.outputTokens || 0,
-      actualCostMicros,
       allowOverdraft: Boolean(params.allowOverdraft),
       rawUsage,
       idempotencyKey,
@@ -3544,7 +3464,6 @@ async function chargeLanguageModelOutputUsage(
     model: usage?.model,
     inputTokens: usage?.inputTokens,
     outputTokens: usage?.outputTokens,
-    actualCostMicros,
   });
 }
 
@@ -4891,7 +4810,7 @@ function buildSignedAgentVoiceStreamURL(
   return url.toString();
 }
 
-class InfiaiVoiceReplyAccumulator {
+export class InfiaiVoiceReplyAccumulator {
   private ws: any | null = null;
   private ready: Promise<void> | null = null;
   private finished: Promise<AgentVoiceStreamResult> | null = null;
@@ -4932,21 +4851,31 @@ class InfiaiVoiceReplyAccumulator {
     const wsURL = buildSignedAgentVoiceStreamURL(this.client, this.params);
     this.ws = new WebSocketCtor(wsURL);
     this.ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => fail("voice_stream_open_timeout"), 15000);
       const fail = (err: unknown) => {
+        clearTimeout(timer);
         const reason = formatSdkError(err) || "voice_stream_open_failed";
         this.disabledReason = reason;
         reject(new Error(reason));
+        this.ws?.close?.();
       };
-      this.ws.onopen = () => resolve();
-      this.ws.onerror = fail;
+      this.ws.onerror = (err: unknown) => {
+        if (!this.disabledReason) fail(err);
+      };
       this.ws.onclose = () => {
-        if (!this.finished) fail("voice_stream_closed");
+        if (!this.finished && !this.disabledReason) fail("voice_stream_closed");
       };
       this.ws.onmessage = (event: any) => {
         try {
           const data = JSON.parse(String(event.data || "{}"));
-          if (data?.type === "error") {
-            this.disabledReason = String(data.message || "voice_stream_error");
+          if (data?.type === "ready" || data?.type === "disabled") {
+            clearTimeout(timer);
+            if (data.type === "disabled") {
+              this.disabledReason = String(data.reason || "voice_reply_disabled");
+            }
+            resolve();
+          } else if (data?.type === "error") {
+            fail(String(data.message || "voice_stream_error"));
           }
         } catch {
           // Ignore progress events that are not JSON.
@@ -4996,9 +4925,18 @@ class InfiaiVoiceReplyAccumulator {
     if (!delta) return;
     this.fullText += delta;
     if (this.disabledReason) return;
-    await this.ensureConnected();
-    for (const part of this.splitReadyText(delta)) {
-      this.ws?.send(JSON.stringify({ type: "append", text: part }));
+    try {
+      await this.ensureConnected();
+      if (this.disabledReason) return;
+      for (const part of this.splitReadyText(delta)) {
+        this.ws?.send(JSON.stringify({ type: "append", text: part }));
+      }
+    } catch (err) {
+      // Keep the first real transport failure visible to the delivery logger.
+      // Subsequent chunks retain text without retrying the broken socket.
+      this.disabledReason ||= formatSdkError(err) || "voice_stream_open_failed";
+      this.ws?.close?.();
+      throw err;
     }
   }
 
@@ -5047,6 +4985,10 @@ class InfiaiVoiceReplyAccumulator {
       this.ws.onerror = (err: unknown) => {
         clearTimeout(timer);
         reject(new Error(formatSdkError(err)));
+      };
+      this.ws.onclose = () => {
+        clearTimeout(timer);
+        reject(new Error("voice_stream_closed"));
       };
       this.ws?.send(JSON.stringify({ type: "finish" }));
     });
@@ -5716,7 +5658,7 @@ export class VoiceCallReplyStream {
   }
 
   get enabled(): boolean {
-    return this.available && Boolean(this.callbackURL());
+    return this.available && !this.signal?.aborted && Boolean(this.callbackURL());
   }
 
   private callbackURL(): string {
@@ -5790,7 +5732,8 @@ export class VoiceCallReplyStream {
 
   private async emit(type: "delta" | "segment" | "final", text: string): Promise<void> {
     if (!this.enabled || !text) return;
-    throwIfVoiceCallAborted(this.signal);
+    // Hanging up detaches delivery while the model drains for usage accounting.
+    // Partial-reply callbacks may be fire-and-forget, so cancellation must not reject.
     const body = JSON.stringify({
       callID: normalizeString(this.params.callID),
       turnID: normalizeString(this.params.turnID),
@@ -6157,7 +6100,7 @@ async function processBufferedAgentTurn(
         [
           "[Image]",
           "The user sent an image, but image understanding returned no readable text.",
-          imageURL,
+          promptMediaReference(imageURL, staged.paths[0]),
         ].join("\n");
       for (const warning of [...staged.warnings, ...imageText.warnings]) {
         warnings.push(warning);
@@ -6350,17 +6293,7 @@ async function processBufferedAgentTurn(
       OriginatingChannel: turnSurface.surface,
       OriginatingTo: `${turnSurface.originatingToPrefix}:${sourceUserID}`,
       CommandAuthorized: false,
-      ...(staged?.paths?.length
-        ? {
-            MediaPath: staged.paths[0],
-            MediaPaths: staged.paths,
-            MediaWorkspaceDir: staged.workspaceDir,
-            MediaUrl: staged.urls[0],
-            MediaType: staged.types[0],
-            MediaUrls: staged.urls,
-            MediaTypes: staged.types,
-          }
-        : {}),
+      ...buildInboundMediaContext(staged),
       _infiai: {
         accountId,
         managedUserId: selfUid,
@@ -7549,17 +7482,7 @@ export async function processInboundMessage(
     OriginatingChannel: "infiai",
     OriginatingTo: originatingTo,
     CommandAuthorized: true,
-    ...(mediaResult.paths.length > 0
-      ? {
-          MediaPath: mediaResult.paths[0],
-          MediaPaths: mediaResult.paths,
-          MediaWorkspaceDir: mediaResult.workspaceDir,
-          MediaUrl: mediaResult.urls[0],
-          MediaType: mediaResult.types[0],
-          MediaUrls: mediaResult.urls,
-          MediaTypes: mediaResult.types,
-        }
-      : {}),
+    ...buildInboundMediaContext(mediaResult),
     _infiai: {
       accountId: client.config.accountId,
       managedUserId: selfUid,

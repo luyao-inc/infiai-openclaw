@@ -6,7 +6,9 @@ import path from "node:path";
 
 import {
   OPEN_PLATFORM_TURN_SURFACE,
+  readTurnLanguageModelUsage,
   VoiceCallReplyStream,
+  InfiaiVoiceReplyAccumulator,
   appendInteractiveReplyContractToBodyForAgent,
   appendLongTermMemoryContextToBodyForAgent,
   buildOpenPlatformOutboundPrompt,
@@ -23,7 +25,6 @@ import {
   detachVoiceCallTurn,
   extractAssistantTextSnapshotFromSessionLine,
   extractMentionedUserIDs,
-  estimateLanguageModelCostUSD,
   inspectInfiaiSessionWorkspaceProjectionState,
   getInfiaiMessageKind,
   isProviderUnavailableText,
@@ -52,6 +53,55 @@ import {
   stripManagedChatLeaks,
   withOpenPlatformSessionLane,
 } from "./inbound";
+
+test("optional voice preserves text without repeated sockets when disabled or unavailable", async () => {
+  const original = (globalThis as any).WebSocket;
+  try {
+    for (const mode of ["disabled", "unavailable", "ready"] as const) {
+      const sockets: any[] = [];
+      class FakeSocket {
+        onmessage?: (event: any) => void;
+        onerror?: (error: unknown) => void;
+        onclose?: () => void;
+        sent: any[] = [];
+        constructor(_url: string) {
+          sockets.push(this);
+          queueMicrotask(() => {
+            if (mode === "unavailable") this.onerror?.(new Error("connection unavailable"));
+            else this.onmessage?.({ data: JSON.stringify({ type: mode, reason: "voice_reply_disabled" }) });
+          });
+        }
+        send(raw: string) {
+          const data = JSON.parse(raw);
+          this.sent.push(data);
+          if (data.type === "finish") queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ type: "finished", enabled: true, audioURL: "https://example.test/audio", duration: 1 }) }));
+        }
+        close() { this.onclose?.(); }
+      }
+      (globalThis as any).WebSocket = FakeSocket;
+      const accumulator = new InfiaiVoiceReplyAccumulator({ config: { accountId: "test", userID: "owner" } } as any,
+        { tenantID: "default", userID: "owner", agentID: "default" });
+      if (mode === "unavailable") {
+        await assert.rejects(accumulator.append("你好。"), /connection unavailable/);
+      } else {
+        await accumulator.append("你好。");
+      }
+      await accumulator.append("你好。欢迎使用灵谐。");
+      const result = await accumulator.finish();
+      assert.equal(accumulator.text, "你好。欢迎使用灵谐。");
+      assert.equal(sockets.length, 1, "one failed optional stream must not be retried per chunk");
+      if (mode === "ready") {
+        assert.equal(result?.enabled, true);
+        assert.equal(sockets[0].sent.filter((x: any) => x.type === "append").length, 2);
+      } else {
+        assert.equal(result, null, "disabled/unavailable voice must fall back to complete text");
+        assert.equal(sockets[0].sent.length, 0);
+      }
+    }
+  } finally {
+    (globalThis as any).WebSocket = original;
+  }
+});
 
 test("builds a public-only knowledge trace without internal identifiers or private filenames", () => {
   const trace = buildKnowledgeTrace({
@@ -285,46 +335,6 @@ test("resolves the runtime session id used by before-prompt evidence", async () 
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
-});
-
-test("doubles DeepSeek OpenClaw-reported cost without changing other providers", () => {
-  assert.deepEqual(
-    estimateLanguageModelCostUSD("deepseek", "deepseek-v4-flash", {
-      cost: { total: 0.25 },
-    }),
-    {
-      costUSD: 0.5,
-      costSource: "openclaw_usage_cost_deepseek_2x",
-    },
-  );
-  assert.deepEqual(
-    estimateLanguageModelCostUSD("openrouter", "qwen/qwen3", {
-      cost: { total: 0.25 },
-    }),
-    { costUSD: 0.25, costSource: "openclaw_usage_cost" },
-  );
-});
-
-test("uses doubled DeepSeek Flash cache-hit, cache-miss and output prices", () => {
-  const usage = { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000, output: 1_000_000 };
-  assert.deepEqual(
-    estimateLanguageModelCostUSD("deepseek", "deepseek-v4-flash", usage),
-    {
-      costUSD: 1.1256,
-      costSource: "deepseek_v4_flash_retail_2x_usd_2026_08",
-    },
-  );
-});
-
-test("uses doubled DeepSeek Pro cache-hit, cache-miss and output prices", () => {
-  const usage = { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000, output: 1_000_000 };
-  assert.deepEqual(
-    estimateLanguageModelCostUSD("deepseek", "deepseek-v4-pro", usage),
-    {
-      costUSD: 3.48725,
-      costSource: "deepseek_v4_pro_retail_2x_usd_2026_08",
-    },
-  );
 });
 
 test("separates stable open-platform message identity from runtime attempts", () => {
@@ -709,6 +719,40 @@ test("streams cumulative voice-call text as ordered deltas and complete speech s
       [...events.keys()].map((index) => index + 1),
     );
     assert.equal(events.filter((event) => event.type === "final").length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalGatewayURL === undefined) delete process.env.VOICE_GATEWAY_INTERNAL_URL;
+    else process.env.VOICE_GATEWAY_INTERNAL_URL = originalGatewayURL;
+    if (originalSecret === undefined) delete process.env.OPENCLAW_SHARED_SECRET;
+    else process.env.OPENCLAW_SHARED_SECRET = originalSecret;
+  }
+});
+
+test("late voice partial and final callbacks after hangup resolve without delivery", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalGatewayURL = process.env.VOICE_GATEWAY_INTERNAL_URL;
+  const originalSecret = process.env.OPENCLAW_SHARED_SECRET;
+  let requests = 0;
+  process.env.VOICE_GATEWAY_INTERNAL_URL = "http://voice-gateway:10008";
+  process.env.OPENCLAW_SHARED_SECRET = "test-secret";
+  globalThis.fetch = (async () => {
+    requests += 1;
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const controller = new AbortController();
+    const stream = new VoiceCallReplyStream({
+      accountId: "acc_default__owner__default", ownerUserID: "owner", agentID: "default",
+      callerUserID: "caller", callID: "vc_hangup", turnID: "vct_hangup",
+      text: "你好", streamReply: true,
+    }, controller.signal);
+    await stream.append("这是已经稳定的一句话。");
+    controller.abort();
+    await assert.doesNotReject(stream.append("这是已经稳定的一句话。还有后续内容。"));
+    await assert.doesNotReject(stream.finish("这是已经稳定的一句话。还有后续内容。"));
+    assert.equal(requests, 0);
+    assert.equal(stream.enabled, false);
+    assert.equal(stream.text, "这是已经稳定的一句话。还有后续内容。");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalGatewayURL === undefined) delete process.env.VOICE_GATEWAY_INTERNAL_URL;
@@ -1627,3 +1671,20 @@ test("commits a free round only after a successful visible assistant reply", () 
     assert.equal(shouldCommitAgentFreeRound(blocked), false);
   }
 });
+
+
+
+ test("turn token collection excludes the preceding reply and free search tokens", async () => {
+ const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bailian-usage-"));
+ try {
+  const file = path.join(dir,"turn.jsonl"), store=path.join(dir,"sessions.json"), now=Date.now();
+  const row=(offset:number,message:any)=>JSON.stringify({type:"message",timestamp:new Date(now+offset).toISOString(),message});
+  const assistant=(id:string,input:number,cacheRead:number)=>({role:"assistant",provider:"aliyun-bailian",model:"deepseek-v4.1-flash",responseId:id,usage:{input,cacheRead,output:10,totalTokens:input+cacheRead+10}});
+  const search={role:"toolResult",toolName:"web_search",details:{cached:false,auxiliaryUsage:{requestId:"search-1",input:6000,output:100,searchCalls:1}}};
+  await fs.writeFile(file,[row(-1000,assistant("old",99999,0)),row(100,assistant("one",100,20)),row(200,search),row(300,search),row(400,assistant("two",200,30))].join("\n"));
+  await fs.writeFile(store,JSON.stringify({"agent:test":{sessionFile:file}}));
+  const got=await readTurnLanguageModelUsage(store,"agent:test","test",now);
+  assert.equal(got?.inputTokens,300);assert.equal(got?.cacheReadTokens,50);assert.equal(got?.outputTokens,20);
+  assert.equal((got?.rawUsage.auxiliaryUsages as any[]).length,1);assert.equal((got as any).costUSD,undefined);
+ } finally {await fs.rm(dir,{recursive:true,force:true});}
+ });
