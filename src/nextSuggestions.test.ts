@@ -107,9 +107,10 @@ test("synchronous runtime hooks isolate concurrent turns and preserve full outpu
         await new Promise((resolve) => setTimeout(resolve, 3));
         const ctx = { sessionKey: turn.options.sessionKey, agentId: "runtime" };
         assert.match(
-          hooks.before_prompt_build({}, ctx).appendContext,
+          hooks.before_prompt_build({}, ctx).appendSystemContext,
           new RegExp(turn.nonce)
         );
+        assert.equal(hooks.before_prompt_build({}, ctx).appendContext, undefined);
         assert.equal(
           hooks.before_prompt_build({}, { sessionKey: "other" }),
           undefined

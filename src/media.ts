@@ -1,3 +1,4 @@
+import { ReplyNotSentError } from "./reply-delivery";
 import type { MessageItem } from "@openim/client-sdk";
 import { File } from "node:buffer";
 import { randomUUID } from "node:crypto";
@@ -79,6 +80,7 @@ async function readLocalAsFile(
 }
 
 type SendTextOptions = {
+ clientMsgID?: string;
   ex?: string;
 };
 
@@ -111,9 +113,10 @@ export async function sendTextToTarget(
   text: string,
   options?: SendTextOptions,
 ): Promise<void> {
-  const created = await client.sdk.createTextMessage(text);
+  const created = await client.sdk.createTextMessage(text).catch((error:unknown)=>{throw new ReplyNotSentError(formatCreationError(error))});
   const message = created?.data;
-  if (!message) throw new Error("createTextMessage failed");
+  if (!message) throw new ReplyNotSentError("createTextMessage failed");
+  if (options?.clientMsgID) message.clientMsgID = options.clientMsgID;
   if (options?.ex) {
     (message as MessageItem & { ex?: string }).ex = options.ex;
   }
@@ -182,7 +185,7 @@ export async function sendAtTextToGroup(
       `[infiai] createTextAtMessage not available on SDK, falling back to createTextMessage — reply will lack formal @-mention, groupID=${groupID}, atUserID=${atUserID}`,
     );
   }
-  const created = hasCreateAtMsg
+  const created = await (async()=>hasCreateAtMsg
     ? await (client.sdk as any).createTextAtMessage({
         text: content,
         atUserIDList: [atUserID],
@@ -193,12 +196,13 @@ export async function sendAtTextToGroup(
           },
         ],
       })
-    : await client.sdk.createTextMessage(content);
+    : await client.sdk.createTextMessage(content))().catch((error:unknown)=>{throw new ReplyNotSentError(formatCreationError(error))});
   const message = created?.data;
   infiaiConsoleDebug(
     `[infiai] sendAtTextToGroup: message created, hasData=${!!message}, dataKeys=${message ? Object.keys(message).join(",") : "null"}`,
   );
-  if (!message) throw new Error("createTextAtMessage failed");
+  if (!message) throw new ReplyNotSentError("createTextAtMessage failed");
+  if (options?.clientMsgID) message.clientMsgID = options.clientMsgID;
   if (options?.ex) {
     (message as MessageItem & { ex?: string }).ex = options.ex;
   }
@@ -317,3 +321,5 @@ export async function sendFileToTarget(
     notOss: isUrl(input),
   });
 }
+
+function formatCreationError(error:unknown):string{return error instanceof Error?error.message:"text message creation failed"}

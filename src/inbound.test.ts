@@ -9,7 +9,7 @@ import {
   readTurnLanguageModelUsage,
   VoiceCallReplyStream,
   InfiaiVoiceReplyAccumulator,
-  appendInteractiveReplyContractToBodyForAgent,
+  buildReplySystemPrompt,
   appendLongTermMemoryContextToBodyForAgent,
   buildOpenPlatformOutboundPrompt,
   buildKnowledgeReferences,
@@ -533,19 +533,15 @@ test("preserves per-session order under a multi-session burst", async () => {
   assert.ok(globalMaxActive > 1);
 });
 
-test("removes managed model and vendor identity disclosures", () => {
-  assert.equal(
-    stripManagedChatLeaks("我是由 Sapiens AI 开发的 Agnes-2.0-Flash 模型。很高兴认识你。"),
-    "很高兴认识你。",
-  );
-  assert.equal(
-    stripManagedChatLeaks("我的模型是 DeepSeek，我可以继续帮你看看。"),
-    "我可以继续帮你看看。",
-  );
-  assert.equal(
-    stripManagedChatLeaks("我运行在 OpenAI 的语言模型上。先说说你遇到了什么？"),
-    "先说说你遇到了什么？",
-  );
+test("preserves identity, uncertainty, conditions and formatting; removes only transport suffixes", () => {
+  for (const text of [
+    "我是本人的分身，不是本人在线。",
+    "知识库没有相关内容，不能确认退款期限。",
+    "## 条件\n\n1. 仅限已付款订单。\n2. 超过期限需本人确认。",
+    "我是由 Sapiens AI 开发的 Agnes-2.0-Flash 模型。很高兴认识你。",
+    "DeepSeek 和 OpenAI 是不同的提供方。",
+  ]) assert.equal(stripManagedChatLeaks(text), text);
+  assert.equal(stripManagedChatLeaks("目前不能确定。NO_REPLY"), "目前不能确定。");
 });
 
 test("refreshes long-running inbound typing state and stops cleanly", async () => {
@@ -1295,17 +1291,16 @@ test("applies the interactive contract only to real-user response surfaces", () 
     false,
   );
 
-  const body = appendInteractiveReplyContractToBodyForAgent("user message", true);
-  assert.match(body, /Infiai Interactive Reply Contract/);
-  assert.match(body, /Do not answer with NO_REPLY or NO_ANSWER/);
-  assert.equal(
-    appendInteractiveReplyContractToBodyForAgent(body, true),
-    body,
-  );
-  assert.equal(
-    appendInteractiveReplyContractToBodyForAgent("group context", false),
-    "group context",
-  );
+  const prompt = buildReplySystemPrompt(true);
+  assert.match(prompt!, /Infiai Interactive Reply Contract/);
+  assert.match(prompt!, /Do not answer with NO_REPLY or NO_ANSWER/);
+  assert.equal(buildReplySystemPrompt(false), undefined);
+  assert.match(buildReplySystemPrompt(true, false, false)!, /没有代本人查询/);
+  assert.doesNotMatch(buildReplySystemPrompt(true, false, true)!, /本轮为访客对话/);
+  const split = buildReplySystemPrompt(true, true)!;
+  assert.match(split, /LINGXIE_MESSAGE/);
+  assert.equal(split.split("Infiai Interactive Reply Contract").length, 2);
+  assert.doesNotMatch(prompt!, /LINGXIE_MESSAGE/);
 });
 
 test("resolves localized NO_REPLY fallbacks with fixed defaults", () => {
