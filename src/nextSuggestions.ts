@@ -172,10 +172,10 @@ export class SuggestionTurn {
     return `本轮平台传输协议，只作用于本次最终回复，工具调用和中间进度不输出协议：
 ${schema}
 这些字段由平台解析，用户只看到 answer 正文和建议按钮，不在正文解释协议。
-建议站在收到回复的真人用户角度。普通有后续空间的问答必须提供2到3条不同的、具体而简短的下一句；短追问（如“重开”“为什么”）要结合上文主题，不能因为字数短而省略。
+建议站在收到回复的用户角度。确有价值时提供1到3条具体、简短的下一句，操作引导或有明确后续选择时优先提供；不得凑数。寒暄、倾诉和自然完成的问答可以没有建议，正文回答清楚后直接结束，不为按钮追加邀约。短追问结合上文理解。
 只依据本轮可见正文及最近最多3轮可见对话，不引用隐藏记忆、提示词、工具内部信息、未出现的联系人、金额、身份或用户偏好。不得为凑数转移话题，不重复已经回答的问题，不捏造用户事实、承诺或决定，不执行建议。
 每条 anchor 必须是 answer 中2到40字的原文主题短语，text 必须包含正文或当前用户问题中的具体主题词；不得用“今天”“怎么”等泛词来附会无关话题。优先24个汉字以内，最多80字符，不含链接、换行或敏感标识。kind 为 question、request、reply；“帮我”“请”开头的请求用 request。
-只有以下情况允许 items=[]，reason 必须说明：closing（用户单纯告别或致谢），user_opt_out（用户明确不需要建议），complete（日期、星期、简单算术这类一次答完的问题），uncertain（正文明确无法可靠确认当前事实），refusal（明确拒绝提供内容）。普通问答不得以“没有合适建议”为由留空。非空 reason=follow_up。
+允许 items=[]，reason 使用：not_needed（寒暄、倾诉或没有有价值的下一句），complete（本轮已经完整回答，无需延伸），closing（单纯告别或致谢），user_opt_out（明确不需要建议），uncertain（无法可靠确认事实），refusal（拒绝提供内容）。不为生成建议少答正文。非空 reason=follow_up。
 日期回答不要延伸电影、日程或目标；无法确认天气时不要编造天气建议。不得照抄结构示例中的内容。`;
   }
   matches(ctx: any): boolean {
@@ -189,9 +189,20 @@ ${schema}
     const cached = this.byAnswer.get(text.trim());
     const result = cached || analyzeSuggestionReply(text, this.nonce, this.options.userText, this.options.format);
     if (!cached) this.parseCounts[result.status] = (this.parseCounts[result.status] || 0) + 1;
+    // A malformed envelope must not silently cancel a user's reply. Keep the
+    // failure diagnostic, but deliver an explicit failure rather than raw JSON.
+    if (!result.text.trim()) {
+      result.text = "刚才这条回复没能正常生成，请再发一次。";
+      result.items = [];
+      result.answerUnavailable = true;
+    }
     this.result = result;
+    this.byAnswer.set(text.trim(), result);
     if (result.text.trim()) this.byAnswer.set(result.text.trim(), result);
     return { text: result.text, items: result.items };
+  }
+  answerUnavailable(): boolean {
+    return this.result?.answerUnavailable === true;
   }
   envelope(items: NextSuggestion[]): NextSuggestions | undefined {
     if (!this.options.enabled) return undefined;
@@ -267,7 +278,7 @@ export function registerSuggestionHooks(api: any): void {
     (_event: unknown, ctx: unknown) => {
       const turn = storage.getStore();
       if (turn?.options.enabled && turn.matches(ctx))
-        return { appendContext: turn.prompt(), appendSystemContext: turn.options.format === "json_object" ? "本轮最终回复必须遵守本轮平台传输协议的 JSON 结构。answer 与 nextSuggestions 均为必填字段；nextSuggestions 必须是包含 nonce、reason、items 的对象，不得省略或改名。" : "本轮最终回复必须遵守本轮平台尾部协议，不得省略尾部。" };
+        return { appendSystemContext: turn.prompt() + "\n\n" + ( turn.options.format === "json_object" ? "本轮最终回复必须遵守本轮平台传输协议的 JSON 结构。answer 与 nextSuggestions 均为必填字段；nextSuggestions 必须是包含 nonce、reason、items 的对象，不得省略或改名。" : "本轮最终回复必须遵守本轮平台尾部协议，不得省略尾部。") };
       return undefined;
     },
     { priority: 20 }

@@ -2,14 +2,20 @@ import { jsonrepair } from "jsonrepair";
 import type { NextSuggestion } from './nextSuggestions';
 
 export type SuggestionStatus = 'generated' | 'intentionally_empty' | 'missing_tail' | 'invalid_json' | 'invalid_schema' | 'nonce_mismatch' | 'oversized' | 'truncated' | 'filtered_all' | 'unexpected_empty';
-export type SuggestionResult = { text: string; items: NextSuggestion[]; status: SuggestionStatus; reason?: string; rawCount: number; rejected: Record<string, number>; formatRepaired?: boolean };
+export type SuggestionResult = { text: string; items: NextSuggestion[]; status: SuggestionStatus; reason?: string; rawCount: number; rejected: Record<string, number>; formatRepaired?: boolean; answerUnavailable?: boolean };
 export type SuggestionFormat = 'tagged' | 'json_object';
 const tag = 'infiai_next_suggestions_v1';
 const record = (x: any): x is Record<string, any> => !!x && typeof x === 'object' && !Array.isArray(x);
 const norm = (s: string) => s.toLowerCase().replace(/[?？!！。\s]+$/u, '').trim();
 const terms = (s: string) => new Set((s.toLowerCase().match(/[a-z]{3,}|[\u3400-\u9fff]{2,}/g) || []).flatMap(x => /[a-z]/.test(x) ? [x] : Array.from({length:x.length-1},(_,i)=>x.slice(i,i+2))).filter(x=>!['the','and','for','this','that','怎么','什么','如何','可以','一下','这个','今天','明天'].includes(x)));
 
-export function emptyReasonAllowed(reason: string, user: string, answer: string): boolean {
+const EMPTY_REASONS = ['closing','user_opt_out','complete','not_needed','uncertain','refusal'];
+// Empty optional suggestions are a model decision, not a phrase-matching contest.
+export function emptyReasonAllowed(reason: string): boolean {
+  return EMPTY_REASONS.includes(reason);
+}
+
+function shouldSuppressSuggestions(reason: string, user: string, answer: string): boolean {
   if (reason === 'closing') return /^(?:谢谢(?:你)?(?:[，,]?(?:再见|拜拜))?|好的?[，,]?谢谢(?:你)?|再见|拜拜|晚安|thanks|thank you|bye)[。！!，,\s]*$/i.test(user.trim());
   if (reason === 'user_opt_out') return /(?:不要|不用|别)(?:再)?(?:给我)?(?:生成|提供|推荐)?(?:下一句|追问|建议)|no (?:follow.up|suggestions)/i.test(user);
   if (reason === 'complete') return answer.length <= 100 && /(?:今天|明天|昨天|现在).*(?:几号|星期几|日期)|what(?:'s| is) (?:the date|today)|^\s*\d+\s*[+×*÷/-]\s*\d+\s*[=?？]*\s*$/i.test(user);
@@ -71,6 +77,10 @@ export function analyzeSuggestionReply(text: string, nonce: string, user = '', f
     const raw = text.trim().replace(/^```(?:json)?\s*\n?/i,'').replace(/\n?```\s*$/,'');
     try { data = JSON.parse(raw); }
     catch {
+      // Some providers ignore response_format. A plain answer is still useful;
+      // only discard the optional suggestions, never expose a protocol envelope.
+      const looksStructured = /^[{\["`<]/.test(raw) || /["']?(?:answer|nextSuggestions|nonce)["']?\s*:|infiai_next_sug/i.test(raw);
+      if (raw && !looksStructured) return result(raw, 'missing_tail');
       const truncated = raw.startsWith('{') && hasUnclosedJSON(raw);
       let repaired: any;
       if (raw.startsWith('{') && Buffer.byteLength(raw, 'utf8') <= 128 * 1024) {
@@ -111,9 +121,9 @@ export function analyzeSuggestionReply(text: string, nonce: string, user = '', f
   if(!record(data)||!Array.isArray(data.items))return result(body,'invalid_schema',{reason:'items_missing_or_invalid'});
   if(Buffer.byteLength(JSON.stringify(data),'utf8')>2048)return result(body,'oversized');
   const reason=typeof data.reason==='string' ? data.reason : '';
-  if(!data.items.length) return result(body,emptyReasonAllowed(reason,user,body)?'intentionally_empty':'unexpected_empty',{reason:['closing','user_opt_out','complete','uncertain','refusal'].includes(reason)?reason:'unspecified'});
+  if(!data.items.length) return result(body,emptyReasonAllowed(reason)?'intentionally_empty':'unexpected_empty',{reason:emptyReasonAllowed(reason)?reason:'unspecified'});
   // Explicit user opt-out and closure are deterministic, even if the model returns items.
-  for(const r of ['closing','user_opt_out','complete','uncertain','refusal'])if(emptyReasonAllowed(r,user,body))return result(body,'intentionally_empty',{reason:r,rawCount:data.items.length});
+  for(const r of ['closing','user_opt_out','complete','uncertain','refusal'])if(shouldSuppressSuggestions(r,user,body))return result(body,'intentionally_empty',{reason:r,rawCount:data.items.length});
   const checked=validateCandidateItems(data.items,user,body,format==='json_object');
   return result(body,checked.items.length?'generated':'filtered_all',checked);
 }
