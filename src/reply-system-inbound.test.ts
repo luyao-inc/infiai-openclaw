@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getInfiaiToolContext } from "./toolContext";
 import { processInboundMessage } from "./inbound";
 
 // Exercise the real OpenIM entrypoint up to dispatch; no network or model calls.
@@ -25,7 +26,7 @@ test("OpenIM dispatch separates system contracts from owner and visitor messages
       return new Response(JSON.stringify({errCode:0,data}), {status:200});
     };
     const captured: any[] = [];
-    const api = {config:cfg,logger:{warn:()=>{},info:()=>{},error:()=>{}},runtime:{channel:{routing:{resolveAgentRoute:()=>({agentId,matchedBy:"binding"})},reply:{dispatchReplyWithBufferedBlockDispatcher:async ({ctx}:any)=>{captured.push(ctx);throw new Error("test stops before model generation");}}}}};
+    const api = {config:cfg,logger:{warn:()=>{},info:()=>{},error:()=>{}},runtime:{channel:{routing:{resolveAgentRoute:()=>({agentId,matchedBy:"binding"})},reply:{dispatchReplyWithBufferedBlockDispatcher:async ({ctx}:any)=>{captured.push({...ctx,trustedMemoryForTest:getInfiaiToolContext()?.memoryContext});throw new Error("test stops before model generation");}}}}};
     const client = {config:{accountId,userID:"prompt-owner",inboundWhitelist:[],requireMention:true,chatApiAddr:"http://prompt-test.invalid"},gatewayConfig:cfg,sdk:{}};
     for (const sender of ["prompt-owner", "prompt-visitor"]) {
       await processInboundMessage(api, client as any, {sendID:sender,recvID:"prompt-owner",sessionType:1,contentType:101,textElem:{content:"你好"},clientMsgID:"prompt-system-"+sender,sendTime:Date.now(),senderNickname:sender,senderPlatformID:5,ex:JSON.stringify({infiai:{source:sender==="prompt-owner"?"infiai_human_self_assistant":""}})} as any);
@@ -39,7 +40,8 @@ test("OpenIM dispatch separates system contracts from owner and visitor messages
       assert.match(ctx.GroupSystemPrompt, /Infiai Interactive Reply Contract/);
       assert.doesNotMatch(ctx.GroupSystemPrompt, /LINGXIE_MESSAGE/);
       assert.doesNotMatch(ctx.BodyForAgent, /Interactive Reply Contract|Reply delivery contract|<<<LINGXIE_MESSAGE>>>/);
-      assert.match(ctx.BodyForAgent, /用户喜欢科幻电影/);
+      assert.doesNotMatch(ctx.BodyForAgent, /用户喜欢科幻电影/);
+      assert.match(ctx.trustedMemoryForTest, /用户喜欢科幻电影/);
       assert.equal(ctx.GroupSystemPrompt.includes("本轮为访客对话"), i !== 0);
       assert.equal(ctx.InfiaiContext.ownerAuthorized, i === 0);
       assert.equal(ctx.InfiaiContext.socialTools, i === 0 ? "allowed" : "denied");
