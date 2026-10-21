@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface InfiaiToolContext {
+  memoryContext?: string;
   accountId: string;
   managedUserId: string;
   senderId: string;

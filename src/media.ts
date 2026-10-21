@@ -85,6 +85,7 @@ type SendTextOptions = {
 };
 
 type SendVoiceOptions = {
+  clientMsgID?: string;
   ex?: string;
 };
 
@@ -159,6 +160,7 @@ export async function sendVoiceToTarget(
   });
   const message = created?.data;
   if (!message) throw new Error("createSoundMessageByURL failed");
+  if (options?.clientMsgID) message.clientMsgID = options.clientMsgID;
   if (options?.ex) {
     (message as MessageItem & { ex?: string }).ex = options.ex;
   }

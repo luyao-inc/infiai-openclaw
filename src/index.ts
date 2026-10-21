@@ -1,3 +1,4 @@
+import { registerMemoryBoundaryHooks } from "./memoryBoundary";
 /**
  * OpenClaw Infiai Channel Plugin
  *
@@ -352,6 +353,7 @@ function registerFull(api: any): void {
   (globalThis as any).__openimGatewayConfig = api.config;
 
   registerSuggestionHooks(api);
+    registerMemoryBoundaryHooks(api);
   registerOpenIMTools(api);
   registerScheduledTaskToolGuard(api);
   registerOpenPlatformGateway(api);
