@@ -25,3 +25,12 @@ test('fresh memory reaches the model separately from storage and is scoped to th
  assert.deepEqual(await Promise.all([make('first user facts'),make('second user facts')]),['first user facts','second user facts']);
  assert.equal(hooks.before_prompt_build({}, {agentId:'agent',sessionKey:'session'}),undefined);
 });
+
+test('learned knowledge stays ephemeral and revocation fences every visitor without affecting other agents',()=>{
+ const teaching='[Infiai Agent Learned Context]\nsubject=general; 星桥三步法\n[End Infiai Agent Learned Context]\n';
+ assert.equal(stripStoredMemory(teaching+'当前访客的问题'),'当前访客的问题');
+ assert.equal(stripStoredMemory('[Infiai Long-Term Memory Context]\n私人偏好\n[End Infiai Long-Term Memory Context]\n'+teaching+'问题'),'问题');
+ const a=memoryVersionedSessionKey('agent:a:visitor:one','facts-v2:1:1:off:learned:1:0');
+ assert.notEqual(a,memoryVersionedSessionKey('agent:a:visitor:one','facts-v2:1:1:off:learned:1:1'));
+ assert.notEqual(a,memoryVersionedSessionKey('agent:a:visitor:two','facts-v2:1:1:off:learned:1:0'));
+});

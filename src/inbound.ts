@@ -2616,6 +2616,7 @@ async function fetchInfiaiLongTermMemoryContext(
     messageID?: string;
     query: string;
     timeoutMs?: number;
+    memoryMode?: string;
   }
 ): Promise<{ contextText: string; provider?: string; skippedReason?: string; memoryVersion?: string; memoryGeneration?: number }> {
   const data = await signedChatApiCall(
@@ -2629,6 +2630,7 @@ async function fetchInfiaiLongTermMemoryContext(
       threadID: params.conversationID,
       conversationID: params.conversationID,
       query: params.query,
+      memoryMode: params.memoryMode,
       messages: params.query.trim()
         ? [
             {
@@ -2643,7 +2645,7 @@ async function fetchInfiaiLongTermMemoryContext(
     { timeoutMs: params.timeoutMs || memoryGatewayTimeoutMs("context") }
   );
   return {
-    contextText: String(data?.contextText || ""),
+    contextText: [String(data?.contextText || ""), String(data?.teachingContextText || "")].filter(Boolean).join("\n\n"),
     provider: String(data?.provider || ""),
     memoryVersion: String(data?.memoryVersion || ""),
     memoryGeneration: Number(data?.memoryGeneration || 0),
@@ -6054,9 +6056,6 @@ async function processBufferedAgentTurn(
             sourceUserID,
           })
         : "";
-    const cachedVoiceMemory = voiceMemoryKey
-      ? takeVoiceMemoryContext(voiceMemoryKey)
-      : "";
     const memoryStartedAt = Date.now();
     try {
       if (turnSurface.memoryReadEnabled === false) {
@@ -6071,6 +6070,7 @@ async function processBufferedAgentTurn(
         conversationID: effectiveSessionKey,
         messageID,
         query: rawBody,
+        memoryMode: turnSurface.kind === "incognito_chat" ? "temporary" : undefined,
         ...(turnSurface.kind === "voice_call"
           ? { timeoutMs: voiceMemoryContextTimeoutMs("turn") }
           : {}),
@@ -6082,10 +6082,6 @@ async function processBufferedAgentTurn(
       if (voiceMemoryKey) putVoiceMemoryContext(voiceMemoryKey, contextResult);
       throwIfVoiceCallAborted(turnRuntime.abortSignal);
     } catch (err) {
-      if (false && cachedVoiceMemory) {
-        longTermMemoryContextText = cachedVoiceMemory;
-        timings.memoryContextCacheHit = true;
-      }
       effectiveSessionKey = memoryVersionedSessionKey(effectiveSessionKey, `unavailable:${messageID}`);
       warnings.push("memory_context_failed");
       api.logger?.warn?.(
@@ -6205,7 +6201,7 @@ async function processBufferedAgentTurn(
     let suppressedProgressOnlyReply = false;
     let usedNoReplyFallback = false;
     const llmDispatchStartedAt = Date.now();
-    const knowledgeReview = knowledgeReplyReview(api, { agentId: executionAgentId, sessionKey: effectiveSessionKey, startedAt: llmDispatchStartedAt, question: rawBody, trustedMemoryContext: longTermMemoryContextText, memorySubject: sourceUserID === selfUid ? "owner" : "end_user", validateMemory: async () => { try { const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid, agentID:businessAgentID, sourceUserID, sourceUserName, conversationType:bufferedConversationType, conversationID:effectiveSessionKey, query:""}); return (current.memoryVersion || "off") === memoryVersionForTurn; } catch { return false; } }, signal: turnRuntime.abortSignal });
+    const knowledgeReview = knowledgeReplyReview(api, { agentId: executionAgentId, sessionKey: effectiveSessionKey, startedAt: llmDispatchStartedAt, question: rawBody, trustedMemoryContext: longTermMemoryContextText, memorySubject: sourceUserID === selfUid ? "owner" : "end_user", validateMemory: async () => { try { const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid, agentID:businessAgentID, sourceUserID, sourceUserName, conversationType:bufferedConversationType, conversationID:effectiveSessionKey, memoryMode:turnSurface.kind === "incognito_chat" ? "temporary" : undefined, query:""}); return (current.memoryVersion || "off") === memoryVersionForTurn; } catch { return false; } }, signal: turnRuntime.abortSignal });
     const cleanVisibleReplyText = (text: string): string => {
       if (!text) return "";
       const localized = localizeOpenClawReply(text);
@@ -6284,7 +6280,7 @@ async function processBufferedAgentTurn(
                   if (cleaned) {
                     // Personal facts are reviewed as a complete draft before speech.
                     if (/(?:你|您).{0,16}(?:身份|职业|工作|从事|经历|做过|项目|参加|参与|偏好|喜欢|获奖|简介|履历|bio)|介绍.{0,8}(?:你|自己)|你是谁|你叫什么/iu.test(rawBody)) return;
-                    const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid,agentID:businessAgentID,sourceUserID,sourceUserName,conversationType:bufferedConversationType,conversationID:effectiveSessionKey,query:""});
+                    const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid,agentID:businessAgentID,sourceUserID,sourceUserName,conversationType:bufferedConversationType,conversationID:effectiveSessionKey,memoryMode:turnSurface.kind === "incognito_chat" ? "temporary" : undefined,query:""});
                     if ((current.memoryVersion || "off") !== memoryVersionForTurn) return;
                     await turnRuntime.voiceStream!.append(cleaned);
                   }

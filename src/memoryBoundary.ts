@@ -7,7 +7,7 @@ export function memoryVersionedSessionKey(key: string, version?: string): string
  return `${base}:memory-v1:${hash}`;
 }
 export function stripStoredMemory(text: string): string {
- return text.replace(/\[Infiai Long-Term Memory Context\][\s\S]*?\[End Infiai Long-Term Memory Context\]\s*/g, "");
+ return text.replace(/\[Infiai Long-Term Memory Context\][\s\S]*?\[End Infiai Long-Term Memory Context\]\s*/g, "").replace(/\[Infiai Agent Learned Context\][\s\S]*?\[End Infiai Agent Learned Context\]\s*/g, "");
 }
 export function registerMemoryBoundaryHooks(api: any): void {
  api.on?.("before_prompt_build", (_event: any, ctx: any) => {
