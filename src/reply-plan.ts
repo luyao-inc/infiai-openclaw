@@ -1,3 +1,5 @@
+import { plainMarkdownText } from "./plainMarkdownText";
+
 export type ReplyDeliveryConfig = {
   version: 1;
   mode: "auto" | "single";
@@ -24,6 +26,10 @@ export function requestsSingleReply(text: string): boolean {
     text
   );
 }
+// Trim transport padding without removing indentation from a code block.
+function trimReplyBoundary(text: string): string {
+  return text.replace(/^(?:[ \t]*\n)+|(?:\n[ \t]*)+$/g, "");
+}
 // Delimiters inside code are literal. Malformed/empty model boundaries fall back losslessly.
 function explicitMessages(text: string): string[] {
   const parts: string[] = [];
@@ -46,11 +52,11 @@ function explicitMessages(text: string): string[] {
       continue;
     }
     if (!fence && line.trim() === MESSAGE_SEPARATOR) {
-      if (lines.join("\n").trim()) parts.push(lines.join("\n").trim());
+      if (lines.join("\n").trim()) parts.push(trimReplyBoundary(lines.join("\n")));
       lines = [];
     } else lines.push(line);
   }
-  if (lines.join("\n").trim()) parts.push(lines.join("\n").trim());
+  if (lines.join("\n").trim()) parts.push(trimReplyBoundary(lines.join("\n")));
   return parts;
 }
 // Protect Markdown blocks locally, allowing ordinary text around code/table blocks to split.
@@ -101,6 +107,8 @@ function semanticUnits(text: string): string[] {
   return blocks.flatMap((block) => {
     if (
       /(?:^|\n) {0,3}(?:`{3,}|~{3,})/.test(block) ||
+      /(`+)[\s\S]*?\1(?!`)/.test(block) ||
+      /^(?: {4}|\t)/.test(block) ||
       /^\s*(?:\||#{1,6}\s|\d+[.、)]|[-*+] )/.test(block) ||
       /\n[^\n]*\|[^\n]*\|/.test(block)
     )
@@ -118,7 +126,8 @@ export function buildReplyPlan(
   config: ReplyDeliveryConfig,
   userText = ""
 ): string[] {
-  const explicit = explicitMessages(text);
+  // Normalize the complete answer before boundaries can separate emphasis pairs.
+  const explicit = explicitMessages(plainMarkdownText(text));
   if (config.mode === "single" || requestsSingleReply(userText))
     return explicit.length ? [explicit.join("\n\n")] : [];
   const parts: string[] = [];
@@ -136,11 +145,11 @@ export function buildReplyPlan(
         Array.from(current.trim()).length >= 60 &&
         !dependent
       ) {
-        parts.push(current.trim());
+        parts.push(trimReplyBoundary(current));
         current = unit;
       } else current += (current && unit ? "\n" : "") + unit;
     }
-    if (current.trim()) parts.push(current.trim());
+    if (current.trim()) parts.push(trimReplyBoundary(current));
   }
   // Apply the final cap AFTER fallback splitting. Merge; never trim away content.
   while (parts.length > 8) {

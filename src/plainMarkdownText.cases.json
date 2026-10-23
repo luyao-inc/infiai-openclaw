@@ -1,0 +1,82 @@
+[
+  {
+    "name": "screenshot",
+    "raw": "**一、把某样东西说成万能。\n**比如“某味药包治百病”。\n这世上没有一味药能通吃所有病。\n**二、把“古书上说”当理由。\n**《本草纲目》本身就有错。",
+    "expected": "一、把某样东西说成万能。\n比如“某味药包治百病”。\n这世上没有一味药能通吃所有病。\n二、把“古书上说”当理由。\n《本草纲目》本身就有错。"
+  },
+  {
+    "name": "paired and multiline",
+    "raw": "**重点**，__结论__。\n**跨行\n重点**",
+    "expected": "重点，结论。\n跨行\n重点"
+  },
+  {
+    "name": "split closing",
+    "raw": "这是结论。**\n**",
+    "expected": "这是结论。\n"
+  },
+  {
+    "name": "headings quotes links",
+    "raw": "# 标题\n> 说明\n[文档](https://example.com/a?q=x)\n![图片](https://example.com/i.png)",
+    "expected": "标题\n说明\n文档 (https://example.com/a?q=x)\n图片 (https://example.com/i.png)"
+  },
+  {
+    "name": "inline code and escaped stars",
+    "raw": "**说明**，`a ** b`、`` `**literal**` ``、\\*\\*原样。",
+    "expected": "说明，`a ** b`、`` `**literal**` ``、\\*\\*原样。"
+  },
+  {
+    "name": "fenced code with prose",
+    "raw": "**前文**\n```ts\nconst x = \"**保留**\";\n```\n**后文**",
+    "expected": "前文\n```ts\nconst x = \"**保留**\";\n```\n后文"
+  },
+  {
+    "name": "tilde fence and unclosed fence",
+    "raw": "**前文**\n~~~\n**code**\n~~~\n**后文**\n```\n**未闭合代码",
+    "expected": "前文\n~~~\n**code**\n~~~\n后文\n```\n**未闭合代码"
+  },
+  {
+    "name": "table",
+    "raw": "**前文**\n| 列 | 值 |\n| --- | --- |\n| **A** | 2 * 3 |\n\n**后文**",
+    "expected": "前文\n| 列 | 值 |\n| --- | --- |\n| **A** | 2 * 3 |\n\n后文"
+  },
+  {
+    "name": "indented code",
+    "raw": "**前文**\n    **代码**\n**后文**",
+    "expected": "前文\n    **代码**\n后文"
+  },
+  {
+    "name": "literal punctuation",
+    "raw": "2 * 3 = 6; 2 ** 3 = 8; *.ts; **/*.ts; foo_bar_baz; C#; #话题; https://example.com/a_b?q=x*y",
+    "expected": "2 * 3 = 6; 2 ** 3 = 8; *.ts; **/*.ts; foo_bar_baz; C#; #话题; https://example.com/a_b?q=x*y"
+  },
+  {
+    "name": "html text",
+    "raw": "**说明** <img src=x onerror=\"alert(1)\">\n<script>alert(1)</script>",
+    "expected": "说明 <img src=x onerror=\"alert(1)\">\n<script>alert(1)</script>"
+  },
+  {
+    "name": "italic strike",
+    "raw": "*强调内容* 和 _重点内容_、~~旧说法~~",
+    "expected": "强调内容 和 重点内容、旧说法"
+  },
+  {
+    "name": "CRLF",
+    "raw": "**重点**\r\n下一行",
+    "expected": "重点\n下一行"
+  },
+  {
+    "name": "single-character emphasis",
+    "raw": "**好**和**坏**、*字*、_词_、__对__",
+    "expected": "好和坏、字、词、对"
+  },
+  {
+    "name": "URL punctuation preserved",
+    "raw": "**链接** https://example.com/a*b*c?q=__x__",
+    "expected": "链接 https://example.com/a*b*c?q=__x__"
+  },
+  {
+    "name": "nested emphasis",
+    "raw": "***重点***，**请 *先* 阅读**，~~旧~~",
+    "expected": "重点，请 先 阅读，旧"
+  }
+]
