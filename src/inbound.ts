@@ -2,6 +2,7 @@ import { memoryVersionedSessionKey } from "./memoryBoundary";
 import { knowledgeReplyReview } from "./knowledgeReview";
 import type { ModelUsageRow } from "./modelUsage";
 import { buildReplyPlan, REPLY_PLAN_PROMPT } from "./reply-plan";
+import { plainMarkdownText } from "./plainMarkdownText";
 import { isReplyStopCommand, replyControlText } from "./reply-plan";
 import { InboundReplyTurn, ReplyNotSentError, ReplyCancelledError, ReplyCancellationScopes, deliverReplyPlan } from "./reply-delivery";
 import { aggregateModelUsage } from "./modelUsage";
@@ -4451,6 +4452,11 @@ async function sendReplyFromInbound(
   } = {}
 ): Promise<void> {
   const isGroup = isGroupMessage(msg);
+  // Planned replies were already normalized before splitting. Keep fallback and
+  // group replies consistent without rewriting code spanning planned parts.
+  if (!options.delivery && (options.messageKind || MESSAGE_KIND_ASSISTANT_REPLY) === MESSAGE_KIND_ASSISTANT_REPLY) {
+    text = plainMarkdownText(text);
+  }
   // A reply already running when a paid session starts must stay silent.
   if (!isGroup) {
     const reception = await signedChatApiCall(client, "/claw/internal/human-reception/active", { buyerUserID: msg.sendID }, { timeoutMs: 5000 });

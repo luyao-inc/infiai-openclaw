@@ -37,6 +37,8 @@ test("model failures reach the sender once using the existing friendly notice", 
         notice,
         "HTTP 429 provider cooldown",
         "我在。",
+        "**一、这是重点。\n**解释说明。",
+        "**前文**\n```ts\nconst x = '**代码**';\n```\n**后文**",
       ].entries()) {
         await t.test(`textDelivery=${textDelivery} payload ${index}`, async () => {
           const sent: any[] = [];
@@ -57,7 +59,7 @@ test("model failures reach the sender once using the existing friendly notice", 
           assert.deepEqual(errors, []);
           assert.equal(sent.length, 1);
           assert.equal(sent[0].recvID, "failure-visitor");
-          assert.equal(sent[0].message.textElem.content, index < 3 ? notice : payload);
+          assert.equal(sent[0].message.textElem.content, index < 3 ? notice : index === 4 ? "一、这是重点。\n解释说明。" : index === 5 ? "前文\n```ts\nconst x = '**代码**';\n```\n后文" : payload);
           assert.equal(JSON.parse(sent[0].message.ex).infiai.messageKind, index < 3 ? "model_error" : "assistant_reply");
         });
       }
