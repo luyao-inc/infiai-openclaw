@@ -22,7 +22,8 @@ import {
 } from "./inbound";
 import { runOpenIMSetup } from "./setup";
 import { registerOpenIMTools } from "./tools";
-import { createBailianSearchProvider } from "./bailianSearch";
+import { createSonarSearchProvider } from "./sonarSearch";
+import { registerSearchPolicyHooks } from "./searchPolicy";
 
 const SCHEDULED_TASK_BLOCKED_TOOLS = new Set([
   "bash",
@@ -349,6 +350,7 @@ function registerCliMetadata(api: any): void {
 }
 
 function registerFull(api: any): void {
+  registerSearchPolicyHooks(api);
   (globalThis as any).__openimApi = api;
   (globalThis as any).__openimGatewayConfig = api.config;
 
@@ -394,7 +396,7 @@ export default {
   name: "Infiai Channel",
   description: "Infiai protocol channel for OpenClaw",
   register(api: any): void {
-    api.registerWebSearchProvider?.(createBailianSearchProvider());
+    api.registerWebSearchProvider?.(createSonarSearchProvider());
     if (api.registrationMode === "cli-metadata") {
       registerCliMetadata(api);
       return;

@@ -15,7 +15,6 @@ export function knowledgeReplyReview(api: any, input: ReviewInput) {
       const previous = cache.get(answer);
       if (previous) return previous;
       const pending = (async () => {
-        if (input.validateMemory && !await input.validateMemory()) return "请重新发送刚才的问题。";
         const service = (process as any)[serviceKey] as ((value: ReviewInput & { answer: string }) => Promise<ReviewResult>) | undefined;
         if (!service) return answer; // Older runtimes retain their existing behavior.
         const learned = input.trustedMemoryContext?.match(/\[Infiai Agent Learned Context\][\s\S]*?\[End Infiai Agent Learned Context\]/g)?.join("\n") || "";

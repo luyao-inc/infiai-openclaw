@@ -4,6 +4,8 @@ import {
   buildReplyPlan,
   effectiveReplyDelivery,
   MESSAGE_SEPARATOR,
+  MAX_REPLY_PARTS,
+  MAX_REPLY_PART_ENCODED_BYTES,
   isReplyStopCommand,
   replyPartDelayMs,
 } from "./reply-plan";
@@ -18,34 +20,38 @@ test("short reply stays whole, explicit boundaries are optional and not displaye
     ["第一件事。", "第二件事。"]
   );
 });
-test("final cap preserves every sentence after a very long fallback", () => {
-  const text =
-    "先打开页面并按提示选择国家地区，然后选择身份证上传正反两面。".repeat(90);
-  const parts = buildReplyPlan(text, config);
-  assert.equal(parts.length, 8);
-  assert.equal(letters(parts.join("")), letters(text));
-  assert.ok(parts.every((p) => p.endsWith("。")));
+test("ordinary long prose stays in one model-chosen message", () => {
+  const text = "先打开页面并按提示选择国家地区，然后选择身份证上传正反两面。".repeat(90);
+  assert.deepEqual(buildReplyPlan(text, config), [text]);
 });
-test("protects complete code, tables, condition and heading while splitting surrounding prose", () => {
+test("independent content boundaries survive different lengths without two-plus-three packing", () => {
+  const messages = ["先说结论。", ...Array.from({length:5}, (_,i)=>`作品${i+1}\n`+"同一作品的正文与说明。".repeat(i*6+1))];
+  assert.deepEqual(buildReplyPlan(messages.join("\n"+MESSAGE_SEPARATOR+"\n"), config), messages);
+  assert.deepEqual(buildReplyPlan("嗯，我听着。\n"+MESSAGE_SEPARATOR+"\n今天最让你难受的是哪一段？",config),["嗯，我听着。","今天最让你难受的是哪一段？"]);
+});
+test("more than eight natural boundaries retain their order and identity",()=>{
+ const messages=Array.from({length:12},(_,i)=>`独立内容${i+1}。`);
+ assert.deepEqual(buildReplyPlan(messages.join("\n"+MESSAGE_SEPARATOR+"\n"),config),messages);
+ const abnormal=Array.from({length:MAX_REPLY_PARTS+2},(_,i)=>`内容${i}。`);
+ assert.deepEqual(buildReplyPlan(abnormal.join("\n"+MESSAGE_SEPARATOR+"\n"),config),[...abnormal.slice(0,MAX_REPLY_PARTS-1),abnormal.slice(MAX_REPLY_PARTS-1).join("\n\n")]);
+});
+test("code, tables and conditions follow explicit boundaries without internal slicing", () => {
   const before = "先阅读说明，再完成这一步。".repeat(30);
-  const code =
-    '```typescript\nconst x = "' +
-    MESSAGE_SEPARATOR +
-    '";\n// ' +
-    "代码。".repeat(90) +
-    "\n```";
-  const table =
-    "| 列 | 值 |\n| --- | --- |\n| A | " + "表格。".repeat(60) + " |";
-  const text = before + "\n\n" + code + "\n\n" + table + "\n\n" + before;
-  const parts = buildReplyPlan(text, config);
-  assert.ok(parts.length > 2);
-  assert.ok(parts.some((p) => p.includes(code)));
-  assert.ok(parts.some((p) => p.includes(table)));
-  assert.equal(letters(parts.join("")), letters(text));
-  const steps =
-    "## 重要条件\n如果你没有账户，\n先创建账户再继续。\n\n" + before;
-  const grouped = buildReplyPlan(steps, config);
-  assert.ok(grouped[0].includes("先创建账户再继续。"));
+  const code = '```typescript\nconst x = "'+MESSAGE_SEPARATOR+'";\n// '+"代码。".repeat(90)+"\n```";
+  const table = "| 列 | 值 |\n| --- | --- |\n| A | "+"表格。".repeat(60)+" |";
+  const messages=[before,code,table,"如果你没有账户，\n先创建账户再继续。"];
+  assert.deepEqual(buildReplyPlan(messages.join("\n"+MESSAGE_SEPARATOR+"\n"),config),messages);
+});
+test("only wire-size overflow is sliced, losslessly across Unicode and JSON escaping",()=>{
+ const text='😀中文"\\\n'.repeat(2400)+'结束';
+ for(const mode of ["auto","single"] as const){
+  const parts=buildReplyPlan(text,{...config,mode});
+  assert.ok(parts.length>1);
+  assert.equal(parts.join(""),text);
+  assert.ok(parts.every(p=>Buffer.byteLength(JSON.stringify(JSON.stringify(p)),"utf8")<=MAX_REPLY_PART_ENCODED_BYTES));
+  assert.ok(parts.every(p=>!/[\uD800-\uDBFF]$/.test(p)));
+ }
+ assert.throws(()=>buildReplyPlan("字".repeat(MAX_REPLY_PART_ENCODED_BYTES*MAX_REPLY_PARTS),config),/safe delivery budget/);
 });
 test("empty boundaries recover without losing content; code delimiter is literal", () => {
   assert.deepEqual(

@@ -69,12 +69,11 @@ export async function deliverReplyPlan(
 ): Promise<string[]> {
   const confirmed: string[] = [];
   for (let i = 0; i < parts.length; i++) {
-    if (callbacks.signal?.aborted || !(await callbacks.canSend())) break;
+    if (callbacks.signal?.aborted) break;
     if (i && config.pacing !== "none")
       await (callbacks.wait || ((ms) => waitForReply(ms, callbacks.signal)))(
         replyPartDelayMs(parts[i].text)
       );
-    if (callbacks.signal?.aborted || !(await callbacks.canSend())) break;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (callbacks.signal?.aborted || !(await callbacks.canSend()))
         return confirmed;
