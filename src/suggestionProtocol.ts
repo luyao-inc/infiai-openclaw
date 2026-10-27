@@ -1,4 +1,5 @@
 import { jsonrepair } from "jsonrepair";
+import { MESSAGE_SEPARATOR } from './reply-plan';
 import type { NextSuggestion } from './nextSuggestions';
 
 export type SuggestionStatus = 'generated' | 'intentionally_empty' | 'missing_tail' | 'invalid_json' | 'invalid_schema' | 'nonce_mismatch' | 'oversized' | 'truncated' | 'filtered_all' | 'unexpected_empty';
@@ -6,6 +7,7 @@ export type SuggestionResult = { text: string; items: NextSuggestion[]; status: 
 export type SuggestionFormat = 'tagged' | 'json_object';
 const tag = 'infiai_next_suggestions_v1';
 const record = (x: any): x is Record<string, any> => !!x && typeof x === 'object' && !Array.isArray(x);
+const messageArray = (x: unknown): x is (string | number)[] => Array.isArray(x) && x.length > 0 && x.length <= 256 && x.every(part => (typeof part === 'string' && part.trim().length > 0) || (typeof part === 'number' && Number.isFinite(part)));
 const norm = (s: string) => s.toLowerCase().replace(/[?？!！。\s]+$/u, '').trim();
 const terms = (s: string) => new Set((s.toLowerCase().match(/[a-z]{3,}|[\u3400-\u9fff]{2,}/g) || []).flatMap(x => /[a-z]/.test(x) ? [x] : Array.from({length:x.length-1},(_,i)=>x.slice(i,i+2))).filter(x=>!['the','and','for','this','that','怎么','什么','如何','可以','一下','这个','今天','明天'].includes(x)));
 
@@ -74,19 +76,22 @@ export function analyzeSuggestionReply(text: string, nonce: string, user = '', f
   if (format === 'json_object') {
     // Do not parse arbitrary JSON in normal tagged-mode answers. In constrained mode
     // only the answer field may reach IM, transcript, TTS or long-term memory.
-    const raw = text.trim().replace(/^```(?:json)?\s*\n?/i,'').replace(/\n?```\s*$/,'');
+    const trimmed = text.trim();
+    // Only peel a JSON envelope, never a plain code answer such as ```python.
+    const jsonFence = /^```(?:json)?[ \t]*(?:\r?\n)?(?=\s*[{\[])/i.exec(trimmed);
+    const raw = jsonFence ? trimmed.slice(jsonFence[0].length).replace(/\r?\n?```[ \t]*$/,'') : trimmed;
     try { data = JSON.parse(raw); }
     catch {
       // Some providers ignore response_format. A plain answer is still useful;
       // only discard the optional suggestions, never expose a protocol envelope.
-      const looksStructured = /^[{\["`<]/.test(raw) || /["']?(?:answer|nextSuggestions|nonce)["']?\s*:|infiai_next_sug/i.test(raw);
+      const looksStructured = /^[{\["<]/.test(raw) || /["']?(?:answer|nextSuggestions|nonce)["']?\s*:|infiai_next_sug/i.test(raw);
       if (raw && !looksStructured) return result(raw, 'missing_tail');
       const truncated = raw.startsWith('{') && hasUnclosedJSON(raw);
       let repaired: any;
       if (raw.startsWith('{') && Buffer.byteLength(raw, 'utf8') <= 128 * 1024) {
         try { repaired = JSON.parse(jsonrepair(raw)); } catch { /* no model retry */ }
       }
-      if (!truncated && record(repaired) && typeof repaired.answer === 'string') {
+      if (!truncated && record(repaired) && (typeof repaired.answer === 'string' || messageArray(repaired.answer) || messageArray(repaired.messages))) {
         // Syntax-only recovery is followed by the same nonce/schema/grounding checks.
         data = repaired;
         formatRepaired = true;
@@ -96,6 +101,27 @@ export function analyzeSuggestionReply(text: string, nonce: string, user = '', f
         if (!recovered && match) { try { recovered = JSON.parse(match[1]); } catch {} }
         return result(recovered, truncated ? 'truncated' : 'invalid_json');
       }
+    }
+    // Providers may return valid JSON scalars instead of an object for very short
+    // answers. Keep the answer; these scalars cannot contain suggestion metadata.
+    if (typeof data === 'number' && Number.isFinite(data)) return result(String(data), 'missing_tail');
+    if (typeof data === 'string' && !/["']?(?:answer|nextSuggestions|nonce)["']?\s*:|infiai_next_sug/i.test(data)) return result(data, 'missing_tail');
+    // Normalize a numeric answer only inside an otherwise authenticated envelope.
+    if (record(data) && typeof data.answer === 'number' && Number.isFinite(data.answer) && record(data.nextSuggestions) && data.nextSuggestions.nonce === nonce) data.answer = String(data.answer);
+    if (record(data) && 'messages' in data) {
+      if (!messageArray(data.messages)) return result('', 'invalid_schema');
+      // Optional suggestion metadata must not discard a complete useful reply.
+      if (!('nextSuggestions' in data)) return result(data.messages.join(`\n${MESSAGE_SEPARATOR}\n`), 'missing_tail');
+      if (!record(data.nextSuggestions)) return result('', 'invalid_schema');
+      if (data.nextSuggestions.nonce !== nonce) return result('', 'nonce_mismatch');
+      data.answer = data.messages;
+    }
+    // The model may express natural message boundaries as an array. Normalize
+    // only an authenticated complete envelope; downstream contracts stay text.
+    if (record(data) && messageArray(data.answer)) {
+      if (!record(data.nextSuggestions)) return result('', 'invalid_schema');
+      if (data.nextSuggestions.nonce !== nonce) return result('', 'nonce_mismatch');
+      data.answer = data.answer.join(`\n${MESSAGE_SEPARATOR}\n`);
     }
     if (!record(data) || typeof data.answer !== 'string') return result('', 'invalid_schema', {reason:'answer_missing_or_invalid'});
     body = data.answer;

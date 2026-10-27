@@ -48,7 +48,7 @@
         "infiai_send_file"
       ],
       "webSearchProviders": [
-        "aliyun-bailian"
+        "infiai-sonar"
       ]
     },
     "channels": [

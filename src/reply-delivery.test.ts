@@ -86,7 +86,7 @@ test("expired eligibility stops before start and no pacing still serializes", as
     parts,
     { ...config, pacing: "none" },
     {
-      canSend: async () => ++n < 4,
+      canSend: async () => ++n < 2,
       start: async () => true,
       send: async (p) => {
         sent.push(p.text);
@@ -184,4 +184,14 @@ test("an old replayed stop does not cancel a newer local turn", () => {
   assert.ok(!newer.signal.aborted);
   old.leave();
   newer.leave();
+});
+
+// Each attempt needs one fresh server decision, including attempts after pacing.
+test("one eligibility request per send attempt, with fresh checks after pacing", async () => {
+ let checks = 0; const sent: string[] = [];
+ await deliverReplyPlan(parts, config, {
+  canSend: async () => ++checks < 2, start: async () => true,
+  send: async p => { sent.push(p.text); }, confirm: async () => {}, wait: async () => {},
+ });
+ assert.deepEqual(sent, ["甲"]); assert.equal(checks, 2);
 });

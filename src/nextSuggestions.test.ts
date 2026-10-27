@@ -22,6 +22,35 @@ const make = (key = "session", enabled = true) =>
     conversationID: "si_A_B",
     userText: "你好",
   });
+
+test("auto delivery uses message arrays while other modes keep their existing prompt",()=>{
+ const turn=new SuggestionTurn({...make().options,format:"json_object",messageBoundaries:true});
+ const schema=JSON.parse(/结构：(\{[^\n]*\})。先完成/.exec(turn.prompt())![1]);
+ assert.deepEqual(Object.keys(schema).sort(),["messages","nextSuggestions"]);
+ assert.equal(schema.nextSuggestions.nonce,turn.nonce);
+ assert.ok(Array.isArray(schema.messages));
+ assert.ok(!turn.prompt().includes("名称甲、名称乙、名称丙"));
+ assert.ok(!turn.prompt().includes("多份独立成品"));
+ assert.ok(turn.prompt().includes("本轮全部待发送消息"));
+ const single=new SuggestionTurn({...make().options,format:"json_object",messageBoundaries:false});
+ assert.ok(!single.prompt().includes("<<<LINGXIE_MESSAGE>>>"));
+});
+
+test("current-turn boundary reminder is scoped and also works without suggestion buttons", async()=>{
+ const hooks:Record<string,any>={};
+ registerSuggestionHooks({on:(name:string,fn:any)=>{hooks[name]=fn;}});
+ for(const enabled of [true,false]) {
+  const turn=new SuggestionTurn({...make().options,enabled,format:enabled?'json_object':'tagged',messageBoundaries:true});
+  await withSuggestionTurn(turn,async()=>{
+   const context=hooks.before_prompt_build({}, {agentId:'runtime',sessionKey:'session'});
+   assert.match(context.appendContext,/同一问题的不同方面/);
+   if(enabled)assert.match(context.appendContext,/messages数组/);
+   else {assert.equal(context.appendSystemContext,undefined);assert.match(context.appendContext,/<<<LINGXIE_MESSAGE>>>/);}
+   assert.equal(hooks.before_prompt_build({}, {agentId:'other',sessionKey:'session'}),undefined);
+   assert.equal(hooks.before_prompt_build({}, {agentId:'runtime',sessionKey:'other'}),undefined);
+  });
+ }
+});
 const tail = (turn: SuggestionTurn) =>
   `<infiai_next_suggestions_v1 nonce="${turn.nonce}">{"items":[{"kind":"question","text":"具体怎么做？"}]}</infiai_next_suggestions_v1>`;
 test("optional structured tail is hidden; malformed, missing and oversized tails degrade without losing answer", () => {

@@ -2,8 +2,55 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {analyzeSuggestionReply, configureSuggestionResponse} from './suggestionProtocol';
 import {SuggestionTurn} from './nextSuggestions';
+import {buildReplyPlan, MESSAGE_SEPARATOR} from './reply-plan';
 const pack=(items:any[], reason='follow_up', answer='发票抬头错误需要重开发票。',nonce='n')=>JSON.stringify({answer,nextSuggestions:{nonce,reason,items}});
 const item={kind:'question',text:'重开发票需要哪些资料？',anchor:'重开发票'};
+test('message arrays normalize to existing boundaries without altering code or short messages',()=>{
+ const code='```python\nprint("hello")\n```';
+ const payload={answer:['嗯，我听着。',code,'第二份完整内容。'],nextSuggestions:{nonce:'n',reason:'complete',items:[]}};
+ const r=analyzeSuggestionReply(JSON.stringify(payload),'n','问题','json_object');
+ assert.deepEqual(buildReplyPlan(r.text,{version:1,mode:'auto',pacing:'none'}),payload.answer);
+ assert.deepEqual(buildReplyPlan(r.text,{version:1,mode:'single',pacing:'none'}),[payload.answer.join('\n\n')]);
+ assert.equal(analyzeSuggestionReply(JSON.stringify({...payload,answer:[4826]}),'n','计算','json_object').text,'4826');
+ const wire={messages:payload.answer,nextSuggestions:payload.nextSuggestions};
+ const current=analyzeSuggestionReply(JSON.stringify(wire),'n','问题','json_object');
+ assert.deepEqual(buildReplyPlan(current.text,{version:1,mode:'auto',pacing:'none'}),payload.answer);
+ assert.ok(!current.text.includes('nextSuggestions'));
+});
+test('array responses retain nonce and shape isolation and reject incomplete arrays',()=>{
+ const makeArray=(answer:unknown,nonce='n')=>JSON.stringify({answer,nextSuggestions:{nonce,reason:'complete',items:[]}});
+ assert.equal(analyzeSuggestionReply(makeArray(['不应泄露'],'wrong'),'n','','json_object').text,'');
+ for(const answer of [[],[''],[false],[{text:'正文'}],Array(257).fill('正文')])assert.equal(analyzeSuggestionReply(makeArray(answer),'n','','json_object').text,'');
+ assert.equal(analyzeSuggestionReply('{"answer":["只有一半','n','','json_object').text,'');
+});
+test('plain JSON scalar answers survive without relaxing object schema or leaking nested protocol',()=>{
+ for(const [raw,text] of [['4826','4826'],['"See you tomorrow."','See you tomorrow.']]) {
+  const r=analyzeSuggestionReply(raw,'n','问题','json_object');
+  assert.equal(r.text,text);assert.equal(r.status,'missing_tail');assert.deepEqual(r.items,[]);
+ }
+ assert.equal(analyzeSuggestionReply('{"answer":4826}','n','问题','json_object').status,'invalid_schema');
+ const numeric={answer:4826,nextSuggestions:{nonce:'n',reason:'complete',items:[]}};
+ assert.equal(analyzeSuggestionReply(JSON.stringify(numeric),'n','问题','json_object').text,'4826');
+ numeric.nextSuggestions.nonce='wrong';
+ assert.equal(analyzeSuggestionReply(JSON.stringify(numeric),'n','问题','json_object').text,'');
+ assert.equal(analyzeSuggestionReply(JSON.stringify(pack([])),'n','问题','json_object').text,'');
+});
+test('plain fenced code survives JSON fallback and delivery without losing its opening fence',()=>{
+ const body='def parse_positive_int(value):\n    if not isinstance(value, str) or not value.isascii() or not value.isdigit():\n        raise ValueError("invalid input")\n    result = int(value)\n    if result <= 0:\n        raise ValueError("not positive")\n    return result\n\nassert parse_positive_int("12") == 12';
+ for(const language of ['python','']) {
+  const code='```'+language+'\n'+body+'\n```';
+  const r=analyzeSuggestionReply(code,'n','给完整代码','json_object');
+  assert.equal(r.text,code);assert.equal(r.status,'missing_tail');
+  assert.deepEqual(buildReplyPlan(r.text,{version:1,mode:'auto',pacing:'none'}),[code]);
+ }
+});
+test('JSON fences retain envelope parsing and nonce validation',()=>{
+ for(const [opening,ending] of [['```json\n','\n```'],['```\r\n','\r\n```'],['```json','```']]) {
+  const good=analyzeSuggestionReply(opening+pack([],'complete','完整正文')+ending,'n','问题','json_object');
+  assert.equal(good.text,'完整正文');
+  assert.equal(analyzeSuggestionReply(opening+pack([],'complete','完整正文','wrong')+ending,'n','问题','json_object').status,'nonce_mismatch');
+ }
+});
 test('JSON final produces grounded suggestions and rejects unrelated memory topic',()=>{
  const r=analyzeSuggestionReply(pack([item,{kind:'question',text:'文艺片有哪些推荐',anchor:'发票抬头'}]),'n','重开','json_object');
  assert.equal(r.status,'generated');assert.equal(r.items.length,1);assert.deepEqual(r.rejected,{off_topic:1});
@@ -119,3 +166,11 @@ test('fallback and plain answer survive repeated transcript and delivery parsing
   assert.equal(t.diagnostics().status,status);
  }
 });
+
+ test('complete messages survive omitted optional suggestions while wrong nonce stays rejected',()=>{
+ const r=analyzeSuggestionReply(JSON.stringify({messages:['第一份完整草稿','第二份完整草稿','第三份完整草稿']}),'n','草稿','json_object');
+ assert.equal(r.status,'missing_tail');
+ assert.deepEqual(r.text.split(`\n${MESSAGE_SEPARATOR}\n`),['第一份完整草稿','第二份完整草稿','第三份完整草稿']);
+ assert.deepEqual(r.items,[]);
+ assert.equal(analyzeSuggestionReply(JSON.stringify({messages:['完整内容'],nextSuggestions:{nonce:'wrong',items:[]}}),'n','草稿','json_object').text,'');
+ });

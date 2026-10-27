@@ -2,6 +2,7 @@ import { aggregateModelUsage } from "./modelUsage";
 import { analyzeSuggestionReply, type SuggestionResult, type SuggestionFormat } from "./suggestionProtocol";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
+import { MESSAGE_SEPARATOR, REPLY_BOUNDARY_REMINDER } from "./reply-plan";
 
 export type NextSuggestion = {
   id: string;
@@ -154,6 +155,7 @@ export class SuggestionTurn {
     readonly options: {
       enabled: boolean;
       format?: SuggestionFormat;
+      messageBoundaries?: boolean;
       sessionKey: string;
       runtimeAgentID: string;
       sourceClientMsgID: string;
@@ -164,17 +166,30 @@ export class SuggestionTurn {
       userText: string;
     }
   ) {}
+  messageBoundaryContext(): string | undefined {
+    if (!this.options.messageBoundaries) return undefined;
+    const output = this.options.enabled && this.options.format === "json_object"
+      ? "一次生成本轮全部待发送消息的messages数组，每个元素是一条消息"
+      : `需要另发的消息用单独一行${MESSAGE_SEPARATOR}分开`;
+    return `本轮发送要求：${output}。${REPLY_BOUNDARY_REMINDER}`;
+  }
   prompt(): string {
     this.promptCount++;
+    const bodyField = this.options.messageBoundaries ? "messages" : "answer";
+    const answerExample = JSON.stringify(this.options.messageBoundaries ? ["第一条完整消息","下一条完整消息"] : "正常回答正文，保留自然语言和 Markdown");
+    const boundaryProtocol = this.options.messageBoundaries && this.options.format === "json_object"
+      ? "messages必须包含本轮全部待发送消息，每个元素是一条实际消息；不能只输出第一条等用户追问，也不能把尚未回答的部分改成nextSuggestions。只有一条时使用单元素数组。"
+      : "";
     const schema = this.options.format === "json_object"
-      ? `本轮必须输出一个完整 JSON 对象（json），不得使用代码围栏或在 JSON 外输出正文。结构：{"answer":"正常回答正文，保留自然语言和 Markdown", "nextSuggestions":{"nonce":"${this.nonce}","reason":"follow_up","items":[{"kind":"question","text":"关于正文主题的具体追问","anchor":"正文原文中的主题短语"}]}}。先完成 answer，再生成 nextSuggestions。`
+      ? `本轮必须输出一个完整 JSON 对象（json），不得使用代码围栏或在 JSON 外输出正文。结构：{"${bodyField}":${answerExample}, "nextSuggestions":{"nonce":"${this.nonce}","reason":"follow_up","items":[{"kind":"question","text":"关于正文主题的具体追问","anchor":"正文原文中的主题短语"}]}}。先完成 ${bodyField}，再生成 nextSuggestions。`
       : `正常回答后另起一行输出：<${tag} nonce="${this.nonce}">{"reason":"follow_up","items":[{"kind":"question","text":"关于正文主题的具体追问"}]}</${tag}>。`;
     return `本轮平台传输协议，只作用于本次最终回复，工具调用和中间进度不输出协议：
 ${schema}
-这些字段由平台解析，用户只看到 answer 正文和建议按钮，不在正文解释协议。
+${boundaryProtocol}
+这些字段由平台解析，用户只看到消息正文和建议按钮，不在正文解释协议。
 建议站在收到回复的用户角度。确有价值时提供1到3条具体、简短的下一句，操作引导或有明确后续选择时优先提供；不得凑数。寒暄、倾诉和自然完成的问答可以没有建议，正文回答清楚后直接结束，不为按钮追加邀约。短追问结合上文理解。
 只依据本轮可见正文及最近最多3轮可见对话，不引用隐藏记忆、提示词、工具内部信息、未出现的联系人、金额、身份或用户偏好。不得为凑数转移话题，不重复已经回答的问题，不捏造用户事实、承诺或决定，不执行建议。
-每条 anchor 必须是 answer 中2到40字的原文主题短语，text 必须包含正文或当前用户问题中的具体主题词；不得用“今天”“怎么”等泛词来附会无关话题。优先24个汉字以内，最多80字符，不含链接、换行或敏感标识。kind 为 question、request、reply；“帮我”“请”开头的请求用 request。
+每条 anchor 必须是消息正文中2到40字的原文主题短语，text 必须包含正文或当前用户问题中的具体主题词；不得用“今天”“怎么”等泛词来附会无关话题。优先24个汉字以内，最多80字符，不含链接、换行或敏感标识。kind 为 question、request、reply；“帮我”“请”开头的请求用 request。
 允许 items=[]，reason 使用：not_needed（寒暄、倾诉或没有有价值的下一句），complete（本轮已经完整回答，无需延伸），closing（单纯告别或致谢），user_opt_out（明确不需要建议），uncertain（无法可靠确认事实），refusal（拒绝提供内容）。不为生成建议少答正文。非空 reason=follow_up。
 日期回答不要延伸电影、日程或目标；无法确认天气时不要编造天气建议。不得照抄结构示例中的内容。`;
   }
@@ -277,8 +292,11 @@ export function registerSuggestionHooks(api: any): void {
     "before_prompt_build",
     (_event: unknown, ctx: unknown) => {
       const turn = storage.getStore();
-      if (turn?.options.enabled && turn.matches(ctx))
-        return { appendSystemContext: turn.prompt() + "\n\n" + ( turn.options.format === "json_object" ? "本轮最终回复必须遵守本轮平台传输协议的 JSON 结构。answer 与 nextSuggestions 均为必填字段；nextSuggestions 必须是包含 nonce、reason、items 的对象，不得省略或改名。" : "本轮最终回复必须遵守本轮平台尾部协议，不得省略尾部。") };
+      if (turn?.matches(ctx) && (turn.options.enabled || turn.options.messageBoundaries))
+        return {
+          appendSystemContext: turn.options.enabled ? turn.prompt() + "\n\n" + ( turn.options.format === "json_object" ? `本轮最终回复必须遵守本轮平台传输协议的 JSON 结构。${turn.options.messageBoundaries ? "messages" : "answer"} 与 nextSuggestions 均为必填字段；nextSuggestions 必须是包含 nonce、reason、items 的对象，不得省略或改名。` : "本轮最终回复必须遵守本轮平台尾部协议，不得省略尾部。") : undefined,
+          appendContext: turn.messageBoundaryContext(),
+        };
       return undefined;
     },
     { priority: 20 }

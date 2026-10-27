@@ -20,10 +20,10 @@ for (const row of cases) {
     );
   });
 }
-test("normalize complete emphasis before automatic and explicit splits", () => {
+test("normalize complete emphasis without inventing message boundaries", () => {
   const body = "这是详细说明。".repeat(80);
   const parts = buildReplyPlan(`**${body}**`, effectiveReplyDelivery());
-  assert.ok(parts.length > 1);
+  assert.deepEqual(parts, [body]);
   assert.equal(parts.join("").replace(/\s/g, ""), body);
   assert.ok(parts.every((part) => !part.includes("**")));
   assert.deepEqual(

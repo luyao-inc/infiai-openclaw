@@ -98,7 +98,7 @@ const INTERACTIVE_REPLY_CONTRACT = [
   INTERACTIVE_REPLY_CONTRACT_MARKER,
   "This turn requires a visible, natural reply to the current real-user request.",
   "Do not answer with NO_REPLY or NO_ANSWER. Do not stay silent after handling the request.",
-  "Reply in the user's language and keep the agent's established role and tone.",
+  "Reply in the user's language and keep the current workspace role and tone. Follow the current turn's style and search rules; do not copy past answers' length, extra explanations or source lists.",
 ].join("\n");
 
 let latestGatewayConfigCache: {
@@ -2618,6 +2618,7 @@ async function fetchInfiaiLongTermMemoryContext(
     query: string;
     timeoutMs?: number;
     memoryMode?: string;
+    versionOnly?: boolean;
   }
 ): Promise<{ contextText: string; provider?: string; skippedReason?: string; memoryVersion?: string; memoryGeneration?: number }> {
   const data = await signedChatApiCall(
@@ -2632,6 +2633,7 @@ async function fetchInfiaiLongTermMemoryContext(
       conversationID: params.conversationID,
       query: params.query,
       memoryMode: params.memoryMode,
+      versionOnly: params.versionOnly,
       messages: params.query.trim()
         ? [
             {
@@ -3242,7 +3244,16 @@ export async function readTurnLanguageModelUsage(
     const ts = Date.parse(String(parsed.timestamp || ""));
     if (lowerBound > 0 && Number.isFinite(ts) && ts < lowerBound) continue;
     const message = parsed?.message;
-    const details = message?.details;
+    let details = message?.details;
+    // OpenClaw truncates persisted details above 8 KiB. Search citations often
+    // cross that threshold; the provider-owned JSON body retains usage metadata.
+    if (message?.role === "toolResult" && message.toolName === "web_search" && !details?.auxiliaryUsage) {
+      const text = (Array.isArray(message.content) ? message.content : [])
+        .filter((part: any) => part?.type === "text").map((part: any) => part.text || "").join("\n");
+      if (Buffer.byteLength(text, "utf8") <= 64 * 1024) {
+        try { details = JSON.parse(text); } catch { /* Not a provider JSON result. */ }
+      }
+    }
     if (message?.role === "toolResult" && message.toolName === "web_search" && !details?.cached && details?.auxiliaryUsage?.requestId) {
       auxiliary.set(String(details.auxiliaryUsage.requestId), details.auxiliaryUsage);
     }
@@ -6207,7 +6218,7 @@ async function processBufferedAgentTurn(
     let suppressedProgressOnlyReply = false;
     let usedNoReplyFallback = false;
     const llmDispatchStartedAt = Date.now();
-    const knowledgeReview = knowledgeReplyReview(api, { agentId: executionAgentId, sessionKey: effectiveSessionKey, startedAt: llmDispatchStartedAt, question: rawBody, trustedMemoryContext: longTermMemoryContextText, memorySubject: sourceUserID === selfUid ? "owner" : "end_user", validateMemory: async () => { try { const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid, agentID:businessAgentID, sourceUserID, sourceUserName, conversationType:bufferedConversationType, conversationID:effectiveSessionKey, memoryMode:turnSurface.kind === "incognito_chat" ? "temporary" : undefined, query:""}); return (current.memoryVersion || "off") === memoryVersionForTurn; } catch { return false; } }, signal: turnRuntime.abortSignal });
+    const knowledgeReview = knowledgeReplyReview(api, { agentId: executionAgentId, sessionKey: effectiveSessionKey, startedAt: llmDispatchStartedAt, question: rawBody, trustedMemoryContext: longTermMemoryContextText, memorySubject: sourceUserID === selfUid ? "owner" : "end_user", validateMemory: async () => { try { const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid, agentID:businessAgentID, sourceUserID, sourceUserName, conversationType:bufferedConversationType, conversationID:effectiveSessionKey, memoryMode:turnSurface.kind === "incognito_chat" ? "temporary" : undefined, query:"",versionOnly:true}); return (current.memoryVersion || "off") === memoryVersionForTurn; } catch { return false; } }, signal: turnRuntime.abortSignal });
     const cleanVisibleReplyText = (text: string): string => {
       if (!text) return "";
       const localized = localizeOpenClawReply(text);
@@ -6286,7 +6297,7 @@ async function processBufferedAgentTurn(
                   if (cleaned) {
                     // Personal facts are reviewed as a complete draft before speech.
                     if (/(?:你|您).{0,16}(?:身份|职业|工作|从事|经历|做过|项目|参加|参与|偏好|喜欢|获奖|简介|履历|bio)|介绍.{0,8}(?:你|自己)|你是谁|你叫什么/iu.test(rawBody)) return;
-                    const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid,agentID:businessAgentID,sourceUserID,sourceUserName,conversationType:bufferedConversationType,conversationID:effectiveSessionKey,memoryMode:turnSurface.kind === "incognito_chat" ? "temporary" : undefined,query:""});
+                    const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid,agentID:businessAgentID,sourceUserID,sourceUserName,conversationType:bufferedConversationType,conversationID:effectiveSessionKey,memoryMode:turnSurface.kind === "incognito_chat" ? "temporary" : undefined,query:"",versionOnly:true});
                     if ((current.memoryVersion || "off") !== memoryVersionForTurn) return;
                     await turnRuntime.voiceStream!.append(cleaned);
                   }
@@ -7504,6 +7515,7 @@ async function processInboundMessageInLane(
   const suggestionResponse = configureSuggestionResponse(cfg, executionAgentId, primaryModel || "", suggestionEnabled);
   const suggestionTurn = new SuggestionTurn({
     enabled: suggestionEnabled, format: suggestionResponse.format,
+    messageBoundaries: Boolean(replyTurn?.textDelivery && replyTurn.enabled && replyTurn.config.mode === "auto"),
     sessionKey: effectiveSessionKey, runtimeAgentID: executionAgentId,
     sourceClientMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
     recipientUserID: senderId, ownerUserID: selfUid, agentID: businessAgentID,
@@ -7511,7 +7523,7 @@ async function processInboundMessageInLane(
   });
   const dispatchObsStart = transcriptObsEnabled() ? Date.now() : 0;
   const llmDispatchStartedAt = Date.now();
-  const knowledgeReview = knowledgeReplyReview(api, { agentId: executionAgentId, sessionKey: effectiveSessionKey, startedAt: llmDispatchStartedAt, question: rawBody, trustedMemoryContext: longTermMemoryContextText, memorySubject: ownerAuthorized ? "owner" : "end_user", validateMemory: async () => { try { const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid, agentID:businessAgentID, sourceUserID:senderId, sourceUserName:fromLabel, conversationType:chatType, conversationID:effectiveSessionKey, query:""}); return (current.memoryVersion || "off") === memoryVersionForTurn; } catch { return false; } }, signal: deliverySignal });
+  const knowledgeReview = knowledgeReplyReview(api, { agentId: executionAgentId, sessionKey: effectiveSessionKey, startedAt: llmDispatchStartedAt, question: rawBody, trustedMemoryContext: longTermMemoryContextText, memorySubject: ownerAuthorized ? "owner" : "end_user", validateMemory: async () => { try { const current = await fetchInfiaiLongTermMemoryContext(client, {ownerUserID:selfUid, agentID:businessAgentID, sourceUserID:senderId, sourceUserName:fromLabel, conversationType:chatType, conversationID:effectiveSessionKey, query:"",versionOnly:true}); return (current.memoryVersion || "off") === memoryVersionForTurn; } catch { return false; } }, signal: deliverySignal });
   let dispatchedFailureReply = false;
   let deliveredVisibleReply = false;
   let sentNoVisibleFallbackReply = false;

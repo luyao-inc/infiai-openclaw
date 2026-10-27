@@ -1683,3 +1683,23 @@ test("commits a free round only after a successful visible assistant reply", () 
   assert.equal((got?.rawUsage.auxiliaryUsages as any[]).length,1);assert.equal((got as any).costUSD,undefined);
  } finally {await fs.rm(dir,{recursive:true,force:true});}
  });
+
+test("Sonar auxiliary usage survives truncated transcript details without billing search tokens", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sonar-usage-"));
+  try {
+    const file = path.join(dir, "turn.jsonl"), store = path.join(dir, "sessions.json");
+    const auxiliaryUsage = { requestId: "sonar-request", provider: "openrouter", model: "perplexity/sonar", input: 500, output: 80, searchCalls: 1, costUSD: 0.005 };
+    const result = { role: "toolResult", toolName: "web_search", details: { persistedDetailsTruncated: true }, content: [{ type: "text", text: JSON.stringify({ answer: "x".repeat(9000), cached: false, auxiliaryUsage }) }] };
+    const ignored = { ...result, toolName: "other_tool" };
+    const malformed = { ...result, content: [{ type: "text", text: "invalid JSON" }] };
+    const cached = { ...result, content: [{ type: "text", text: JSON.stringify({ cached: true, auxiliaryUsage: { ...auxiliaryUsage, requestId: "cached" } }) }] };
+    const oversized = { ...result, content: [{ type: "text", text: JSON.stringify({ answer: "x".repeat(65536), auxiliaryUsage: { ...auxiliaryUsage, requestId: "oversized" } }) }] };
+    const main = { role: "assistant", provider: "aliyun-bailian", model: "deepseek-v4.1-flash", responseId: "main", usage: { input: 100, output: 20 } };
+    await fs.writeFile(file, [result, result, ignored, malformed, cached, oversized, main].map(message => JSON.stringify({ type: "message", message })).join("\n"));
+    await fs.writeFile(store, JSON.stringify({ "agent:test": { sessionFile: file } }));
+    const got = await readTurnLanguageModelUsage(store, "agent:test", "test", 0);
+    assert.equal(got?.inputTokens, 100);
+    assert.equal(got?.outputTokens, 20);
+    assert.deepEqual(got?.rawUsage.auxiliaryUsages, [auxiliaryUsage]);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
