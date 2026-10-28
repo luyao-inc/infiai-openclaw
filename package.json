@@ -32,6 +32,7 @@
     ],
     "contracts": {
       "tools": [
+        "infiai_set_reply_mode",
         "infiai_send_text",
         "infiai_list_my_friends",
         "infiai_list_my_groups",
@@ -165,6 +166,7 @@
       ]
     },
     "toolMetadata": {
+      "infiai_set_reply_mode": { "description": "Set reply medium only for the current private avatar conversation." },
       "infiai_send_text": {
         "description": "Send a text message through the configured Infiai account."
       },

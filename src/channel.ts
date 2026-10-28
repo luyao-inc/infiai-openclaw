@@ -1,7 +1,8 @@
+import { publicReplyText } from "./publicReply";
 import { getConnectedClient } from "./clients";
 import { listAccountIds, resolveAccountConfig } from "./config";
 import { infiaiGatewayStartAccount, infiaiGatewayStopAccount } from "./gatewayLifecycle";
-import { sendTextToTarget } from "./media";
+import { sendImageToTarget, sendTextToTarget } from "./media";
 import { parseTarget } from "./targets";
 import { formatSdkError } from "./utils";
 
@@ -40,6 +41,17 @@ export const OpenIMChannelPlugin = {
   },
   outbound: {
     deliveryMode: "direct" as const,
+    normalizePayload: ({ payload }: any) => ({ ...payload, text: publicReplyText(payload.text || "", payload.isError === true) }),
+    sendMedia: async ({ to, text, mediaUrl, accountId }: { to: string; text: string; mediaUrl?: string; accountId?: string }) => {
+      const target = parseTarget(to);
+      if (!target) throw new Error("invalid target, expected user:<id> or group:<id>");
+      const client = getConnectedClient(accountId);
+      if (!client) throw new Error("Infiai not connected");
+      if (!mediaUrl?.trim()) throw new Error("image is empty");
+      const message = await sendImageToTarget(client, target, mediaUrl);
+      if (text?.trim()) await sendTextToTarget(client, target, text);
+      return { channel: "infiai", messageId: message.clientMsgID };
+    },
     resolveTarget: ({ to }: { to?: string }) => {
       const target = parseTarget(to);
       if (!target) {

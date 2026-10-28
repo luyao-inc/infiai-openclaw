@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { processInboundMessage } from "./inbound";
+import { processInboundMessage, processOpenPlatformMessage, processIncognitoMessage } from "./inbound";
 import { registerSuggestionHooks } from "./nextSuggestions";
+import { registerReplyFailureHooks, FRIENDLY_CONTENT_REJECTION } from "./replyFailure";
 
-const notice = "抱歉，当前服务暂时无法完成回复，请稍后再试。";
+const notice = "这次没能好好接上你的话。你可以再说一次，我继续听。";
 
 // Run the real inbound/filter/fallback/outbound path; substitute only external IO.
 test("model failures reach the sender once using the existing friendly notice", async (t) => {
@@ -39,19 +40,40 @@ test("model failures reach the sender once using the existing friendly notice", 
         "我在。",
         "**一、这是重点。\n**解释说明。",
         "**前文**\n```ts\nconst x = '**代码**';\n```\n**后文**",
+        "400 Input text data may contain inappropriate content.",
+        "raw-rejection-recovery-success",
+        "media-only",
       ].entries()) {
         await t.test(`textDelivery=${textDelivery} payload ${index}`, async () => {
+          planned = [];
           const sent: any[] = [];
           const errors: string[] = [];
-          const api = { config: cfg, on: () => {}, logger: { warn: () => {}, info: () => {}, error: (s: string) => errors.push(s) }, runtime: { channel: {
+          const hooks: Record<string, any[]> = {};
+          let dispatchCalls = 0;
+          const api = { config: cfg, on: (name: string, handler: any) => { (hooks[name] ||= []).push(handler); }, logger: { warn: () => {}, info: () => {}, error: (s: string) => errors.push(s) }, runtime: { channel: {
             routing: { resolveAgentRoute: () => ({ agentId, matchedBy: "binding" }) },
-            reply: { dispatchReplyWithBufferedBlockDispatcher: async ({ dispatcherOptions }: any) => {
+            reply: { dispatchReplyWithBufferedBlockDispatcher: async ({ dispatcherOptions, ctx }: any) => {
+              dispatchCalls++;
+              if (index === 8) {
+                await dispatcherOptions.deliver({ mediaUrl: "https://example.invalid/guide.png" }, {kind:"final"});
+                await dispatcherOptions.deliver({ mediaUrl: "https://example.invalid/guide.png" }, {kind:"final"});
+                return;
+              }
+              if (index === 7) {
+                if (dispatchCalls === 1) {
+                  for (const hook of hooks.before_message_write || []) hook({ message: { role: "assistant", stopReason: "error", errorMessage: "400 Input text data may contain inappropriate content.", content: [] } }, { agentId, sessionKey: ctx.SessionKey });
+                  await dispatcherOptions.deliver({ text: "LLM request failed: provider rejected the request schema or tool payload." }, { kind: "final" });
+                } else await dispatcherOptions.deliver({ text: "你更想从哪个角度聊聊？" }, { kind: "final" });
+                return;
+              }
               await dispatcherOptions.deliver({ text: payload }, { kind: "final" });
               if (index < 3) await dispatcherOptions.deliver({ text: payload }, { kind: "final" });
             } },
           } } };
           registerSuggestionHooks(api);
+          registerReplyFailureHooks(api);
           const client = { config: { accountId, userID: "failure-owner", inboundWhitelist: [], requireMention: true, chatApiAddr: "http://failure-test.invalid" }, gatewayConfig: cfg, sdk: {
+            createImageMessageByURL: async () => ({ data: { contentType: 102, clientMsgID: "image-regression" } }),
             createTextMessage: async (text: string) => ({ data: { textElem: { content: text } } }),
             sendMessage: async (value: any) => { sent.push(value); return { data: {} }; },
           } };
@@ -59,8 +81,29 @@ test("model failures reach the sender once using the existing friendly notice", 
           assert.deepEqual(errors, []);
           assert.equal(sent.length, 1);
           assert.equal(sent[0].recvID, "failure-visitor");
-          assert.equal(sent[0].message.textElem.content, index < 3 ? notice : index === 4 ? "一、这是重点。\n解释说明。" : index === 5 ? "前文\n```ts\nconst x = '**代码**';\n```\n后文" : payload);
-          assert.equal(JSON.parse(sent[0].message.ex).infiai.messageKind, index < 3 ? "model_error" : "assistant_reply");
+          if (index === 8) {
+            assert.equal(sent[0].message.contentType,102);
+            assert.equal(JSON.parse(sent[0].message.ex).infiai.messageKind,"assistant_reply");
+            return;
+          }
+          assert.equal(sent[0].message.textElem.content, index < 3 ? notice : index === 4 ? "一、这是重点。\n解释说明。" : index === 5 ? "前文\n```ts\nconst x = '**代码**';\n```\n后文" : index === 6 ? FRIENDLY_CONTENT_REJECTION : index === 7 ? "你更想从哪个角度聊聊？" : payload);
+          assert.equal(JSON.parse(sent[0].message.ex).infiai.messageKind, index < 3 || index > 5 ? "model_error" : "assistant_reply");
+          assert.equal(dispatchCalls, [2, 6, 7].includes(index) ? 2 : 1);
+          if (index < 3 || index > 5) assert.deepEqual(planned, []);
+          if ([2, 6, 7].includes(index)) {
+            for (const processTurn of [processOpenPlatformMessage, processIncognitoMessage]) {
+              dispatchCalls = 0;
+              const result = await processTurn(api, client as any, {
+                ownerUserID: "failure-owner", agentID: "default", sourceUserID: "failure-visitor",
+                conversationID: `recovery-${textDelivery}-${index}`, messageID: `buffered-${textDelivery}-${index}`,
+                messageType: "text", text: "在吗？",
+              });
+              assert.equal(result.replyText, index === 6 ? FRIENDLY_CONTENT_REJECTION : index === 7 ? "你更想从哪个角度聊聊？" : notice);
+              assert.equal(dispatchCalls, 2);
+              assert.equal(result.billing?.chargeUnits, 0);
+              assert.ok(result.warnings?.includes("interactive_no_reply_fallback"));
+            }
+          }
         });
       }
     }
