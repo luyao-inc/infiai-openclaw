@@ -952,7 +952,7 @@ test("localizes the OpenClaw 7.1 incomplete-turn user-facing error", () => {
     localizeOpenClawReply(
       "⚠️ Agent couldn't generate a response. Please try again.",
     ),
-    "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+    "这次没能好好接上你的话。你可以再说一次，我继续听。",
   );
 });
 
@@ -1199,7 +1199,7 @@ test("classifies exact silent replies by interactive surface policy", () => {
   assert.equal(
     resolveInfiaiNoVisibleReplyOutcome({
       assistantText: "NO_REPLY",
-      failureText: "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+      failureText: "这次没能好好接上你的话。你可以再说一次，我继续听。",
       interactive: true,
       userText: "ok",
     }).outcome,
@@ -1235,14 +1235,14 @@ test("keeps real failures distinct from silent-success outcomes", () => {
   assert.deepEqual(
     resolveInfiaiNoVisibleReplyOutcome({
       assistantText: "",
-      failureText: "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+      failureText: "这次没能好好接上你的话。你可以再说一次，我继续听。",
       interactive: true,
       userText: "ok",
     }),
     {
       outcome: "actual_failure",
       rawOutcome: "failure",
-      replyText: "抱歉，当前服务暂时无法完成回复，请稍后再试。",
+      replyText: "这次没能好好接上你的话。你可以再说一次，我继续听。",
       messageKind: "model_error",
       fallbackUsed: false,
     },

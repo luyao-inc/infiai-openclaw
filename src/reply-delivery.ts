@@ -107,22 +107,32 @@ export class InboundReplyTurn {
   private token = "";
   private timer?: ReturnType<typeof setInterval>;
   private tail: Promise<unknown> = Promise.resolve();
+  private deliveryStarted = false;
   constructor(
     private rpc: (path: string, body: Record<string, unknown>) => Promise<any>,
     private identity: Record<string, unknown>
   ) {}
+  private serialize<T>(run: () => Promise<T>): Promise<T> {
+    const p = this.tail.then(run, run);
+    this.tail = p.catch(() => {});
+    return p;
+  }
   private request(action: string, body: Record<string, unknown> = {}) {
-    const run = () =>
-      this.rpc("/claw/internal/reply-delivery/turn", {
+    return this.serialize(() => this.rpc("/claw/internal/reply-delivery/turn", {
         ...this.identity,
         turnID: this.turnID,
         token: this.token,
         action,
         ...body,
-      });
-    const p = this.tail.then(run, run);
-    this.tail = p.catch(() => {});
-    return p;
+      }));
+  }
+  get voiceContext() { return { turnID: this.turnID, token: this.token }; }
+  async setReplyMode(mode: "inherit" | "text" | "voice", scope: "conversation" | "turn") {
+    const r = await this.serialize(() => this.rpc("/claw/internal/reply-preference/update", {
+      ...this.identity, ...this.voiceContext, mode, scope,
+    }));
+    if (r.effectiveMode === "text" || r.effectiveMode === "voice") this.voiceReplyEnabled = r.effectiveMode === "voice";
+    return r;
   }
   async begin() {
     const r = await this.request("begin");
@@ -147,6 +157,10 @@ export class InboundReplyTurn {
       turnID: this.turnID,
       token: this.token,
     });
+    // A new text choice suppresses unsent audio; never start voice midway through a text answer.
+    if (r.effectiveMode === "text" || r.effectiveMode === "voice") {
+      if (!this.deliveryStarted || r.effectiveMode === "text") this.voiceReplyEnabled = r.effectiveMode === "voice";
+    }
     return r.allowed === true && (r.enabled !== false || !this.enabled);
   }
   async plan(
@@ -159,6 +173,7 @@ export class InboundReplyTurn {
   }
   async start(index: number) {
     const r = await this.request("start", { index });
+    if (r.send === true) this.deliveryStarted = true;
     if (r.parts?.[index]) this.attempts.set(index, r.parts[index].attempts);
     return r.send === true;
   }

@@ -1,4 +1,6 @@
+import { createBailianImageProvider } from "./bailianImage";
 import { registerMemoryBoundaryHooks } from "./memoryBoundary";
+import { registerReplyFailureHooks } from "./replyFailure";
 /**
  * OpenClaw Infiai Channel Plugin
  *
@@ -351,10 +353,14 @@ function registerCliMetadata(api: any): void {
 
 function registerFull(api: any): void {
   registerSearchPolicyHooks(api);
+  api.on("before_tool_call", (event: any, ctx: any) => {
+    if (event.toolName === "image_generate" && ctx?.sessionKey?.includes(":infiai:")) return { params: { ...event.params, model: "infiai-bailian-image/qwen-image-3.0-pro" } };
+  }, { priority: 900 });
   (globalThis as any).__openimApi = api;
   (globalThis as any).__openimGatewayConfig = api.config;
 
   registerSuggestionHooks(api);
+  registerReplyFailureHooks(api);
     registerMemoryBoundaryHooks(api);
   registerOpenIMTools(api);
   registerScheduledTaskToolGuard(api);
@@ -397,6 +403,7 @@ export default {
   description: "Infiai protocol channel for OpenClaw",
   register(api: any): void {
     api.registerWebSearchProvider?.(createSonarSearchProvider());
+    api.registerImageGenerationProvider?.(createBailianImageProvider());
     if (api.registrationMode === "cli-metadata") {
       registerCliMetadata(api);
       return;

@@ -1,3 +1,4 @@
+import { publicReplyText } from "./publicReply";
 import { ReplyNotSentError } from "./reply-delivery";
 import type { MessageItem } from "@openim/client-sdk";
 import { File } from "node:buffer";
@@ -114,7 +115,7 @@ export async function sendTextToTarget(
   text: string,
   options?: SendTextOptions,
 ): Promise<void> {
-  const created = await client.sdk.createTextMessage(text).catch((error:unknown)=>{throw new ReplyNotSentError(formatCreationError(error))});
+  const created = await client.sdk.createTextMessage(publicReplyText(text)).catch((error:unknown)=>{throw new ReplyNotSentError(formatCreationError(error))});
   const message = created?.data;
   if (!message) throw new ReplyNotSentError("createTextMessage failed");
   if (options?.clientMsgID) message.clientMsgID = options.clientMsgID;
@@ -223,7 +224,8 @@ export async function sendImageToTarget(
   client: OpenIMClientState,
   target: ParsedTarget,
   image: string,
-): Promise<void> {
+  options?: SendTextOptions,
+): Promise<MessageItem> {
   const input = image.trim();
   if (!input) throw new Error("image is empty");
 
@@ -266,7 +268,8 @@ export async function sendImageToTarget(
   }
 
   if (!message) throw new Error("createImageMessage failed");
-  await sendCreatedMessageToTarget(client, target, message, {
+  if (options?.ex) message.ex = options.ex;
+  return sendCreatedMessageToTarget(client, target, message, {
     notOss: isUrl(input),
   });
 }
