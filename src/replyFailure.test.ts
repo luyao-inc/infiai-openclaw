@@ -120,3 +120,32 @@ test("parent stop bounds even a recovery dispatcher that ignores abort", async (
   }, { ...options, replyOptions: { abortSignal: controller.signal } });
   assert.equal(calls, 2); assert.deepEqual(result, {});
 });
+
+test("session rotation before work retries once with identical scope", async () => {
+  const { api, options, delivered } = setup(); let calls = 0;
+  const result = await dispatchWithReplyRecovery(api, async (o) => {
+    calls++;
+    assert.equal(o.ctx, options.ctx);
+    assert.equal(o.cfg, options.cfg);
+    if (calls === 1) throw new Error('Session "session" changed while starting work. Retry.');
+    await o.dispatcherOptions.deliver({ text: "好友共3人" }, { kind: "final" });
+  }, options);
+  assert.equal(calls, 2); assert.deepEqual(result, {}); assert.equal(delivered.length, 1);
+});
+
+test("session conflict after tool execution is never replayed", async () => {
+  const { api, hooks, options } = setup(); let calls = 0;
+  const result = await dispatchWithReplyRecovery(api, async () => {
+    calls++; hooks.before_tool_call({ toolName: "infiai_send_text" });
+    throw new Error('Session "session" changed while starting work. Retry.');
+  }, options);
+  assert.equal(calls, 1); assert.equal(result.failureReply, FRIENDLY_REPLY_FAILURE);
+});
+
+test("repeated pre-work session conflicts stop after one retry", async () => {
+  const { api, options } = setup(); let calls = 0;
+  const result = await dispatchWithReplyRecovery(api, async () => {
+    calls++; throw new Error('Session "session" changed while starting work. Retry.');
+  }, options);
+  assert.equal(calls, 2); assert.equal(result.failureReply, FRIENDLY_REPLY_FAILURE);
+});

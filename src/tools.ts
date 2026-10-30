@@ -1,3 +1,4 @@
+import { registerSocialReadTools } from "./socialReadTools";
 import { connectedClientCount, getConnectedClient } from "./clients";
 import { createHmac } from "node:crypto";
 import {
@@ -86,6 +87,7 @@ export function registerOpenIMTools(api: any): void {
     return;
   }
   infiaiDebug(api, "[infiai] registering social tools");
+  registerSocialReadTools(api);
 
   type InfiaiToolParams = {
     accountId?: string;
@@ -438,6 +440,7 @@ export function registerOpenIMTools(api: any): void {
     parameters: {
       type: "object",
       properties: {
+        cursor: { type: "string", description: "Copy returned nextCursor for the next page. Counts use social_overview, not list length." },
         query: {
           type: "string",
           description: "Optional nickname/remark/profile keyword",
@@ -465,6 +468,7 @@ export function registerOpenIMTools(api: any): void {
       _id: string,
       params: {
         query?: string;
+        cursor?: string;
         limit?: number;
         taskID?: string;
         runID?: string;
@@ -493,6 +497,7 @@ export function registerOpenIMTools(api: any): void {
     parameters: {
       type: "object",
       properties: {
+        cursor: { type: "string", description: "Copy returned nextCursor for the next page. Counts use social_overview, not list length." },
         query: {
           type: "string",
           description: "Optional group name/introduction/type keyword",
@@ -520,6 +525,7 @@ export function registerOpenIMTools(api: any): void {
       _id: string,
       params: {
         query?: string;
+        cursor?: string;
         limit?: number;
         taskID?: string;
         runID?: string;
@@ -873,7 +879,7 @@ export function registerOpenIMTools(api: any): void {
       type: "object",
       properties: {
         userID: { type: "string", description: "Friend user ID, or self for the owner’s own clone conversation" },
-        beforeSeq: { type: "integer", minimum: 1, description: "Self history only: pass returned nextBeforeSeq to read the next older page. Omit on the first page." },
+        beforeSeq: { type: "integer", minimum: 1, description: "Pass returned nextBeforeSeq to continue an authorized friend/self history. Omit on the first page." },
         limit: {
           type: "number",
           description: "Maximum messages, default 20, max 100",
@@ -956,6 +962,7 @@ export function registerOpenIMTools(api: any): void {
     parameters: {
       type: "object",
       properties: {
+        beforeSeq: { type: "integer", minimum: 1, description: "Copy returned nextBeforeSeq for authorized group history continuation." },
         groupID: { type: "string", description: "Joined group ID" },
         limit: {
           type: "number",
@@ -1005,6 +1012,7 @@ export function registerOpenIMTools(api: any): void {
       _id: string,
       params: {
         groupID: string;
+        beforeSeq?: number;
         limit?: number;
         days?: number;
         since?: string;

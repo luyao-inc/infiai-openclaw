@@ -1758,7 +1758,7 @@ function localizeOpenClawError(errorText: string): string {
   return localized === errorText ? friendlyReplyFailure(classifyReplyFailure(errorText)) : localized;
 }
 
-function isLikelyToolProgressOnlyReply(text: string): boolean {
+export function isLikelyToolProgressOnlyReply(text: string): boolean {
   const s = String(text ?? "")
     .replace(/\r\n/g, "\n")
     .trim();
@@ -1775,7 +1775,7 @@ function isLikelyToolProgressOnlyReply(text: string): boolean {
     /(?:知识库|文档|资料).{0,30}(?:没(?:有|啥)?(?:相关)?(?:内容|信息|关系)|无关|不相关).{0,60}(?:查|查一下|搜索|搜一下|查询|检索|看一下)/.test(
       s
     ) ||
-    /(?:我)?(?:来|先|再|直接)?(?:查|查一下|搜索|搜一下|查询|检索|看一下|了解一下).{0,80}(?:情况|信息|资料|内容|天气|新闻|赛事|近况|结果|动态)[。.!！]*$/.test(
+    /^(?:我)?(?:来|先|再|直接)?(?:查|查一下|搜索|搜一下|查询|检索|看一下|了解一下).{0,80}(?:情况|信息|资料|内容|天气|新闻|赛事|近况|结果|动态)[。.!！]*$/.test(
       s
     ) ||
     /(?:现在|马上|接下来)?帮[你您].{0,30}(?:搜索|查询|检索|查找)/.test(s) ||
@@ -2938,7 +2938,8 @@ async function writeSessionStore(
 export async function resetInfiaiSessionStoreEntry(
   storePath: string,
   sessionKey: string,
-  agentId: string
+  agentId: string,
+  includeMemoryVersions = false
 ): Promise<{
   removed: boolean;
   storePath: string;
@@ -2948,16 +2949,18 @@ export async function resetInfiaiSessionStoreEntry(
 }> {
   const key = String(sessionKey || "").trim();
   const store = await readSessionStore(storePath, agentId);
-  if (!key || !Object.prototype.hasOwnProperty.call(store.data, key)) {
+  const keys = key ? Object.keys(store.data).filter(candidate => candidate === key ||
+    (includeMemoryVersions && candidate.startsWith(key) && /^:memory-v1:[a-f0-9]{16}$/.test(candidate.slice(key.length)))) : [];
+  if (!keys.length) {
     return { removed: false, storePath: store.path };
   }
-  const entry = store.data[key] as Record<string, unknown>;
+  const entry = (store.data[key] || store.data[keys[0]]) as Record<string, unknown>;
   const sessionFile = String(entry?.sessionFile || "").trim() || undefined;
   const sessionId = String(entry?.sessionId || "").trim() || undefined;
   const sessionStartedAt = numberOrDateMs(
     entry?.sessionStartedAt ?? entry?.createdAt ?? entry?.startedAt
   );
-  delete store.data[key];
+  for (const candidate of keys) delete store.data[candidate];
   await writeSessionStore(store.path, store.data);
   return {
     removed: true,
@@ -4907,6 +4910,7 @@ async function sendClassifiedReplyFromInbound(
     tenantID?: string;
     ownerUserID?: string;
     agentID?: string;
+    recoveredTurn?: InboundReplyTurn;
     nextSuggestions?: NextSuggestions;
     knowledgeTrace?: Record<string, unknown>;
   }
@@ -4934,7 +4938,7 @@ async function sendClassifiedReplyFromInbound(
       }
     | undefined;
   if (
-    params.messageKind === MESSAGE_KIND_ASSISTANT_REPLY &&
+    (params.recoveredTurn ? params.recoveredTurn.voiceReplyEnabled : params.messageKind === MESSAGE_KIND_ASSISTANT_REPLY) &&
     !isGroupMessage(msg) &&
     params.ownerUserID &&
     params.agentID
@@ -4948,12 +4952,13 @@ async function sendClassifiedReplyFromInbound(
         agentID: params.agentID,
         text,
         actorUserID: String(msg.sendID || ""),
-        conversationID: String(
+        conversationID: params.recoveredTurn ? resolveInfiaiConversationID(msg) : String(
           msg.sessionType === 3
             ? msg.groupID || ""
             : msg.sendID || msg.recvID || ""
         ),
         sourceMsgID: String(msg.clientMsgID || msg.serverMsgID || ""),
+        ...params.recoveredTurn?.voiceContext,
       });
       if (synthesized.enabled) {
         voice = {
@@ -4987,6 +4992,11 @@ async function sendClassifiedReplyFromInbound(
         } agent=${params.agentID} error=${formatSdkError(err)}`
       );
     }
+  }
+  // Recovery keeps its notice/billing semantics, but shares the live IM media preference.
+  if (params.recoveredTurn) {
+    if (!await params.recoveredTurn.canSend()) return false;
+    if (!params.recoveredTurn.voiceReplyEnabled) voice = undefined;
   }
   await sendReplyFromInbound(client, msg, text, {
     messageKind: params.messageKind,
@@ -6745,7 +6755,8 @@ async function processInboundMessageInLane(
         const reset = await resetInfiaiSessionStoreEntry(
           storePath,
           effectiveSessionKey,
-          executionAgentId
+          executionAgentId,
+          true
         );
         api.logger?.info?.(
           `[infiai] session control /new: accountId=${
@@ -6937,6 +6948,8 @@ async function processInboundMessageInLane(
   }
   const deliverySignal = inboundReplySignals.get(msg as object);
   let replyTurn: InboundReplyTurn | null = null;
+  let readOnlySocialSource = false;
+  let ownerReviewCalls = 0;
   if (!inboundFromManagedBot && (!group || mentioned)) {
     replyTurn = new InboundReplyTurn((path, body) => signedChatApiCall(client, path, body, {timeoutMs:5000}), {
       ownerUserID:selfUid, agentID:businessAgentID, actorUserID:senderId,
@@ -7534,6 +7547,7 @@ async function processInboundMessageInLane(
   let suppressedNoReplyMetaReply = false;
   let memoryExtractSubmitted = false;
   let pendingFailureReply = "";
+  let recoveredReply = false;
   let deliveredSilentReplyText = "";
   const deliveredImages = new Set<string>();
   const voiceReplyAccumulator =
@@ -7562,7 +7576,7 @@ async function processInboundMessageInLane(
     if (!parts.length) return;
     textDeliveryStopped = true; // A partial/failed send must never enter the generic fallback path.
     const billing = await buildLanguageModelOutputCharge(client, msg, {payerUserID:selfUid,actorUserID:senderId,agentID:businessAgentID,conversationID:effectiveSessionKey,storePath,dispatchStartedAtMs:llmDispatchStartedAt,suggestionTurn,allowOverdraft:true,subscriberUserID:agentSubscription?.subscriberUserID || "",agentSubscriptionID:agentSubscription?.subscriptionID || "",usageSource:"internal_im"});
-    const planned = await replyTurn.plan(parts, billing, {ownerUserID:selfUid,agentID:businessAgentID,sourceUserID:senderId,sourceUserName:fromLabel,threadID:effectiveSessionKey,conversationID:effectiveSessionKey,userText:rawBody,createdAt:timestamp,metadata:{conversationType:chatType,groupID:group?String(msg.groupID || ""):"",groupName,messageKind:MESSAGE_KIND_ASSISTANT_REPLY,source:"infiai-openclaw-inbound"}});
+    const planned = await replyTurn.plan(parts, billing, {ownerUserID:selfUid,agentID:businessAgentID,sourceUserID:senderId,sourceUserName:fromLabel,threadID:effectiveSessionKey,conversationID:effectiveSessionKey,userText:rawBody,createdAt:timestamp,metadata:{readOnlySocialSource,conversationType:chatType,groupID:group?String(msg.groupID || ""):"",groupName,messageKind:MESSAGE_KIND_ASSISTANT_REPLY,source:"infiai-openclaw-inbound"}});
     try {
       if (!await replyTurn.canSend()) throw new ReplyCancelledError();
       await deliverReplyPlan(planned, replyTurn.voiceReplyEnabled ? {...config, pacing:"none"} : config, {
@@ -7620,6 +7634,17 @@ async function processInboundMessageInLane(
           ownerAuthorized: String(senderId).trim() === String(selfUid).trim(),
           memoryContext: longTermMemoryContextText,
           setReplyMode: replyTurn?.textDelivery && !group ? (mode, scope) => replyTurn!.setReplyMode(mode, scope) : undefined,
+          getSocialOverview: replyTurn?.textDelivery && !group && senderId === selfUid ? async (params) => {
+            if (++ownerReviewCalls > 3) throw new Error("owner read budget exceeded");
+            const result = await replyTurn!.readOwnerData("social_overview", params);
+            readOnlySocialSource = true; return result;
+          } : undefined,
+          reviewConversations: replyTurn?.textDelivery && !group && senderId === selfUid ? async (params) => {
+            if (++ownerReviewCalls > 3) throw new Error("owner read budget exceeded");
+            const result = await replyTurn!.readOwnerData("review_agent_conversations", params);
+            readOnlySocialSource = true; return result;
+          } : undefined,
+
           source: "inbound",
         },
         async () =>
@@ -7876,7 +7901,10 @@ async function processInboundMessageInLane(
               disableBlockStreaming: !voiceReplyAccumulator,
               images: [],
             },
-          }, () => Boolean(deliveredVisibleReply || bufferedReply || voiceReplyAccumulator?.text || textDeliveryStopped)).then((result) => { if (result.failureReply) pendingFailureReply = result.failureReply; })
+          }, () => Boolean(deliveredVisibleReply || bufferedReply || voiceReplyAccumulator?.text || textDeliveryStopped)).then((result) => {
+            if (result.failureReply) pendingFailureReply = result.failureReply;
+            recoveredReply = result.recovered === true;
+          })
       );
     };
 
@@ -8104,6 +8132,7 @@ async function processInboundMessageInLane(
                   : resolution.rawOutcome === "progress_only"
                   ? "progress_only_fallback"
                   : "no_visible_model_reply",
+              recoveredTurn: recoveredReply && !group ? replyTurn ?? undefined : undefined,
               tenantID: resolveTenantIDFromAccountID(
                 client.config.accountId
               ),

@@ -86,10 +86,17 @@ export async function dispatchWithReplyRecovery(api: any, dispatch: (options: an
     },
     onError: (error: unknown, info: any) => { capture.error ||= String(error); options.dispatcherOptions.onError?.(error, info); },
   } };
-  try { await storage.run(capture, () => dispatch(wrapped)); }
-  catch (error) {
-    if (options.replyOptions?.abortSignal?.aborted || ["AbortError", "ReplyCancelledError", "HumanReceptionSuppressedError"].includes((error as any)?.name)) throw error;
-    capture.error ||= String(error);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { await storage.run(capture, () => dispatch(wrapped)); }
+    catch (error) {
+      if (options.replyOptions?.abortSignal?.aborted || ["AbortError", "ReplyCancelledError", "HumanReceptionSuppressedError"].includes((error as any)?.name)) throw error;
+      capture.error ||= String(error);
+    }
+    // Compaction can rotate a session before work starts. Retry this explicit
+    // pre-work conflict once, only before any model output or tool side effect.
+    if (attempt !== 0 || visible || silent || capture.toolsUsed || capture.modelFailed || hasReply?.() || options.replyOptions?.abortSignal?.aborted ||
+      !/\bSession "[^"\n]+" changed while starting work\. Retry\./.test(capture.error)) break;
+    capture.error = "";
   }
   if (silent || (hasReply ? hasReply() : visible) || (visible && !capture.modelFailed) || !capture.error) return {};
   const kind = classifyReplyFailure(capture.error);

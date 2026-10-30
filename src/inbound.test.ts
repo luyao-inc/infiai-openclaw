@@ -1444,6 +1444,26 @@ test("resets only the current Infiai session mapping for slash new", async () =>
   assert.ok(next["agent:a:infiai:direct:a:u2"]);
 });
 
+test("slash new retires only this conversation's memory-versioned mappings, even without a base entry", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "infiai-new-memory-"));
+  try {
+    const storePath = path.join(dir, "sessions.json");
+    const base = "agent:a:infiai:direct:a:u1";
+    const first = `${base}:memory-v1:0123456789abcdef`;
+    const second = `${base}:memory-v1:fedcba9876543210`;
+    const other = "agent:a:infiai:direct:a:u10:memory-v1:0123456789abcdef";
+    const transcript = path.join(dir, "old.jsonl");
+    await fs.writeFile(transcript, "keep history");
+    const entries = { [first]: { sessionId: "old", sessionFile: transcript }, [second]: { sessionId: "older" }, [other]: { sessionId: "other" } };
+    await fs.writeFile(storePath, JSON.stringify(entries));
+    // Exact resets used by artifact purging must not expand their scope.
+    assert.equal((await resetInfiaiSessionStoreEntry(storePath, base, "a")).removed, false);
+    assert.equal((await resetInfiaiSessionStoreEntry(storePath, base, "a", true)).removed, true);
+    assert.deepEqual(JSON.parse(await fs.readFile(storePath, "utf8")), { [other]: entries[other] });
+    assert.equal(await fs.readFile(transcript, "utf8"), "keep history");
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
 test("purges the current incognito mapping, transcript, and trajectory files", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "infiai-incognito-purge-"));
   const storePath = path.join(dir, "sessions.json");

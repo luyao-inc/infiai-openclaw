@@ -127,6 +127,11 @@ export class InboundReplyTurn {
       }));
   }
   get voiceContext() { return { turnID: this.turnID, token: this.token }; }
+  async readOwnerData(kind: "social_overview" | "review_agent_conversations", params: Record<string, unknown>) {
+    if (!this.textDelivery || this.deliveryStarted) throw new Error("owner turn unavailable");
+    return this.rpc("/claw/internal/tools/" + kind, { ...params, ...this.identity, ...this.voiceContext });
+  }
+
   async setReplyMode(mode: "inherit" | "text" | "voice", scope: "conversation" | "turn") {
     const r = await this.serialize(() => this.rpc("/claw/internal/reply-preference/update", {
       ...this.identity, ...this.voiceContext, mode, scope,

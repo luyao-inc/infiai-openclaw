@@ -3,6 +3,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 export interface InfiaiToolContext {
 	/** Bound only for the current, durable private-IM turn. Never accepts a target. */
 	setReplyMode?: (mode: "inherit" | "text" | "voice", scope: "conversation" | "turn") => Promise<unknown>;
+  getSocialOverview?: (params: Record<string, unknown>) => Promise<unknown>;
+  reviewConversations?: (params: Record<string, unknown>) => Promise<unknown>;
   memoryContext?: string;
   accountId: string;
   managedUserId: string;
