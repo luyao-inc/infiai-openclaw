@@ -16,10 +16,10 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
   await fs.writeFile(path.join(workspace, ".openclaw/workspace-state.json"), JSON.stringify({automationMode:"always",conversationMemoryEnabled:false}));
   const accountId="acc_default__voice-owner__default", agentId="mg_default__voice-owner__default";
   const cfg={agents:{list:[{id:agentId,workspace}]},channels:{infiai:{accounts:{[accountId]:{enabled:true,userID:"voice-owner"}}}},bindings:[{agentId,match:{channel:"infiai",accountId}}]};
-  for(const scenario of ["voice", "mixed", "stop", "switch-text", "switch-voice", "during-synthesis"]){
+  for(const scenario of ["voice", "mixed", "stop", "switch-text", "switch-voice", "during-synthesis", "recovery-voice", "recovery-text", "recovery-failed", "recovery-stop", "recovery-switch"]){
    await t.test(scenario, async()=>{
     const sent:any[]=[], synthesis:any[]=[], warnings:string[]=[];
-    let planned:any[]=[], stopped=false, prompt="", voiceEnabled=scenario!=="switch-voice";
+    let planned:any[]=[], stopped=false, prompt="", voiceEnabled=scenario!=="switch-voice"&&scenario!=="recovery-text";
     const tools:any[]=[];
     globalThis.fetch=async(input,init)=>{
      const url=String(input); assert.ok(url.startsWith("http://voice-test.invalid/"),url);
@@ -33,8 +33,8 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
      }
      if(url.endsWith("/agent-voice/synthesize")){
       synthesis.push(body);
-      if(scenario==="during-synthesis")voiceEnabled=false;
-      if(scenario==="stop")stopped=true;
+      if(scenario==="during-synthesis"||scenario==="recovery-switch")voiceEnabled=false;
+      if(scenario==="stop"||scenario==="recovery-stop")stopped=true;
       if(scenario==="mixed"&&synthesis.length===2) return new Response(JSON.stringify({errCode:500,errMsg:"ServerInternalError",errDlt:"synthetic provider finish timed out"}),{status:500});
       data={enabled:true,audioURL:"https://example.com/voice.wav",duration:4,transcript:body.text,contentType:"audio/wav"};
      }
@@ -43,6 +43,10 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
     const parts=["第一段完整回答。","第二段完整回答。","第三段完整回答。"];
     const api={registerTool:(tool:any)=>tools.push(tool),config:cfg,on:()=>{},logger:{info:()=>{},warn:(s:string)=>warnings.push(s),error:()=>{}},runtime:{channel:{routing:{resolveAgentRoute:()=>({agentId,matchedBy:"binding"})},reply:{dispatchReplyWithBufferedBlockDispatcher:async({ctx,dispatcherOptions}:any)=>{
      prompt=ctx.GroupSystemPrompt;
+     if(scenario.startsWith("recovery-")){
+      if(!ctx.SessionKey.includes(":ephemeral:recovery:")||scenario==="recovery-failed")throw new Error("400 Input text data may contain inappropriate content.");
+      await dispatcherOptions.deliver({text:"你好，很高兴见到你。"},{kind:"final"});return;
+     }
      if(scenario.startsWith("switch-")){const result=await tools.find(x=>x.name==="infiai_set_reply_mode").execute("mode-change",{mode:scenario==="switch-text"?"text":"voice",scope:"conversation"});assert.notEqual(result.isError,true);}
      await dispatcherOptions.deliver({text:parts.join("\n<<<LINGXIE_MESSAGE>>>\n")},{kind:"final"});
     }}}}};
@@ -54,7 +58,15 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
      sendMessage:async(value:any)=>{sent.push(value);return{data:{clientMsgID:value.message.clientMsgID}};},
     }};
     const started=Date.now();
-    await processInboundMessage(api,client as any,{sendID:"voice-visitor",recvID:"voice-owner",sessionType:1,contentType:101,textElem:{content:scenario==="switch-text"?"你现在回复我就应该发文字，不要再发语音了":scenario==="switch-voice"?"不要发文字，要发语音":"为什么你一会儿和我文字，一会儿和我语音呢"},clientMsgID:`source-${scenario}`,sendTime:Date.now(),senderPlatformID:5,ex:JSON.stringify({infiai:{nextSuggestionsVersion:1}})} as any);
+    await processInboundMessage(api,client as any,{sendID:scenario.startsWith("recovery-")?"voice-owner":"voice-visitor",recvID:"voice-owner",sessionType:1,contentType:101,textElem:{content:scenario==="switch-text"?"你现在回复我就应该发文字，不要再发语音了":scenario==="switch-voice"?"不要发文字，要发语音":"为什么你一会儿和我文字，一会儿和我语音呢"},clientMsgID:`source-${scenario}`,sendTime:Date.now(),senderPlatformID:5,ex:JSON.stringify({infiai:{nextSuggestionsVersion:1}})} as any);
+    if(scenario.startsWith("recovery-")){
+     assert.equal(planned.length,0,"recovery must not enqueue normal answer billing or memory");
+     assert.equal(sent.length,scenario==="recovery-stop"?0:1);
+     assert.equal(synthesis.length,["recovery-text","recovery-failed"].includes(scenario)?0:1);
+     if(synthesis.length){assert.equal(synthesis[0].turnID,`turn-${scenario}`);assert.equal(synthesis[0].conversationID,"si_voice-owner_voice-owner");}
+     if(sent.length){assert.equal(sent[0].message.contentType,scenario==="recovery-voice"?103:101);assert.equal(JSON.parse(sent[0].message.ex).infiai.messageKind,"model_error");}
+     return;
+    }
     if(scenario!=="switch-voice"){assert.match(prompt,/本轮已开启语音回复/);assert.match(prompt,/不得断言自己没有发过语音/);}
     assert.match(prompt,/先调用 infiai_set_reply_mode/);
     assert.match(prompt,/LINGXIE_MESSAGE/);

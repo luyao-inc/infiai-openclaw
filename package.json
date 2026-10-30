@@ -46,7 +46,9 @@
         "infiai_get_task_context",
         "infiai_send_image",
         "infiai_send_video",
-        "infiai_send_file"
+        "infiai_send_file",
+        "infiai_get_social_overview",
+        "infiai_review_agent_conversations"
       ],
       "webSearchProviders": [
         "infiai-sonar"
@@ -166,7 +168,9 @@
       ]
     },
     "toolMetadata": {
-      "infiai_set_reply_mode": { "description": "Set reply medium only for the current private avatar conversation." },
+      "infiai_set_reply_mode": {
+        "description": "Set reply medium only for the current private avatar conversation."
+      },
       "infiai_send_text": {
         "description": "Send a text message through the configured Infiai account."
       },
@@ -208,6 +212,12 @@
       },
       "infiai_get_task_context": {
         "description": "Read task context from Infiai Chat API for the configured account."
+      },
+      "infiai_get_social_overview": {
+        "description": "Read current owner data in a validated private conversation."
+      },
+      "infiai_review_agent_conversations": {
+        "description": "Read current owner data in a validated private conversation."
       }
     },
     "channel": {
