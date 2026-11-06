@@ -7614,6 +7614,7 @@ async function processInboundMessageInLane(
         },
         confirm:(index,part)=>replyTurn!.confirm(index,part),
         notSent:(index)=>replyTurn!.notSent(index),
+        failed:(index,code)=>replyTurn!.failed(index,code),
       });
     } catch(error) {api.logger?.warn?.(`[infiai] text reply group stopped: ${formatSdkError(error)}`);}
     memoryExtractSubmitted = true; // Chat's durable outbox owns confirmed-prefix memory and billing.

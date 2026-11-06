@@ -5,6 +5,7 @@ import {
   ReplyCancellationScopes,
   waitForReply,
   InboundReplyTurn,
+  relationshipRejectionCode,
 } from "./reply-delivery";
 const parts = ["甲", "乙", "丙"].map((text, i) => ({
   text,
@@ -45,6 +46,37 @@ test("send, confirm, delay and next send are strictly ordered", async () => {
     "send2",
     "ack2",
   ]);
+});
+
+test("explicit relationship refusals record one terminal failure without resend or tail", async () => {
+  for (const code of [1302, 1303]) {
+    const sent: string[] = [], failed: number[] = [];
+    await assert.rejects(deliverReplyPlan(parts, config, {
+      canSend: async () => true, start: async () => true,
+      send: async p => { sent.push(p.text); throw { errCode: code, errMsg: "relationship refused" }; },
+      confirm: async () => assert.fail("refusal confirmed"),
+      notSent: async () => assert.fail("refusal entered retry branch"),
+      failed: async (index, errorCode) => { assert.equal(index, 0); failed.push(errorCode); },
+    }));
+    assert.deepEqual(sent, ["甲"]); assert.deepEqual(failed, [code]);
+  }
+  for (const error of [Error("1303 timeout"), { code: 1303 }, { errCode: 500 }, null])
+    assert.equal(relationshipRejectionCode(error), undefined);
+});
+
+test("lost terminal failure receipt retries state only and includes attempt", async () => {
+  let failures = 0;
+  const turn = new InboundReplyTurn(async (_path, req) => {
+    if (req.action === "begin") return { acquired: true, textDelivery: true, turnID: "t", token: "secret", config };
+    if (req.action === "start") return { send: true, parts: [{ attempts: 1 }] };
+    if (req.action === "failed") {
+      assert.equal(req.attempt, 1); assert.equal(req.errorCode, 1303);
+      if (++failures === 1) throw Error("receipt lost");
+    }
+    return {};
+  }, {});
+  await turn.begin(); await turn.start(0); await turn.failed(0, 1303); await turn.finish();
+  assert.equal(failures, 2);
 });
 test("stop during an interval sends no tail", async () => {
   const ctl = new AbortController(),
