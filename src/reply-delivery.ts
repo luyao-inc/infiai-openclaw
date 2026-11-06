@@ -1,6 +1,14 @@
 import type { ReplyDeliveryConfig } from "./reply-plan";
 import { replyPartDelayMs } from "./reply-plan";
 export class ReplyNotSentError extends Error {}
+// Only explicit SDK relationship refusals are definitive. Timeouts and unknown
+// errors retain the existing uncertain-send protection against duplicate sends.
+export function relationshipRejectionCode(error: unknown): number | undefined {
+  const raw = (error as { errCode?: unknown } | null)?.errCode;
+  if (typeof raw !== "number" && typeof raw !== "string") return undefined;
+  const code = Number(raw);
+  return code === 1302 || code === 1303 ? code : undefined;
+}
 export class ReplyCancelledError extends Error {
   constructor() {
     super("reply delivery cancelled");
@@ -64,6 +72,7 @@ export async function deliverReplyPlan(
     send: (part: PlannedPart, index: number) => Promise<void>;
     confirm: (index: number, part: PlannedPart) => Promise<void>;
     notSent?: (index: number) => Promise<void>;
+    failed?: (index: number, errorCode: number) => Promise<void>;
     wait?: (ms: number) => Promise<void>;
   }
 ): Promise<string[]> {
@@ -81,6 +90,11 @@ export async function deliverReplyPlan(
       try {
         await callbacks.send(parts[i], i);
       } catch (error) {
+        const rejection = relationshipRejectionCode(error);
+        if (rejection !== undefined && callbacks.failed) {
+          await callbacks.failed(i, rejection);
+          throw error;
+        }
         if (error instanceof ReplyNotSentError && callbacks.notSent) {
           await callbacks.notSent(i);
           if (attempt < 2) continue;
@@ -188,22 +202,23 @@ export class InboundReplyTurn {
       attempt: this.attempts.get(index) || 0,
     });
   }
-  async confirm(index: number, part: PlannedPart) {
-    let error: unknown;
-    for (let i = 0; i < 3; i++) {
+  private async receipt(action: "sent" | "failed", body: Record<string, unknown>) {
+    // Both transitions are idempotent; retry receipts without resending content.
+    for (let i = 0; ; i++) {
       try {
-        await this.request("sent", {
-          index,
-          messageID: part.messageID,
-          attempt: this.attempts.get(index) || 0,
-        });
+        await this.request(action, body);
         return;
-      } catch (e) {
-        error = e;
+      } catch (error) {
+        if (i === 2) throw error;
         await waitForReply(100 * (i + 1));
       }
     }
-    throw error;
+  }
+  async failed(index: number, errorCode: number) {
+    await this.receipt("failed", { index, errorCode, attempt: this.attempts.get(index) || 0 });
+  }
+  async confirm(index: number, part: PlannedPart) {
+    await this.receipt("sent", { index, messageID: part.messageID, attempt: this.attempts.get(index) || 0 });
   }
   async finish(reason = "finished") {
     if (this.timer) clearInterval(this.timer);
