@@ -112,6 +112,7 @@ export async function deliverReplyPlan(
 
 // Serialize state mutations, including heartbeats and lost-ack retries.
 export class InboundReplyTurn {
+  conversationContext?: { text: string; revision: string };
   textDelivery = false;
   voiceReplyEnabled = false;
   enabled = true;
@@ -157,6 +158,7 @@ export class InboundReplyTurn {
     const r = await this.request("begin");
     if (!r.acquired) return false;
     this.textDelivery = r.textDelivery === true;
+    this.conversationContext = r.conversationContext ?? undefined;
     this.voiceReplyEnabled = r.voiceReplyEnabled === true;
     if (this.textDelivery) {
       this.turnID = r.turnID;

@@ -16,7 +16,7 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
   await fs.writeFile(path.join(workspace, ".openclaw/workspace-state.json"), JSON.stringify({automationMode:"always",conversationMemoryEnabled:false}));
   const accountId="acc_default__voice-owner__default", agentId="mg_default__voice-owner__default";
   const cfg={agents:{list:[{id:agentId,workspace}]},channels:{infiai:{accounts:{[accountId]:{enabled:true,userID:"voice-owner"}}}},bindings:[{agentId,match:{channel:"infiai",accountId}}]};
-  for(const scenario of ["voice", "mixed", "stop", "switch-text", "switch-voice", "during-synthesis", "recovery-voice", "recovery-text", "recovery-failed", "recovery-stop", "recovery-switch"]){
+  for(const scenario of ["voice", "mixed", "stop", "switch-text", "switch-voice", "during-synthesis", "recovery-voice", "recovery-text", "recovery-failed", "recovery-stop", "recovery-switch", "image-block", "image-duplicate", "image-stop"]){
    await t.test(scenario, async()=>{
     const sent:any[]=[], synthesis:any[]=[], warnings:string[]=[];
     let planned:any[]=[], stopped=false, prompt="", voiceEnabled=scenario!=="switch-voice"&&scenario!=="recovery-text";
@@ -43,6 +43,14 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
     const parts=["第一段完整回答。","第二段完整回答。","第三段完整回答。"];
     const api={registerTool:(tool:any)=>tools.push(tool),config:cfg,on:()=>{},logger:{info:()=>{},warn:(s:string)=>warnings.push(s),error:()=>{}},runtime:{channel:{routing:{resolveAgentRoute:()=>({agentId,matchedBy:"binding"})},reply:{dispatchReplyWithBufferedBlockDispatcher:async({ctx,dispatcherOptions}:any)=>{
      prompt=ctx.GroupSystemPrompt;
+     if (scenario.startsWith("image-")) {
+      const url = "https://example.com/generated.png";
+      await dispatcherOptions.deliver({ mediaUrl: url, mediaUrls: [url] }, { kind: "block" });
+      assert.equal(sent.length, 0);
+      if (scenario === "image-stop") stopped = true;
+      if (scenario === "image-duplicate") await dispatcherOptions.deliver({ mediaUrl: url }, { kind: "final" });
+      return;
+     }
      if(scenario.startsWith("recovery-")){
       if(!ctx.SessionKey.includes(":ephemeral:recovery:")||scenario==="recovery-failed")throw new Error("400 Input text data may contain inappropriate content.");
       await dispatcherOptions.deliver({text:"你好，很高兴见到你。"},{kind:"final"});return;
@@ -55,10 +63,17 @@ test("voice uses planned parts, silent text fallback, stable IDs and stop checks
     const client={config:{accountId,userID:"voice-owner",inboundWhitelist:[],requireMention:true,chatApiAddr:"http://voice-test.invalid"},gatewayConfig:cfg,sdk:{
      createTextMessage:async(text:string)=>({data:{contentType:101,textElem:{content:text}}}),
      createSoundMessageByURL:async(sound:any)=>({data:{contentType:103,soundElem:sound}}),
+     createImageMessageByURL: async () => ({ data: { contentType: 102 } }),
      sendMessage:async(value:any)=>{sent.push(value);return{data:{clientMsgID:value.message.clientMsgID}};},
     }};
     const started=Date.now();
     await processInboundMessage(api,client as any,{sendID:scenario.startsWith("recovery-")?"voice-owner":"voice-visitor",recvID:"voice-owner",sessionType:1,contentType:101,textElem:{content:scenario==="switch-text"?"你现在回复我就应该发文字，不要再发语音了":scenario==="switch-voice"?"不要发文字，要发语音":"为什么你一会儿和我文字，一会儿和我语音呢"},clientMsgID:`source-${scenario}`,sendTime:Date.now(),senderPlatformID:5,ex:JSON.stringify({infiai:{nextSuggestionsVersion:1}})} as any);
+    if (scenario.startsWith("image-")) {
+     assert.deepEqual(sent.map(x => x.message.contentType), scenario === "image-stop" ? [] : [102]);
+     assert.equal(planned.length, 0);
+     if (sent.length) assert.equal(JSON.parse(sent[0].message.ex).infiai.conversationReplyTurn, `turn-${scenario}`);
+     return;
+    }
     if(scenario.startsWith("recovery-")){
      assert.equal(planned.length,0,"recovery must not enqueue normal answer billing or memory");
      assert.equal(sent.length,scenario==="recovery-stop"?0:1);

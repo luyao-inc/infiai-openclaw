@@ -284,6 +284,7 @@ export function buildAssistantReplyEx(
       ...(extraInfiai || {}),
       source: ASSISTANT_MESSAGE_SOURCE,
       messageKind,
+      conversationReplyTurn: inboundReplyTurns.get(msg as object)?.turnID || undefined,
       traceID: randomUUID(),
       parentClientMsgID: String(msg.clientMsgID ?? ""),
     },
@@ -6503,6 +6504,7 @@ async function processBufferedAgentTurn(
 
 const inboundReplyScopes = new ReplyCancellationScopes();
 const inboundReplySignals = new WeakMap<object, AbortSignal>();
+const inboundReplyTurns = new WeakMap<object, InboundReplyTurn>();
 const inboundControlTexts = new WeakMap<object,string>();
 const seenReplyControls = new BoundedExpiringCache<boolean>();
 export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
@@ -6533,7 +6535,7 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
  const scope = inboundReplyScopes.enter(key, actor, msg.sendTime || Date.now());
  inboundReplySignals.set(msg as object, scope.signal);
  try { await withOpenPlatformSessionLane(key, () => scope.signal.aborted ? Promise.resolve() : processInboundMessageInLane(api,client,msg)); }
- finally {scope.leave();inboundReplySignals.delete(msg as object);inboundControlTexts.delete(msg as object);}
+ finally {scope.leave();inboundReplySignals.delete(msg as object);inboundReplyTurns.delete(msg as object);inboundControlTexts.delete(msg as object);}
 }
 
 async function processInboundMessageInLane(
@@ -6925,8 +6927,10 @@ async function processInboundMessageInLane(
       return;
     }
   }
+  const serverConversationPolicy = process.env.INFIAI_CONVERSATION_REPLY_ENABLED === "1" &&
+    !group && !humanSelfAssistant && !inboundFromManagedBot;
   if (
-    await shouldSkipForOfflineOnlyAutomation(
+    !serverConversationPolicy && await shouldSkipForOfflineOnlyAutomation(
       cfg,
       client,
       bindingAgentId ?? executionAgentId,
@@ -6953,9 +6957,10 @@ async function processInboundMessageInLane(
   if (!inboundFromManagedBot && (!group || mentioned)) {
     replyTurn = new InboundReplyTurn((path, body) => signedChatApiCall(client, path, body, {timeoutMs:5000}), {
       ownerUserID:selfUid, agentID:businessAgentID, actorUserID:senderId,
-      conversationID:resolveInfiaiConversationID(msg), sourceMsgID:String(msg.clientMsgID || msg.serverMsgID || ""), sourceTime:msg.sendTime || Date.now(), group,
+      conversationID:resolveInfiaiConversationID(msg), sourceMsgID:String(msg.clientMsgID || msg.serverMsgID || ""), sourceTime:msg.sendTime || Date.now(), sourceSeq: msg.seq || 0, group,
     });
     if (!await replyTurn.begin()) return;
+    inboundReplyTurns.set(msg as object, replyTurn);
   }
   try {
   let agentSubscription: AgentSubscriptionPreflightResult | null = null;
@@ -7330,7 +7335,7 @@ async function processInboundMessageInLane(
     });
     longTermMemoryContextText = contextResult.contextText || "";
       memoryVersionForTurn = contextResult.memoryVersion || "off";
-      effectiveSessionKey = memoryVersionedSessionKey(effectiveSessionKey, contextResult.memoryVersion);
+    effectiveSessionKey = memoryVersionedSessionKey(effectiveSessionKey, contextResult.memoryVersion);
     if (
       contextResult.skippedReason &&
       contextResult.skippedReason !== "disabled"
@@ -7353,6 +7358,13 @@ async function processInboundMessageInLane(
         msg.clientMsgID || ""
       } error=${formatSdkError(err)}`
     );
+  }
+  if (replyTurn?.conversationContext) {
+    effectiveSessionKey = memoryVersionedSessionKey(
+      effectiveSessionKey,
+      `${memoryVersionForTurn}:conversation:${replyTurn.conversationContext.revision}`,
+    );
+    longTermMemoryContextText = [longTermMemoryContextText, replyTurn.conversationContext.text].filter(Boolean).join("\n\n");
   }
   const interactiveInboundTurn = isInfiaiInteractiveInboundTurn({
     isGroup: group,
@@ -7549,7 +7561,28 @@ async function processInboundMessageInLane(
   let pendingFailureReply = "";
   let recoveredReply = false;
   let deliveredSilentReplyText = "";
-  const deliveredImages = new Set<string>();
+  const attemptedImages = new Set<string>();
+  const bufferedImages = new Set<string>();
+  const deliverImages = async (images: Iterable<string>) => {
+    for (const image of images) {
+      if (attemptedImages.has(image)) continue;
+      if (deliverySignal?.aborted || (replyTurn?.textDelivery && !await replyTurn.canSend())) return;
+      // Never retry a media send under a new message ID after an ambiguous ACK.
+      attemptedImages.add(image);
+      await sendImageToTarget(client, {kind: group ? "group" : "user", id: group ? String(msg.groupID) : senderId}, image, {
+        ex: JSON.stringify({infiai: {
+          source: ASSISTANT_MESSAGE_SOURCE,
+          messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+          conversationReplyTurn: replyTurn?.turnID,
+          parentClientMsgID: msg.clientMsgID,
+        }}),
+      }).catch(error => {
+        api.logger?.warn?.(`[infiai] image delivery failed: ${formatSdkError(error)}`);
+        throw error;
+      });
+      deliveredVisibleReply = true;
+    }
+  };
   const voiceReplyAccumulator =
     !replyTurn?.textDelivery && !suggestionTurn.options.enabled && !group && businessAgentID
       ? new InfiaiVoiceReplyAccumulator(client, {
@@ -7581,7 +7614,7 @@ async function processInboundMessageInLane(
       if (!await replyTurn.canSend()) throw new ReplyCancelledError();
       await deliverReplyPlan(planned, replyTurn.voiceReplyEnabled ? {...config, pacing:"none"} : config, {
         signal:deliverySignal,
-        canSend:async()=>!deliverySignal?.aborted && !await shouldSkipForOfflineOnlyAutomation(await resolveLatestGatewayConfig(cfg),client,bindingAgentId ?? executionAgentId,selfUid,humanSelfAssistant) && await replyTurn!.canSend(),
+        canSend:async()=>!deliverySignal?.aborted && (serverConversationPolicy || !await shouldSkipForOfflineOnlyAutomation(await resolveLatestGatewayConfig(cfg),client,bindingAgentId ?? executionAgentId,selfUid,humanSelfAssistant)) && await replyTurn!.canSend(),
         start:(index)=>replyTurn!.start(index),
         send:async(part,index)=>{
           let voice: NonNullable<Parameters<typeof sendReplyFromInbound>[3]>["voice"];
@@ -7608,7 +7641,21 @@ async function processInboundMessageInLane(
             if (deliverySignal?.aborted || !await replyTurn!.canSend()) throw new ReplyCancelledError();
             if (!replyTurn!.voiceReplyEnabled) voice = undefined;
           }
-          try { await sendReplyFromInbound(client,msg,part.text,{messageKind:MESSAGE_KIND_ASSISTANT_REPLY,mention:index===0,voice,delivery:{replyTurnID:replyTurn!.turnID,partIndex:index,partCount:planned.length,messageID:part.messageID},nextSuggestions:index===planned.length-1?suggestionTurn.envelope(bufferedSuggestions):undefined,knowledgeTrace:currentInboundKnowledgeTrace()}); } catch(error) {if(error instanceof HumanReceptionSuppressedError)throw new ReplyNotSentError("human reception active");throw error}
+          try {
+            await sendReplyFromInbound(client, msg, part.text, {
+              messageKind: MESSAGE_KIND_ASSISTANT_REPLY,
+              mention: index === 0,
+              voice,
+              delivery: { replyTurnID: replyTurn!.turnID, partIndex: index, partCount: planned.length, messageID: part.messageID },
+              nextSuggestions: index === planned.length - 1 ? suggestionTurn.envelope(bufferedSuggestions) : undefined,
+              knowledgeTrace: currentInboundKnowledgeTrace(),
+            });
+          } catch (error) {
+            if (error instanceof HumanReceptionSuppressedError || formatSdkError(error).includes("managed conversation reply paused")) {
+              throw new ReplyNotSentError("conversation reply paused");
+            }
+            throw error;
+          }
           deliveredVisibleReply = true;
           if(index===planned.length-1)suggestionTurn.noteDelivery(true);
         },
@@ -7671,19 +7718,19 @@ async function processInboundMessageInLane(
                   );
                   return;
                 }
-                if (replyTurn?.textDelivery && info?.kind && info.kind !== "final") return;
-                const nextReply = payload.text ? suggestionTurn.parse(payload.text) : { text: "", items: [] };
                 const images = new Set([...(payload.mediaUrls || []), ...(payload.mediaUrl ? [payload.mediaUrl] : [])]);
+                if (replyTurn?.textDelivery && info?.kind && info.kind !== "final") {
+                  // OpenClaw can emit the generated image as a media-only block
+                  // and omit it from the final payload. Keep text final-only.
+                  for (const image of images) {
+                    if (/\.(?:png|jpe?g|webp|gif)(?:[?#]|$)/i.test(image)) bufferedImages.add(image);
+                  }
+                  return;
+                }
+                const nextReply = payload.text ? suggestionTurn.parse(payload.text) : { text: "", items: [] };
                 nextReply.text = nextReply.text.replace(/^MEDIA:\s*(\/root\/\.openclaw\/media\/[^\s]+)[ \t]*$/gm, (_line, image) => { images.add(image); return ""; }).trim();
                 if (images.size && await checkReplyMemory("") !== "") { images.clear(); nextReply.text = "请重新发送刚才的问题。"; }
-                if ((!info?.kind || info.kind === "final") && !deliverySignal?.aborted && (!replyTurn?.textDelivery || await replyTurn.canSend())) {
-                  for (const image of images) {
-                    if (deliveredImages.has(image)) continue;
-                    await sendImageToTarget(client, {kind: group ? "group" : "user", id: group ? String(msg.groupID) : senderId}, image, {ex: JSON.stringify({infiai:{source:ASSISTANT_MESSAGE_SOURCE,messageKind:MESSAGE_KIND_ASSISTANT_REPLY,parentClientMsgID:msg.clientMsgID}})}).catch(error => { api.logger?.warn?.(`[infiai] image delivery failed: ${formatSdkError(error)}`); throw error; });
-                    deliveredImages.add(image);
-                    deliveredVisibleReply = true;
-                  }
-                }
+                if (!info?.kind || info.kind === "final") await deliverImages(images);
 
                 if (!nextReply.text && deliveredVisibleReply) return;
                 if (!replyTurn?.textDelivery && (!info?.kind || info.kind === "final")) {
@@ -7913,6 +7960,9 @@ async function processInboundMessageInLane(
       await withSuggestionTurn(suggestionTurn, runDispatch);
     } finally {
       api.logger?.info?.(`[infiai-next-suggestions] ${JSON.stringify(suggestionTurn.diagnostics())}`);
+    }
+    if (bufferedImages.size && await checkReplyMemory("") === "") {
+      await deliverImages(bufferedImages).catch(() => {}); // The send path logs the failure.
     }
     if (replyTurn?.textDelivery && bufferedReply) await deliverPlannedText(bufferedReply);
     if (
