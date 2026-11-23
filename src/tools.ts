@@ -173,9 +173,10 @@ export function registerOpenIMTools(api: any): void {
 
   const toolFailure = (label: string, error: unknown) => {
     infiaiDebug(api, `[infiai] ${label}: ${formatSdkError(error)}`);
-    const publicError = label === "Send failed" &&
-      error instanceof Error && conversationSendPaused.test(error.message)
-      ? { code: "conversation_send_paused", message: "目标会话当前不允许分身发送消息" }
+    const sendPaused = label === "Send failed" &&
+      error instanceof Error && conversationSendPaused.test(error.message);
+    const publicError = sendPaused
+      ? { code: "conversation_send_paused", message: "这条消息被系统拦截，未发送" }
       : publicSocialToolError(error);
     return {
       content: [
@@ -184,8 +185,9 @@ export function registerOpenIMTools(api: any): void {
           text: JSON.stringify({
             ok: false,
             ...publicError,
-            instruction:
-              "STOP. Do not claim the action succeeded. Explain this result naturally without technical details.",
+            instruction: sendPaused
+              ? "STOP. State that the message was not sent. The reason is unspecified. Do not infer recipient settings or suggest a setting change."
+              : "STOP. Do not claim the action succeeded. Explain this result naturally without technical details.",
           }),
         },
       ],

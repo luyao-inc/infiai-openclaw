@@ -109,8 +109,8 @@ test("send text binds direct authorization to the current owner self-chat", asyn
   const result = await withInfiaiToolContext(self, () => execute("direct", params));
   assert.equal(requests.at(-1)?.ownerDirectSend, true);
   assert.deepEqual(JSON.parse(result.content[0].text), {
-    ok: false, code: "conversation_send_paused", message: "目标会话当前不允许分身发送消息",
-    instruction: "STOP. Do not claim the action succeeded. Explain this result naturally without technical details.",
+    ok: false, code: "conversation_send_paused", message: "这条消息被系统拦截，未发送",
+    instruction: "STOP. State that the message was not sent. The reason is unspecified. Do not infer recipient settings or suggest a setting change.",
   });
   for (const [context, input] of [
     [{ ...self, humanSelfAssistant: false }, { ...params, ownerDirectSend: true }],
