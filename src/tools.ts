@@ -79,6 +79,8 @@ export function publicSocialToolError(error: unknown) {
   return { code: "request_failed", message: "查询暂时没有成功，请稍后再试" };
 }
 
+const conversationSendPaused = /managed conversation reply paused/i;
+
 export function registerOpenIMTools(api: any): void {
   if (typeof api.registerTool !== "function") {
     api.logger?.warn?.(
@@ -142,6 +144,11 @@ export function registerOpenIMTools(api: any): void {
         responseBody = { raw: text };
       }
     }
+    if (path === "/claw/internal/tools/send_message" &&
+        [responseBody?.errMsg, responseBody?.errDlt].some((value) =>
+          typeof value === "string" && conversationSendPaused.test(value))) {
+      throw new Error("managed conversation reply paused");
+    }
     if (!resp.ok)
       throw new Error(
         responseBody?.errMsg ||
@@ -166,7 +173,10 @@ export function registerOpenIMTools(api: any): void {
 
   const toolFailure = (label: string, error: unknown) => {
     infiaiDebug(api, `[infiai] ${label}: ${formatSdkError(error)}`);
-    const publicError = publicSocialToolError(error);
+    const publicError = label === "Send failed" &&
+      error instanceof Error && conversationSendPaused.test(error.message)
+      ? { code: "conversation_send_paused", message: "目标会话当前不允许分身发送消息" }
+      : publicSocialToolError(error);
     return {
       content: [
         {
@@ -413,6 +423,13 @@ export function registerOpenIMTools(api: any): void {
     ) {
       const checked = ensureTargetAndChatTool(params);
       if (!checked.ok) return checked.result;
+      // Use the current dispatch, never another in-flight turn for this account.
+      const context = getInfiaiToolContext();
+      const ownerDirectSend = checked.target.kind === "user" &&
+        !params.taskID && !params.runID && context?.source === "inbound" &&
+        context.humanSelfAssistant === true && context.ownerAuthorized &&
+        context.accountId === checked.client?.config?.accountId &&
+        context.senderId === checked.client?.config?.userID;
       try {
         const result = await chatToolCall(
           checked.client,
@@ -424,6 +441,7 @@ export function registerOpenIMTools(api: any): void {
             runID: params.runID,
             actionID: _id,
             accountId: params.accountId,
+            ...(ownerDirectSend ? { ownerDirectSend: true } : {}),
           },
         );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
