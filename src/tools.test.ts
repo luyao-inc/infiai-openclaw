@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { ApiService } from "@openim/client-sdk";
+import { startAccountClient, stopAccountClient } from "./clients";
+import { withInfiaiToolContext } from "./toolContext";
 
 import {
   authorizeInfiaiSocialTool,
   compactPeopleSearchResult,
   publicSocialToolError,
+  registerOpenIMTools,
 } from "./tools";
 
 test("social tools allow the owner from the current runtime context", () => {
@@ -68,4 +72,57 @@ test("social tool errors never expose SDK stacks to the model", () => {
       message: "当前账号没有权限查看这些内容",
     },
   );
+});
+
+test("send text binds direct authorization to the current owner self-chat", async (t) => {
+  let execute!: (id: string, params: Record<string, unknown>) => Promise<any>;
+  const api = {
+    registerTool(tool: any) {
+      if (tool.name === "infiai_send_text") execute = tool.execute;
+    },
+  };
+  registerOpenIMTools(api);
+  const accountId = "acc_default__owner__default";
+  await startAccountClient(api, {
+    accountId, userID: "owner", token: "fixture", enabled: true,
+    wsAddr: "ws://localhost:10001", apiAddr: "http://localhost:10002",
+    chatApiAddr: "http://localhost:10008",
+    platformID: 12, requireMention: false, inboundWhitelist: [],
+  }, { sdk: {
+    on() {}, off() {}, async login() {}, async logout() {},
+  } as unknown as ApiService });
+  t.after(() => stopAccountClient(api, accountId));
+
+  const requests: Record<string, unknown>[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    requests.push(JSON.parse(String(init.body)));
+    return Response.json({
+      errCode: 1002, errMsg: "NoPermissionError", errDlt: "managed conversation reply paused",
+    });
+  });
+  const self = {
+    accountId, managedUserId: "owner", senderId: "owner", agentId: "default",
+    sessionKey: "self", ownerAuthorized: true, source: "inbound" as const,
+    humanSelfAssistant: true,
+  };
+  const params = { target: "user:friend", text: "更正消息" };
+  const result = await withInfiaiToolContext(self, () => execute("direct", params));
+  assert.equal(requests.at(-1)?.ownerDirectSend, true);
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    ok: false, code: "conversation_send_paused", message: "目标会话当前不允许分身发送消息",
+    instruction: "STOP. Do not claim the action succeeded. Explain this result naturally without technical details.",
+  });
+  for (const [context, input] of [
+    [{ ...self, humanSelfAssistant: false }, { ...params, ownerDirectSend: true }],
+    [{ ...self, source: "voice_call" as const }, params],
+    [self, { ...params, target: "group:team" }],
+    [self, { ...params, taskID: "task", runID: "run" }],
+  ] as const) {
+    await withInfiaiToolContext(context, () => execute("ordinary", input));
+    assert.equal(requests.at(-1)?.ownerDirectSend, undefined);
+  }
+  const before = requests.length;
+  await withInfiaiToolContext({ ...self, senderId: "visitor", ownerAuthorized: false }, () => execute("visitor", params));
+  await withInfiaiToolContext(self, () => execute("other", { ...params, accountId: "some-other-account" }));
+  assert.equal(requests.length, before);
 });

@@ -12,6 +12,7 @@ export interface InfiaiToolContext {
   agentId: string;
   sessionKey: string;
   ownerAuthorized: boolean;
+  humanSelfAssistant?: boolean;
   source: "inbound" | "open_platform" | "voice_call" | "incognito_chat";
 }
 

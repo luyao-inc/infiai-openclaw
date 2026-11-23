@@ -7680,6 +7680,7 @@ async function processInboundMessageInLane(
           agentId: executionAgentId,
           sessionKey: effectiveSessionKey,
           ownerAuthorized: String(senderId).trim() === String(selfUid).trim(),
+          humanSelfAssistant: !group && humanSelfAssistant,
           memoryContext: longTermMemoryContextText,
           setReplyMode: replyTurn?.textDelivery && !group ? (mode, scope) => replyTurn!.setReplyMode(mode, scope) : undefined,
           getSocialOverview: replyTurn?.textDelivery && !group && senderId === selfUid ? async (params) => {
