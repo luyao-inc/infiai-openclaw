@@ -15,7 +15,11 @@ export function registerMemoryBoundaryHooks(api: any): void {
   if (!trusted?.memoryContext || trusted.agentId !== ctx?.agentId || (ctx?.sessionKey && trusted.sessionKey !== ctx.sessionKey)) return;
   // Inject fresh backend facts independently of transcript persistence. User
   // text can never create this trusted context, and concurrent turns use ALS.
-  return {appendSystemContext: trusted.memoryContext};
+  const memoryContext = trusted.memoryContext.replace(
+    /^\[(End )?Infiai (Long-Term Memory Context|Agent Learned Context)\](?=\r?$)/gm,
+    "[$1$2]",
+  );
+  return {appendSystemContext: memoryContext};
  }, {priority:350});
  api.on?.("before_message_write", (event: any) => {
   const message = event.message;
