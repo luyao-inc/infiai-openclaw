@@ -94,11 +94,12 @@ test("send text binds direct authorization to the current owner self-chat", asyn
   t.after(() => stopAccountClient(api, accountId));
 
   const requests: Record<string, unknown>[] = [];
+  let response: () => Response = () => Response.json({
+    errCode: 1002, errMsg: "NoPermissionError", errDlt: "managed conversation reply paused",
+  });
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
     requests.push(JSON.parse(String(init.body)));
-    return Response.json({
-      errCode: 1002, errMsg: "NoPermissionError", errDlt: "managed conversation reply paused",
-    });
+    return response();
   });
   const self = {
     accountId, managedUserId: "owner", senderId: "owner", agentId: "default",
@@ -110,7 +111,7 @@ test("send text binds direct authorization to the current owner self-chat", asyn
   assert.equal(requests.at(-1)?.ownerDirectSend, true);
   assert.deepEqual(JSON.parse(result.content[0].text), {
     ok: false, code: "conversation_send_paused", message: "这条消息被系统拦截，未发送",
-    instruction: "STOP. State that the message was not sent. The reason is unspecified. Do not infer recipient settings or suggest a setting change.",
+    instruction: "STOP. Report only the stated delivery outcome and any confirmed reason. Do not infer recipient settings, suggest a setting change, or retry automatically.",
   });
   for (const [context, input] of [
     [{ ...self, humanSelfAssistant: false }, { ...params, ownerDirectSend: true }],
@@ -125,4 +126,40 @@ test("send text binds direct authorization to the current owner self-chat", asyn
   await withInfiaiToolContext({ ...self, senderId: "visitor", ownerAuthorized: false }, () => execute("visitor", params));
   await withInfiaiToolContext(self, () => execute("other", { ...params, accountId: "some-other-account" }));
   assert.equal(requests.length, before);
+
+  const cases = [
+    [{ errCode: 1002, errMsg: "NoPermissionError", errDlt: "target user is not a friend" }, "target_not_friend"],
+    [{ errCode: 1303, errMsg: "NotPeersFriend" }, "target_not_friend"],
+    [{ errCode: 1302, errMsg: "BlockedByPeer" }, "send_rejected"],
+    [{ errCode: 1002, errMsg: "NoPermissionError", errDlt: "not a member of target group" }, "send_rejected"],
+    [{ errCode: 1002, errMsg: "NoPermissionError", errDlt: "task action is already processing or failed" }, "send_unconfirmed"],
+    [{ errCode: 1002, errMsg: "NoPermissionError", errDlt: "private diagnostic details" }, "send_unconfirmed"],
+    [{ errCode: 500, errMsg: "managed conversation delivery receipt unavailable" }, "send_unconfirmed"],
+    [{ errCode: 0, data: {} }, "send_unconfirmed"],
+    [{ ok: true, target: "user:friend", message: { serverMsgID: "message-id" } }, "send_unconfirmed"],
+    [{ errCode: 0, ok: true, target: "user:friend", message: { serverMsgID: "message-id" } }, "send_unconfirmed"],
+    [{ errCode: 0, data: { ok: true, target: "user:friend", message: {} } }, "send_unconfirmed"],
+    [{ errCode: 0, data: { ok: true, target: "user:other", message: { serverMsgID: "message-id" } } }, "send_unconfirmed"],
+  ] as const;
+  for (const [body, code] of cases) {
+    response = () => Response.json(body);
+    const result = await withInfiaiToolContext(self, () => execute("failure", params));
+    const reply = JSON.parse(result.content[0].text);
+    assert.equal(reply.ok, false);
+    assert.equal(reply.code, code);
+    assert.match(reply.instruction, /or retry automatically/);
+    assert.doesNotMatch(reply.message, /查看|private diagnostic details|BlockedByPeer/);
+    assert.match(reply.message, code === "send_unconfirmed" ? /无法确认.*是否送达/ : /未发送/);
+  }
+
+  response = () => { throw new Error("network timeout"); };
+  const beforeTimeout = requests.length;
+  const timeout = await withInfiaiToolContext(self, () => execute("timeout", params));
+  assert.equal(JSON.parse(timeout.content[0].text).code, "send_unconfirmed");
+  assert.equal(requests.length, beforeTimeout + 1);
+
+  const receipt = { ok: true, target: "user:friend", message: { serverMsgID: "message-id" } };
+  response = () => Response.json({ errCode: 0, data: receipt });
+  const sent = await withInfiaiToolContext(self, () => execute("success", params));
+  assert.deepEqual(JSON.parse(sent.content[0].text), receipt);
 });

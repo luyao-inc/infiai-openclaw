@@ -94,12 +94,13 @@ const INFIAI_TYPING_CUSTOM_TYPE = 260;
 const AGENT_SUBSCRIPTION_PREFLIGHT_FAILED_REPLY =
   "当前分身订阅状态校验失败，请稍后重试。";
 const INTERACTIVE_REPLY_CONTRACT_MARKER =
-  "[Infiai Interactive Reply Contract]";
+  "[Interactive Reply Contract]";
 const INTERACTIVE_REPLY_CONTRACT = [
   INTERACTIVE_REPLY_CONTRACT_MARKER,
   "This turn requires a visible, natural reply to the current real-user request.",
   "Do not answer with NO_REPLY or NO_ANSWER. Do not stay silent after handling the request.",
   "Reply in the user's language and keep the current workspace role and tone. Follow the current turn's style and search rules; do not copy past answers' length, extra explanations or source lists.",
+  "For sending questions, use the verified capability and delivery result. There is no separate setting to enable an owner's clone to send text to friends on request. If an older reply invented one, acknowledge the mistake without quoting the old reply. For example: “我之前说错了。灵谐没有单独的代发权限开关。” Use Lingxie as the only platform name in this explanation, even when the user or history uses a different name. Mention a setting only when verified and applicable. A follow-up about a prior send does not authorize another send.",
 ].join("\n");
 
 let latestGatewayConfigCache: {
@@ -2158,7 +2159,7 @@ export function buildTextEnvelope(
   const envelopeOptions =
     runtime.channel.reply?.resolveEnvelopeFormatOptions?.(cfg) ?? {};
   const formatted = runtime.channel.reply?.formatInboundEnvelope?.({
-    channel: "Infiai",
+    channel: "Lingxie",
     from: fromLabel,
     timestamp,
     body: bodyWithContext,
@@ -5246,7 +5247,7 @@ export function buildOpenPlatformOutboundPrompt(
         .filter((fact) => fact.content)
     : [];
   const sections = [
-    "[Infiai Internal Proactive Generation Task]",
+    "[Internal Proactive Generation Task]",
     "This is an internal platform task, not a message written by the recipient.",
     "Generate one message that the agent can send directly to this user.",
     "Always preserve the configured agent persona and follow system, safety, privacy, and authorization rules.",

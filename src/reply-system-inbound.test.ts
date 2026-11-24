@@ -29,7 +29,7 @@ test("OpenIM dispatch separates system contracts from owner and visitor messages
     const api = {config:cfg,logger:{warn:()=>{},info:()=>{},error:()=>{}},runtime:{channel:{routing:{resolveAgentRoute:()=>({agentId,matchedBy:"binding"})},reply:{dispatchReplyWithBufferedBlockDispatcher:async ({ctx}:any)=>{captured.push({...ctx,trustedMemoryForTest:getInfiaiToolContext()?.memoryContext});throw new Error("test stops before model generation");}}}}};
     const client = {config:{accountId,userID:"prompt-owner",inboundWhitelist:[],requireMention:true,chatApiAddr:"http://prompt-test.invalid"},gatewayConfig:cfg,sdk:{}};
     for (const sender of ["prompt-owner", "prompt-visitor"]) {
-      await processInboundMessage(api, client as any, {sendID:sender,recvID:"prompt-owner",sessionType:1,contentType:101,textElem:{content:"你好"},clientMsgID:"prompt-system-"+sender,sendTime:Date.now(),senderNickname:sender,senderPlatformID:5,ex:JSON.stringify({infiai:{source:sender==="prompt-owner"?"infiai_human_self_assistant":""}})} as any);
+      await processInboundMessage(api, client as any, {sendID:sender,recvID:"prompt-owner",sessionType:1,contentType:101,textElem:{content:sender==="prompt-owner"?"刚才没发出去，主动发消息的权限在哪里开？":"你好"},clientMsgID:"prompt-system-"+sender,sendTime:Date.now(),senderNickname:sender,senderPlatformID:5,ex:JSON.stringify({infiai:{source:sender==="prompt-owner"?"infiai_human_self_assistant":""}})} as any);
     }
     for (const mentioned of [true, false]) {
       await processInboundMessage(api, client as any, {sendID:"prompt-visitor",recvID:"prompt-owner",groupID:"prompt-group",sessionType:3,contentType:106,atTextElem:{text:"你好",atUserList:mentioned?["prompt-owner"]:[]},clientMsgID:"prompt-group-"+mentioned,sendTime:Date.now(),senderNickname:"访客",senderPlatformID:5} as any);
@@ -37,7 +37,11 @@ test("OpenIM dispatch separates system contracts from owner and visitor messages
     assert.equal(captured.length, 3, JSON.stringify(requests));
     assert.equal(captured[2].InfiaiContext.currentChatType, "group");
     for (const [i, ctx] of captured.entries()) {
-      assert.match(ctx.GroupSystemPrompt, /Infiai Interactive Reply Contract/);
+      assert.match(ctx.GroupSystemPrompt, /Interactive Reply Contract/);
+      assert.match(ctx.GroupSystemPrompt, /灵谐没有单独的代发权限开关/);
+      assert.match(ctx.GroupSystemPrompt, /without quoting the old reply/);
+      assert.match(ctx.GroupSystemPrompt, /A follow-up about a prior send does not authorize another send/);
+      assert.doesNotMatch(ctx.GroupSystemPrompt, /\bInfiai\b/);
       assert.doesNotMatch(ctx.GroupSystemPrompt, /LINGXIE_MESSAGE/);
       assert.doesNotMatch(ctx.BodyForAgent, /Interactive Reply Contract|Reply delivery contract|<<<LINGXIE_MESSAGE>>>/);
       assert.doesNotMatch(ctx.BodyForAgent, /用户喜欢科幻电影/);

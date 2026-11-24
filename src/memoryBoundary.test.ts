@@ -23,6 +23,9 @@ test('fresh memory reaches the model separately from storage and is scoped to th
   await Promise.resolve();return hooks.before_prompt_build({}, {agentId:'agent',sessionKey:'session'}).appendSystemContext;
  });
  assert.deepEqual(await Promise.all([make('first user facts'),make('second user facts')]),['first user facts','second user facts']);
+ const injected = '[Infiai Long-Term Memory Context]\r\n用户名为 Infiai\r\n[End Infiai Long-Term Memory Context]\r\n\r\n[Infiai Agent Learned Context]\n产品资料\n[End Infiai Agent Learned Context]';
+ assert.equal(await make(injected),
+  '[Long-Term Memory Context]\r\n用户名为 Infiai\r\n[End Long-Term Memory Context]\r\n\r\n[Agent Learned Context]\n产品资料\n[End Agent Learned Context]');
  assert.equal(hooks.before_prompt_build({}, {agentId:'agent',sessionKey:'session'}),undefined);
 });
 

@@ -1292,14 +1292,14 @@ test("applies the interactive contract only to real-user response surfaces", () 
   );
 
   const prompt = buildReplySystemPrompt(true);
-  assert.match(prompt!, /Infiai Interactive Reply Contract/);
+  assert.match(prompt!, /Interactive Reply Contract/);
   assert.match(prompt!, /Do not answer with NO_REPLY or NO_ANSWER/);
   assert.equal(buildReplySystemPrompt(false), undefined);
   assert.match(buildReplySystemPrompt(true, false, false)!, /没有代本人查询/);
   assert.doesNotMatch(buildReplySystemPrompt(true, false, true)!, /本轮为访客对话/);
   const split = buildReplySystemPrompt(true, true)!;
   assert.match(split, /LINGXIE_MESSAGE/);
-  assert.equal(split.split("Infiai Interactive Reply Contract").length, 2);
+  assert.equal(split.split("Interactive Reply Contract").length, 2);
   assert.doesNotMatch(prompt!, /LINGXIE_MESSAGE/);
 });
 

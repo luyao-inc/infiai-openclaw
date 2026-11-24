@@ -7,6 +7,7 @@ import {
   sendVideoToTarget,
 } from "./media";
 import { parseTarget } from "./targets";
+import { relationshipRejectionCode } from "./reply-delivery";
 import { getInfiaiToolContext } from "./toolContext";
 import { formatSdkError, infiaiDebug } from "./utils";
 
@@ -79,7 +80,32 @@ export function publicSocialToolError(error: unknown) {
   return { code: "request_failed", message: "查询暂时没有成功，请稍后再试" };
 }
 
-const conversationSendPaused = /managed conversation reply paused/i;
+const SEND_TEXT_PATH = "/claw/internal/tools/send_message";
+
+function publicTextSendError(error: unknown) {
+  const rejection = error instanceof Error
+    ? error.cause as { errCode?: number; detail?: string } | undefined
+    : undefined;
+  const detail = rejection?.detail ?? "";
+  if (rejection?.errCode === 1002 && /managed conversation reply paused/i.test(detail)) {
+    return { code: "conversation_send_paused", message: "这条消息被系统拦截，未发送" };
+  }
+  const relationship = relationshipRejectionCode(rejection);
+  if (relationship === 1303 ||
+      (rejection?.errCode === 1002 && /target user is not a friend/i.test(detail))) {
+    return { code: "target_not_friend", message: "当前好友关系不满足发信条件，消息未发送" };
+  }
+  // A generic permission error can also mean a scheduled action is still
+  // processing. Only known, terminal delivery rejections prove non-delivery.
+  if (relationship === 1302 ||
+      (rejection?.errCode === 1002 && /target user is unavailable|not a member of target group/i.test(detail))) {
+    return { code: "send_rejected", message: "当前无法向该对象发送这条消息，消息未发送" };
+  }
+  return {
+    code: "send_unconfirmed",
+    message: "暂时无法确认这条消息是否送达",
+  };
+}
 
 export function registerOpenIMTools(api: any): void {
   if (typeof api.registerTool !== "function") {
@@ -122,6 +148,7 @@ export function registerOpenIMTools(api: any): void {
     ).trim();
     const resp = await fetch(`${base}${path}`, {
       method: "POST",
+      ...(path === SEND_TEXT_PATH ? { redirect: "error" as const } : {}),
       headers: {
         "Content-Type": "application/json",
         ...(sharedSecret
@@ -144,10 +171,14 @@ export function registerOpenIMTools(api: any): void {
         responseBody = { raw: text };
       }
     }
-    if (path === "/claw/internal/tools/send_message" &&
-        [responseBody?.errMsg, responseBody?.errDlt].some((value) =>
-          typeof value === "string" && conversationSendPaused.test(value))) {
-      throw new Error("managed conversation reply paused");
+    const rawCode = responseBody?.errCode;
+    const errCode = typeof rawCode === "number" || (typeof rawCode === "string" && /^\d+$/.test(rawCode))
+      ? Number(rawCode) : NaN;
+    if (path === SEND_TEXT_PATH && Number.isInteger(errCode) && errCode > 0) {
+      const detail = [responseBody?.errMsg, responseBody?.errDlt]
+        .filter((value) => typeof value === "string")
+        .join(": ");
+      throw new Error(detail || "Text send rejected", { cause: { errCode, detail } });
     }
     if (!resp.ok)
       throw new Error(
@@ -168,16 +199,16 @@ export function registerOpenIMTools(api: any): void {
         ),
       );
     }
+    if (path === SEND_TEXT_PATH) {
+      if (errCode !== 0) throw new Error("Text send response had no successful Chat envelope");
+      return responseBody.data;
+    }
     return responseBody?.data ?? responseBody;
   };
 
-  const toolFailure = (label: string, error: unknown) => {
+  const toolFailure = (label: string, error: unknown, isTextSend = false) => {
     infiaiDebug(api, `[infiai] ${label}: ${formatSdkError(error)}`);
-    const sendPaused = label === "Send failed" &&
-      error instanceof Error && conversationSendPaused.test(error.message);
-    const publicError = sendPaused
-      ? { code: "conversation_send_paused", message: "这条消息被系统拦截，未发送" }
-      : publicSocialToolError(error);
+    const publicError = isTextSend ? publicTextSendError(error) : publicSocialToolError(error);
     return {
       content: [
         {
@@ -185,8 +216,8 @@ export function registerOpenIMTools(api: any): void {
           text: JSON.stringify({
             ok: false,
             ...publicError,
-            instruction: sendPaused
-              ? "STOP. State that the message was not sent. The reason is unspecified. Do not infer recipient settings or suggest a setting change."
+            instruction: isTextSend
+              ? "STOP. Report only the stated delivery outcome and any confirmed reason. Do not infer recipient settings, suggest a setting change, or retry automatically."
               : "STOP. Do not claim the action succeeded. Explain this result naturally without technical details.",
           }),
         },
@@ -201,9 +232,9 @@ export function registerOpenIMTools(api: any): void {
         text: JSON.stringify({
           ok: false,
           error:
-            "accountId is required because multiple Infiai accounts are connected.",
+            "accountId is required because multiple accounts are connected.",
           instruction:
-            "STOP. Do not retry with a guessed account. Use the current Infiai accountId from the workspace/tool instructions, or tell the user the account context is missing.",
+            "STOP. Do not retry with a guessed account. Use the current accountId from the workspace/tool instructions, or tell the user the account context is missing.",
         }),
       },
     ],
@@ -216,8 +247,8 @@ export function registerOpenIMTools(api: any): void {
         text: JSON.stringify({
           ok: false,
           error: accountId
-            ? `Infiai account is not connected: ${accountId}`
-            : "Infiai is not connected.",
+            ? `Account is not connected: ${accountId}`
+            : "The messaging service is not connected.",
           instruction: "STOP. Do not claim the action succeeded.",
         }),
       },
@@ -237,7 +268,7 @@ export function registerOpenIMTools(api: any): void {
           instruction:
             reason === "missing_runtime_context"
               ? "If this is a scheduled task, retry this same tool once with taskID, runID and accountId copied exactly from the internal task context. Otherwise stop and explain the capability boundary naturally."
-              : "STOP. Do not call any other Infiai social tool for this request. Respond in the agent's own persona and explain only the capability boundary; do not use a fixed refusal sentence or a legal/compliance refusal unless the request has a separate safety issue.",
+              : "STOP. Do not call any other social tool for this request. Respond in the agent's own persona and explain only the capability boundary; do not use a fixed refusal sentence or a legal/compliance refusal unless the request has a separate safety issue.",
         }),
       },
     ],
@@ -391,7 +422,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_send_text",
     description:
-      "Send a text message via Infiai business API with trace metadata. target format: user:ID or group:ID.",
+      "Send a text message to a confirmed friend or joined group. target format: user:ID or group:ID.",
     parameters: {
       type: "object",
       properties: {
@@ -408,7 +439,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "text"],
@@ -432,12 +463,13 @@ export function registerOpenIMTools(api: any): void {
         context.humanSelfAssistant === true && context.ownerAuthorized &&
         context.accountId === checked.client?.config?.accountId &&
         context.senderId === checked.client?.config?.userID;
+      const target = `${checked.target.kind}:${checked.target.id}`;
       try {
         const result = await chatToolCall(
           checked.client,
-          "/claw/internal/tools/send_message",
+          SEND_TEXT_PATH,
           {
-            target: `${checked.target.kind}:${checked.target.id}`,
+            target,
             text: params.text,
             taskID: params.taskID,
             runID: params.runID,
@@ -446,9 +478,13 @@ export function registerOpenIMTools(api: any): void {
             ...(ownerDirectSend ? { ownerDirectSend: true } : {}),
           },
         );
+        if (result?.ok !== true || result.target !== target ||
+            typeof result.message?.serverMsgID !== "string" || !result.message.serverMsgID.trim()) {
+          throw new Error("Text send result was not confirmed");
+        }
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
-      } catch (e: any) {
-        return toolFailure("Send failed", e);
+      } catch (error) {
+        return toolFailure("Send failed", error, true);
       }
     },
   });
@@ -456,7 +492,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_list_my_friends",
     description:
-      "List or search the current Infiai user's friends. Use this before sending to existing contacts.",
+      "List or search the current user's friends. Use this before sending to existing contacts.",
     parameters: {
       type: "object",
       properties: {
@@ -480,7 +516,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
     },
@@ -513,7 +549,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_list_my_groups",
     description:
-      "List or search groups the current Infiai user has joined. Use this before sending to an existing group.",
+      "List or search groups the current user has joined. Use this before sending to an existing group.",
     parameters: {
       type: "object",
       properties: {
@@ -537,7 +573,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
     },
@@ -570,7 +606,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_search_people",
     description:
-      "Search public Infiai people/agent profiles by keyword. Results are public candidates and may require a friend request before messaging.",
+      "Search public Lingxie people/agent profiles by keyword. Results are public candidates and may require a friend request before messaging.",
     parameters: {
       type: "object",
       properties: {
@@ -598,7 +634,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["query"],
@@ -655,7 +691,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_search_groups",
     description:
-      "Search public Infiai groups by name, type, or introduction. Results are public candidates and may require joining before messaging.",
+      "Search public Lingxie groups by name, type, or introduction. Results are public candidates and may require joining before messaging.",
     parameters: {
       type: "object",
       properties: {
@@ -688,7 +724,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["query"],
@@ -752,7 +788,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["userIDs", "message"],
@@ -786,7 +822,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_apply_groups",
     description:
-      "Send join requests to selected Infiai groups. Do not use this for groups already joined.",
+      "Send join requests to selected groups. Do not use this for groups already joined.",
     parameters: {
       type: "object",
       properties: {
@@ -802,7 +838,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["groupIDs", "message"],
@@ -836,7 +872,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_list_group_members",
     description:
-      "List members of a group the current Infiai user has joined, if the group allows viewing member profiles.",
+      "List members of a group the current user has joined, if the group allows viewing member profiles.",
     parameters: {
       type: "object",
       properties: {
@@ -860,7 +896,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["groupID"],
@@ -939,7 +975,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["userID"],
@@ -978,7 +1014,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_get_group_chat_history",
     description:
-      "Read recent chat history from a group the current Infiai user has joined.",
+      "Read recent chat history from a group the current user has joined.",
     parameters: {
       type: "object",
       properties: {
@@ -1023,7 +1059,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["groupID"],
@@ -1062,7 +1098,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_get_task_context",
     description:
-      "Return current Infiai tool context for trace metadata. Cron prompts may also include taskID/runID explicitly.",
+      "Return current account and task context for trace metadata. Cron prompts may also include taskID/runID explicitly.",
     parameters: {
       type: "object",
       properties: {
@@ -1081,7 +1117,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
     },
@@ -1117,7 +1153,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_send_image",
     description:
-      "Send an image via Infiai. `image` supports a local path or an http(s) URL.",
+      "Send an image to a friend or joined group. `image` supports a local path or an http(s) URL.",
     parameters: {
       type: "object",
       properties: {
@@ -1129,7 +1165,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "image"],
@@ -1161,7 +1197,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_send_video",
     description:
-      "Send a video via Infiai (delivered as a file message). `video` supports a local path or URL.",
+      "Send a video to a friend or joined group (delivered as a file message). `video` supports a local path or URL.",
     parameters: {
       type: "object",
       properties: {
@@ -1177,7 +1213,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "video"],
@@ -1223,7 +1259,7 @@ export function registerOpenIMTools(api: any): void {
   api.registerTool({
     name: "infiai_send_file",
     description:
-      "Send a file via Infiai. `file` supports a local path or URL; `name` is optional.",
+      "Send a file to a friend or joined group. `file` supports a local path or URL; `name` is optional.",
     parameters: {
       type: "object",
       properties: {
@@ -1239,7 +1275,7 @@ export function registerOpenIMTools(api: any): void {
         accountId: {
           type: "string",
           description:
-            "Current Infiai account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
+            "Current account ID. Normal messages use the runtime context; scheduled tasks use the validated task context.",
         },
       },
       required: ["target", "file"],
